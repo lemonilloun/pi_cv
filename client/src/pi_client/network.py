@@ -55,6 +55,9 @@ class PiClient:
 
         try:
             raw_line = self._reader.readline()
+        except socket.timeout as exc:
+            self.close()
+            raise ClientConnectionError("Timed out waiting for server response") from exc
         except OSError as exc:
             self.close()
             raise ClientConnectionError("Failed to receive response") from exc

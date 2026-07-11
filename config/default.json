@@ -1,11 +1,12 @@
 {
   "server": {
-    "host": "127.0.0.1",
-    "port": 5000,
+    "host": "0.0.0.0",
+    "port": 8765,
     "backlog": 5
   },
   "client": {
     "device_id": "raspberry_pi_01",
+    "server_host": "127.0.0.1",
     "connect_timeout_seconds": 5
   },
   "logging": {

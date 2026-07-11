@@ -5,14 +5,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from pi_client.network import ClientConnectionError, PiClient
 from pi_client.protocol import make_hello_message
 
 
-DEFAULT_CONFIG_PATH = Path("config/default.json")
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config/default.json"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -43,7 +48,7 @@ def main() -> int:
     server_config = config["server"]
     client_config = config["client"]
 
-    host = args.host or server_config["host"]
+    host = args.host or client_config.get("server_host") or server_config["host"]
     port = args.port or int(server_config["port"])
     timeout_seconds = float(client_config.get("connect_timeout_seconds", 5))
     device_id = client_config["device_id"]

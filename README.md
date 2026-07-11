@@ -51,32 +51,47 @@ For local testing on one machine, keep:
 ```json
 {
   "server": {
-    "host": "127.0.0.1",
-    "port": 5000
+    "host": "0.0.0.0",
+    "port": 8765
   },
   "client": {
     "device_id": "raspberry_pi_01",
+    "server_host": "127.0.0.1",
     "connect_timeout_seconds": 5
   }
 }
 ```
 
-For Raspberry Pi to MacBook Wi-Fi communication, set `server.host` on the Raspberry Pi side to the MacBook IP address on the same network.
+For Raspberry Pi to MacBook Wi-Fi communication:
+
+- On MacBook, keep server bind host as `0.0.0.0`.
+- On Raspberry Pi, set `client.server_host` to the MacBook IP address on the same Wi-Fi network.
+- Do not use `127.0.0.1` from Raspberry Pi when connecting to MacBook. On Raspberry Pi, `127.0.0.1` means the Raspberry Pi itself.
 
 ## Run
 
-Open two terminals from the repository root.
+Open two terminals from the repository root:
+
+```bash
+cd /Users/lehacho/Desktop/works/cv_pojects/pi_cv
+```
 
 Terminal 1, start the server:
 
 ```bash
-PYTHONPATH=.:server/src python3 -m mac_server.server
+./scripts/run_server.sh
 ```
 
 Terminal 2, run the client:
 
 ```bash
-PYTHONPATH=.:client/src python3 -m pi_client.client
+./scripts/run_client.sh
+```
+
+For Raspberry Pi connecting to MacBook, pass the MacBook IP explicitly:
+
+```bash
+./scripts/run_client.sh --host MACBOOK_IP_ADDRESS
 ```
 
 Expected result:
@@ -91,13 +106,42 @@ Expected result:
 For a quick local check, start the server in one-shot mode:
 
 ```bash
-PYTHONPATH=.:server/src python3 -m mac_server.server --once
+./scripts/run_server.sh --once
 ```
 
 Then run the client once:
 
 ```bash
-PYTHONPATH=.:client/src python3 -m pi_client.client
+./scripts/run_client.sh
 ```
 
 The server exits after handling one client connection.
+
+## Manual Commands
+
+If you do not want to use scripts, run from the repository root:
+
+```bash
+PYTHONPATH=.:server/src python3 -m mac_server.server
+PYTHONPATH=.:client/src python3 -m pi_client.client
+```
+
+If you are already inside `server/src`, run:
+
+```bash
+PYTHONPATH=../..:. python3 -m mac_server.server
+```
+
+If you are already inside `client/src`, run:
+
+```bash
+PYTHONPATH=../..:. python3 -m pi_client.client
+```
+
+## Check Port Conflicts
+
+The project uses TCP port `8765` by default. To check whether something else is using it on macOS:
+
+```bash
+lsof -nP -iTCP:8765 -sTCP:LISTEN
+```
