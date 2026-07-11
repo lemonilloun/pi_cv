@@ -6,10 +6,15 @@ import argparse
 import json
 import logging
 import socket
+import sys
 import threading
 from pathlib import Path
 from types import TracebackType
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from mac_server.handlers import handle_message
 from mac_server.protocol import make_error_response
@@ -17,7 +22,7 @@ from shared.messages import Message
 
 
 logger = logging.getLogger(__name__)
-DEFAULT_CONFIG_PATH = Path("config/default.json")
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config/default.json"
 
 
 class MacServer:
