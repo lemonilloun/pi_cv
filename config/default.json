@@ -1,0 +1,14 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 5000,
+    "backlog": 5
+  },
+  "client": {
+    "device_id": "raspberry_pi_01",
+    "connect_timeout_seconds": 5
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
