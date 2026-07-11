@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import socket
 import sys
@@ -18,18 +17,22 @@ if str(REPO_ROOT) not in sys.path:
 
 from mac_server.handlers import handle_message
 from mac_server.protocol import make_error_response
+from shared.config import load_config
+from shared.framing import receive_packet, send_packet
 from shared.messages import Message
 
 
 logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config/default.json"
+DEFAULT_ENV_PATH = REPO_ROOT / ".env"
 
 
 class MacServer:
-    def __init__(self, host: str, port: int, backlog: int = 5) -> None:
+    def __init__(self, host: str, port: int, backlog: int = 5, storage_dir: Path | None = None) -> None:
         self.host = host
         self.port = port
         self.backlog = backlog
+        self.storage_dir = storage_dir or REPO_ROOT / "data/received"
         self._socket: socket.socket | None = None
         self._stop_event = threading.Event()
 
@@ -79,31 +82,34 @@ class MacServer:
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
         with client_socket:
-            reader = client_socket.makefile("rb")
-            with reader:
-                while not self._stop_event.is_set():
+            while not self._stop_event.is_set():
+                try:
+                    message, binary_payload = receive_packet(client_socket)
+                except EOFError:
+                    logger.info("Client disconnected %s:%s", address[0], address[1])
+                    return
+                except ValueError as exc:
+                    logger.warning("Invalid packet from %s:%s: %s", address[0], address[1], exc)
                     try:
-                        raw_line = reader.readline()
-                    except OSError as exc:
-                        logger.warning("Failed reading from %s:%s: %s", address[0], address[1], exc)
+                        send_packet(client_socket, make_error_response(str(exc)))
+                    except OSError:
                         return
+                    return
+                except OSError as exc:
+                    logger.warning("Failed reading from %s:%s: %s", address[0], address[1], exc)
+                    return
 
-                    if not raw_line:
-                        logger.info("Client disconnected %s:%s", address[0], address[1])
-                        return
+                response = self._process_message(message, binary_payload)
 
-                    response = self._process_raw_message(raw_line)
+                try:
+                    send_packet(client_socket, response)
+                except OSError as exc:
+                    logger.warning("Failed sending to %s:%s: %s", address[0], address[1], exc)
+                    return
 
-                    try:
-                        client_socket.sendall(response.to_json_line())
-                    except OSError as exc:
-                        logger.warning("Failed sending to %s:%s: %s", address[0], address[1], exc)
-                        return
-
-    def _process_raw_message(self, raw_line: bytes) -> Message:
+    def _process_message(self, message: Message, binary_payload: bytes) -> Message:
         try:
-            message = Message.from_json_line(raw_line)
-            return handle_message(message)
+            return handle_message(message, binary_payload, self.storage_dir)
         except ValueError as exc:
             logger.warning("Invalid message: %s", exc)
             return make_error_response(str(exc))
@@ -119,12 +125,6 @@ class MacServer:
         traceback: TracebackType | None,
     ) -> None:
         self.stop()
-
-
-def load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as config_file:
-        return json.load(config_file)
-
 
 def configure_logging(level_name: str) -> None:
     logging.basicConfig(
@@ -144,15 +144,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    config = load_config(args.config)
+    config = load_config(args.config, DEFAULT_ENV_PATH)
     configure_logging(config.get("logging", {}).get("level", "INFO"))
 
     server_config = config["server"]
     host = args.host or server_config["host"]
     port = args.port or int(server_config["port"])
     backlog = int(server_config.get("backlog", 5))
+    storage_dir = Path(server_config.get("storage_dir", "data/received"))
+    if not storage_dir.is_absolute():
+        storage_dir = REPO_ROOT / storage_dir
 
-    server = MacServer(host=host, port=port, backlog=backlog)
+    server = MacServer(host=host, port=port, backlog=backlog, storage_dir=storage_dir)
     try:
         server.serve_forever(once=args.once)
     except KeyboardInterrupt:

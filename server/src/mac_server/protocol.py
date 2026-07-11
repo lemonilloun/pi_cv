@@ -19,6 +19,19 @@ def make_ack_response(request: Message) -> Message:
     )
 
 
+def make_image_ack_response(request: Message, saved_path: str, byte_count: int) -> Message:
+    return make_message(
+        device_id=SERVER_DEVICE_ID,
+        message_type="ack",
+        payload={
+            "received_type": request.type,
+            "filename": request.payload.get("filename"),
+            "bytes_received": byte_count,
+            "saved_path": saved_path,
+        },
+    )
+
+
 def make_error_response(error_message: str) -> Message:
     return make_message(
         device_id=SERVER_DEVICE_ID,

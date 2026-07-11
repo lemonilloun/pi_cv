@@ -6,6 +6,7 @@ import logging
 import socket
 from types import TracebackType
 
+from shared.framing import receive_packet, send_packet
 from shared.messages import Message
 
 
@@ -37,42 +38,50 @@ class PiClient:
         self._reader = sock.makefile("rb")
         logger.info("Connected to server %s:%s", self.host, self.port)
 
-    def send_message(self, message: Message) -> None:
+    def send_message(self, message: Message, binary_payload: bytes = b"") -> None:
         if self._socket is None:
             raise ClientConnectionError("Client is not connected")
 
         try:
-            self._socket.sendall(message.to_json_line())
+            send_packet(self._socket, message, binary_payload)
         except OSError as exc:
             self.close()
             raise ClientConnectionError("Failed to send message") from exc
 
-        logger.info("Sent message type=%s payload=%s", message.type, message.payload)
+        logger.info(
+            "Sent message type=%s payload=%s binary_payload_bytes=%s",
+            message.type,
+            message.payload,
+            len(binary_payload),
+        )
 
-    def receive_response(self) -> Message:
-        if self._reader is None:
+    def receive_response(self) -> tuple[Message, bytes]:
+        if self._socket is None:
             raise ClientConnectionError("Client is not connected")
 
         try:
-            raw_line = self._reader.readline()
+            response, binary_payload = receive_packet(self._socket)
         except socket.timeout as exc:
             self.close()
             raise ClientConnectionError("Timed out waiting for server response") from exc
+        except EOFError as exc:
+            self.close()
+            raise ClientConnectionError("Server closed the connection") from exc
         except OSError as exc:
             self.close()
             raise ClientConnectionError("Failed to receive response") from exc
 
-        if not raw_line:
-            self.close()
-            raise ClientConnectionError("Server closed the connection")
+        logger.info(
+            "Received response type=%s payload=%s binary_payload_bytes=%s",
+            response.type,
+            response.payload,
+            len(binary_payload),
+        )
+        return response, binary_payload
 
-        response = Message.from_json_line(raw_line)
-        logger.info("Received response type=%s payload=%s", response.type, response.payload)
-        return response
-
-    def request(self, message: Message) -> Message:
+    def request(self, message: Message, binary_payload: bytes = b"") -> tuple[Message, bytes]:
         self.connect()
-        self.send_message(message)
+        self.send_message(message, binary_payload)
         return self.receive_response()
 
     def close(self) -> None:

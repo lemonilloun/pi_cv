@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -14,15 +13,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pi_client.network import ClientConnectionError, PiClient
-from pi_client.protocol import make_hello_message
+from pi_client.protocol import make_hello_message, make_image_message, make_telemetry_message
+from shared.config import load_config
+from shared.messages import Message
 
 
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config/default.json"
-
-
-def load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as config_file:
-        return json.load(config_file)
+DEFAULT_ENV_PATH = REPO_ROOT / ".env"
 
 
 def configure_logging(level_name: str) -> None:
@@ -37,12 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--host", help="Override server host from config")
     parser.add_argument("--port", type=int, help="Override server port from config")
+    parser.add_argument("--image", type=Path, help="Send an image file as binary payload")
+    parser.add_argument("--telemetry", action="store_true", help="Send a device telemetry JSON packet")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    config = load_config(args.config)
+    config = load_config(args.config, DEFAULT_ENV_PATH)
     configure_logging(config.get("logging", {}).get("level", "INFO"))
 
     server_config = config["server"]
@@ -53,16 +52,28 @@ def main() -> int:
     timeout_seconds = float(client_config.get("connect_timeout_seconds", 5))
     device_id = client_config["device_id"]
 
-    message = make_hello_message(device_id)
+    packets: list[tuple[Message, bytes]] = []
+
+    if args.telemetry:
+        packets.append((make_telemetry_message(device_id), b""))
+
+    if args.image:
+        image_path = args.image if args.image.is_absolute() else REPO_ROOT / args.image
+        image_bytes = image_path.read_bytes()
+        packets.append((make_image_message(device_id, image_path, len(image_bytes)), image_bytes))
+
+    if not packets:
+        packets.append((make_hello_message(device_id), b""))
 
     try:
         with PiClient(host=host, port=port, timeout_seconds=timeout_seconds) as client:
-            response = client.request(message)
+            for message, binary_payload in packets:
+                response, _ = client.request(message, binary_payload)
+                logging.getLogger(__name__).info("Server response: %s", response.to_dict())
     except (OSError, ValueError, ClientConnectionError) as exc:
         logging.getLogger(__name__).error("Client failed: %s", exc)
         return 1
 
-    logging.getLogger(__name__).info("Server response: %s", response.to_dict())
     return 0
 
 

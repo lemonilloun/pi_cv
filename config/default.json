@@ -2,7 +2,8 @@
   "server": {
     "host": "0.0.0.0",
     "port": 8765,
-    "backlog": 5
+    "backlog": 5,
+    "storage_dir": "data/received"
   },
   "client": {
     "device_id": "raspberry_pi_01",

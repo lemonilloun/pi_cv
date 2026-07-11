@@ -12,7 +12,7 @@ from shared.schemas import validate_message_dict
 
 @dataclass(frozen=True)
 class Message:
-    """Protocol message sent over TCP as newline-delimited JSON."""
+    """Protocol message sent over TCP."""
 
     device_id: str
     type: str
@@ -27,8 +27,11 @@ class Message:
             "payload": self.payload,
         }
 
+    def to_json_bytes(self) -> bytes:
+        return json.dumps(self.to_dict(), separators=(",", ":")).encode("utf-8")
+
     def to_json_line(self) -> bytes:
-        return (json.dumps(self.to_dict(), separators=(",", ":")) + "\n").encode("utf-8")
+        return self.to_json_bytes() + b"\n"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Message":
@@ -41,9 +44,9 @@ class Message:
         )
 
     @classmethod
-    def from_json_line(cls, raw_line: bytes) -> "Message":
+    def from_json_bytes(cls, raw_json: bytes) -> "Message":
         try:
-            data = json.loads(raw_line.decode("utf-8"))
+            data = json.loads(raw_json.decode("utf-8"))
         except UnicodeDecodeError as exc:
             raise ValueError("Message is not valid UTF-8") from exc
         except json.JSONDecodeError as exc:
@@ -53,6 +56,10 @@ class Message:
             raise ValueError("Message JSON must be an object")
 
         return cls.from_dict(data)
+
+    @classmethod
+    def from_json_line(cls, raw_line: bytes) -> "Message":
+        return cls.from_json_bytes(raw_line.rstrip(b"\n"))
 
 
 def make_message(device_id: str, message_type: str, payload: dict[str, Any] | None = None) -> Message:
