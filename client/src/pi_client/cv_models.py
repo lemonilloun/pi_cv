@@ -5,7 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import time
 import tempfile
+import sys
+from io import BytesIO
+from pathlib import Path
 from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DEPTH_ANYTHING_V2_SMALL_PATH = REPO_ROOT / "models/depth_anything_v2_vits.pth"
+DEPTH_ANYTHING_V2_REPO_PATH = REPO_ROOT / "external/Depth-Anything-V2"
 
 
 class CvModelError(RuntimeError):
@@ -42,6 +50,56 @@ class DepthResult:
     is_metric: bool
     min_depth: float
     max_depth: float
+
+
+def check_depth_anything_v2_environment(
+    model_path: str | None,
+    encoder: str,
+) -> dict[str, object]:
+    resolved_model_path = _resolve_depth_anything_v2_model_path(model_path)
+    _ensure_depth_anything_v2_import_path()
+
+    status: dict[str, object] = {
+        "repo_path": str(DEPTH_ANYTHING_V2_REPO_PATH),
+        "repo_exists": DEPTH_ANYTHING_V2_REPO_PATH.exists(),
+        "model_path": str(resolved_model_path),
+        "model_exists": resolved_model_path.exists(),
+        "encoder": encoder,
+    }
+
+    try:
+        import cv2
+        status["opencv_version"] = cv2.__version__
+    except ImportError as exc:
+        status["opencv_error"] = str(exc)
+
+    try:
+        import torch
+        status["torch_version"] = torch.__version__
+    except ImportError as exc:
+        status["torch_error"] = str(exc)
+
+    try:
+        from depth_anything_v2.dpt import DepthAnythingV2  # noqa: F401
+        status["depth_anything_v2_import"] = "ok"
+    except ImportError as exc:
+        status["depth_anything_v2_import_error"] = str(exc)
+
+    if resolved_model_path.exists():
+        status["model_size_mb"] = round(resolved_model_path.stat().st_size / 1024 / 1024, 2)
+
+    return status
+
+
+def depth_to_npz_bytes(depth_map: Any) -> bytes:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise CvModelError("NumPy is required to save depth_raw.npz") from exc
+
+    buffer = BytesIO()
+    np.savez_compressed(buffer, depth=depth_map.astype("float32"))
+    return buffer.getvalue()
 
 
 def run_yolo(image_bytes: bytes, model_path: str, confidence: float, task: str = "detect") -> YoloResult:
@@ -257,8 +315,15 @@ def _run_depth_anything_v2(
     is_metric: bool,
 ) -> DepthResult:
     started_at = time.perf_counter()
-    if not model_path:
-        raise CvModelError("Depth Anything V2 requires --depth-model-path")
+    resolved_model_path = _resolve_depth_anything_v2_model_path(model_path)
+
+    if not resolved_model_path.exists():
+        raise CvModelError(
+            f"Depth Anything V2 checkpoint not found: {resolved_model_path}. "
+            "Run: ./scripts/setup_depth_anything_v2.sh small"
+        )
+
+    _ensure_depth_anything_v2_import_path()
 
     try:
         import cv2
@@ -267,7 +332,7 @@ def _run_depth_anything_v2(
         from depth_anything_v2.dpt import DepthAnythingV2
     except ImportError as exc:
         raise CvModelError(
-            "Depth Anything V2 dependencies are missing. Install the official repo package and PyTorch CPU first."
+            "Depth Anything V2 dependencies are missing. Run: ./scripts/setup_depth_anything_v2.sh small"
         ) from exc
 
     model_configs = {
@@ -280,7 +345,7 @@ def _run_depth_anything_v2(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DepthAnythingV2(**model_configs[encoder])
-    checkpoint = torch.load(model_path, map_location="cpu")
+    checkpoint = torch.load(str(resolved_model_path), map_location="cpu")
     model.load_state_dict(checkpoint)
     model = model.to(device).eval()
 
@@ -294,7 +359,7 @@ def _run_depth_anything_v2(
         heatmap_image=_depth_to_heatmap_jpeg(depth),
         inference_ms=(time.perf_counter() - started_at) * 1000,
         backend="depth-anything-v2",
-        model_id=model_path,
+        model_id=str(resolved_model_path),
         input_size=input_size,
         is_metric=is_metric,
         min_depth=float(np.min(depth)),
@@ -318,8 +383,6 @@ def _run_depth_anything_v3(
         raise CvModelError(
             "Depth Anything 3 dependencies are missing. Install the official depth-anything-3 package first."
         ) from exc
-
-    from io import BytesIO
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DepthAnything3.from_pretrained(model_id)
@@ -359,6 +422,18 @@ def _decode_image_bgr(image_bytes: bytes):
     if image is None:
         raise CvModelError("Failed to decode image bytes")
     return image
+
+
+def _ensure_depth_anything_v2_import_path() -> None:
+    if str(DEPTH_ANYTHING_V2_REPO_PATH) not in sys.path and DEPTH_ANYTHING_V2_REPO_PATH.exists():
+        sys.path.insert(0, str(DEPTH_ANYTHING_V2_REPO_PATH))
+
+
+def _resolve_depth_anything_v2_model_path(model_path: str | None) -> Path:
+    resolved_model_path = Path(model_path) if model_path else DEFAULT_DEPTH_ANYTHING_V2_SMALL_PATH
+    if not resolved_model_path.is_absolute():
+        resolved_model_path = REPO_ROOT / resolved_model_path
+    return resolved_model_path
 
 
 def _depth_to_heatmap_jpeg(depth_map: Any) -> bytes:

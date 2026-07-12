@@ -420,12 +420,12 @@ The project code exposes a separate CV CLI:
 ./scripts/run_cv_client.sh --help
 ```
 
-Install only the CV dependencies you need on Raspberry Pi:
+Install only the CV dependencies you need on Raspberry Pi.
+For real Depth Anything V2 testing, use the setup script below instead of only installing the minimal file:
 
 ```bash
 cd ~/pi_cv
 source .venv/bin/activate
-pip install -r client/requirements-cv-min.txt
 ```
 
 For YOLO on Raspberry Pi:
@@ -445,16 +445,19 @@ cd /Users/lehacho/Desktop/works/cv_pojects/pi_cv
 
 ### Depth Test
 
-Synthetic depth is useful for checking the transport and visualization without downloading a model:
+Install Depth Anything V2 Small and download its real checkpoint:
 
 ```bash
-./scripts/run_cv_client.sh depth \
-  --source camera \
-  --depth-backend synthetic \
-  --telemetry
+./scripts/setup_depth_anything_v2.sh small
 ```
 
-Depth Anything V2 Small on Raspberry Pi CPU should be the first real depth target:
+Check the real depth environment:
+
+```bash
+./scripts/run_cv_client.sh depth-check
+```
+
+Run a real camera depth test:
 
 ```bash
 ./scripts/run_cv_client.sh depth \
@@ -464,6 +467,46 @@ Depth Anything V2 Small on Raspberry Pi CPU should be the first real depth targe
   --depth-encoder vits \
   --depth-input-size 392 \
   --telemetry
+```
+
+The server saves the result in:
+
+```text
+data/received/cv/<run_id>/
+```
+
+Open these files on the MacBook:
+
+- `original.jpg` - source image from Raspberry Pi camera.
+- `depth_heatmap.jpg` - visual depth map.
+- `depth_raw.npz` - raw float32 depth map.
+- `metadata.json` - model name, inference time, min/max depth, image source.
+
+To test the model on an existing image file instead of the camera:
+
+```bash
+./scripts/run_cv_client.sh depth \
+  --source image \
+  --image data/cat.jpg \
+  --depth-backend depth-anything-v2 \
+  --depth-model-path models/depth_anything_v2_vits.pth \
+  --depth-encoder vits \
+  --depth-input-size 392 \
+  --telemetry
+```
+
+Synthetic depth still exists only as a transport smoke test:
+
+```bash
+./scripts/run_cv_client.sh depth --source image --image data/cat.jpg --depth-backend synthetic
+```
+
+Depth Anything V2 model variants:
+
+```bash
+./scripts/setup_depth_anything_v2.sh small  # vits, first choice for Raspberry Pi 5 CPU
+./scripts/setup_depth_anything_v2.sh base   # vitb, heavier
+./scripts/setup_depth_anything_v2.sh large  # vitl, likely too slow/heavy on Pi CPU
 ```
 
 ### YOLO Test
@@ -518,6 +561,7 @@ Each run contains:
 - `original.jpg`
 - `yolo_annotated.jpg` for YOLO and pipeline runs.
 - `depth_heatmap.jpg` for depth and pipeline runs.
+- `depth_raw.npz` for depth and pipeline runs.
 - `combined.jpg` for pipeline runs.
 
 Depth Anything V2 relative checkpoints produce relative depth, not true distance in meters. Use `--depth-is-metric` only when the selected model output is metric.

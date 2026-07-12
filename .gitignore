@@ -22,6 +22,7 @@ data/cv_runs/
 
 research/
 models/
+external/
 *.pt
 *.pth
 *_ncnn_model/

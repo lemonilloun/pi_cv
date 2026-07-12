@@ -1,0 +1,6 @@
+# Runtime helpers for Depth Anything V2 experiments.
+# PyTorch itself is installed by scripts/setup_depth_anything_v2.sh because the
+# correct wheel/index can vary by Raspberry Pi OS and Python version.
+numpy
+opencv-python
+pillow

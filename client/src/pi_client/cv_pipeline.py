@@ -16,6 +16,7 @@ from pi_client.camera import capture_camera_frame
 from pi_client.cv_models import (
     CvModelError,
     attach_depth_to_detections,
+    depth_to_npz_bytes,
     image_size,
     render_combined_image,
     run_depth,
@@ -105,6 +106,7 @@ def build_cv_package(
             is_metric=depth_is_metric,
         )
         artifacts["depth_heatmap.jpg"] = depth_result.heatmap_image
+        artifacts["depth_raw.npz"] = depth_to_npz_bytes(depth_result.depth_map)
         metadata["models"]["depth"] = {
             "backend": depth_result.backend,
             "model_id": depth_result.model_id,
@@ -114,6 +116,7 @@ def build_cv_package(
             "inference_ms": depth_result.inference_ms,
             "min_depth": depth_result.min_depth,
             "max_depth": depth_result.max_depth,
+            "depth_shape": list(depth_result.depth_map.shape),
         }
 
     if mode == "pipeline":

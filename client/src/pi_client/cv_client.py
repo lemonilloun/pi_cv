@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -11,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pi_client.cv_models import CvModelError
+from pi_client.cv_models import CvModelError, check_depth_anything_v2_environment
 from pi_client.cv_pipeline import build_cv_package, load_source_image
 from pi_client.network import ClientConnectionError, PiClient
 from pi_client.protocol import make_cv_result_message, make_telemetry_message
@@ -37,6 +38,10 @@ def parse_args() -> argparse.Namespace:
         subparser = subparsers.add_parser(mode)
         _add_common_args(subparser)
 
+    depth_check = subparsers.add_parser("depth-check")
+    depth_check.add_argument("--depth-model-path", help="Depth Anything V2 checkpoint path")
+    depth_check.add_argument("--depth-encoder", choices=["vits", "vitb", "vitl"], default="vits")
+
     return parser.parse_args()
 
 
@@ -57,7 +62,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--depth-backend",
         choices=["synthetic", "depth-anything-v2", "depth-anything-v3"],
-        default="synthetic",
+        default="depth-anything-v2",
     )
     parser.add_argument("--depth-model-path", help="Depth model checkpoint path or Hugging Face model id")
     parser.add_argument("--depth-encoder", choices=["vits", "vitb", "vitl"], default="vits")
@@ -67,6 +72,23 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
 
 def main() -> int:
     args = parse_args()
+
+    if args.mode == "depth-check":
+        status = check_depth_anything_v2_environment(
+            model_path=args.depth_model_path,
+            encoder=args.depth_encoder,
+        )
+        print(json.dumps(status, indent=2))
+        if not (
+            status.get("repo_exists")
+            and status.get("model_exists")
+            and status.get("depth_anything_v2_import") == "ok"
+            and "torch_version" in status
+            and "opencv_version" in status
+        ):
+            return 1
+        return 0
+
     config = load_config(args.config, DEFAULT_ENV_PATH)
     configure_logging(config.get("logging", {}).get("level", "INFO"))
     logger = logging.getLogger(__name__)
