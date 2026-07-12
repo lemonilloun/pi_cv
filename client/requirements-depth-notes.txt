@@ -1,0 +1,10 @@
+# Depth model dependencies are intentionally not installed by default.
+#
+# Recommended Raspberry Pi order:
+# 1. Start with Depth Anything V2 Small (vits) on CPU.
+# 2. Install PyTorch CPU for Raspberry Pi using the current Raspberry Pi / PyTorch guidance.
+# 3. Clone and install the official Depth-Anything-V2 repo:
+#    git clone https://github.com/DepthAnything/Depth-Anything-V2 external/Depth-Anything-V2
+#    pip install -e external/Depth-Anything-V2
+#
+# Depth Anything 3 is heavier and should be tested after V2 Small works acceptably.

@@ -33,6 +33,26 @@ def make_image_ack_response(request: Message, saved_path: str, byte_count: int) 
     )
 
 
+def make_cv_result_ack_response(
+    request: Message,
+    saved_path: str,
+    extracted_dir: str,
+    byte_count: int,
+) -> Message:
+    return make_message(
+        device_id=SERVER_DEVICE_ID,
+        message_type="ack",
+        payload={
+            "received_type": request.type,
+            "run_id": request.payload.get("run_id"),
+            "pipeline_type": request.payload.get("pipeline_type"),
+            "bytes_received": byte_count,
+            "saved_path": saved_path,
+            "extracted_dir": extracted_dir,
+        },
+    )
+
+
 def make_error_response(error_message: str) -> Message:
     return make_message(
         device_id=SERVER_DEVICE_ID,

@@ -1,0 +1,4 @@
+# Minimal dependencies for local CV packaging and synthetic depth tests.
+numpy
+opencv-python
+pillow

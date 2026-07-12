@@ -91,9 +91,18 @@ Contains MacBook server code.
 4. Server exposes the latest frames as MJPEG at `http://127.0.0.1:8080/`.
 5. Stream frames are not saved by default; use `--stream-save-frames true` only for debugging.
 
+## CV Experiment Flow
+
+1. Raspberry Pi captures one camera image or reads a local image file.
+2. `run_cv_client.sh` runs `depth`, `yolo`, or `pipeline`.
+3. Results are packaged as a zip containing images and `metadata.json`.
+4. Client sends the package as a `cv_result` message.
+5. Server stores and extracts it in `data/received/cv/<run_id>/`.
+
 ## Next Steps
 
 - Add structured message types for camera frames, IMU samples, status, and errors.
 - Add integration tests that start a server on a random local port.
 - Add reconnection/backoff logic on the client.
 - Add optional H.264 path with `rpicam-vid` for higher quality/lower bandwidth streaming.
+- Benchmark Depth Anything V2 Small, YOLO NCNN, and the combined pipeline on Raspberry Pi 5.

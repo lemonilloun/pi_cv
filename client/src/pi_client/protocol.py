@@ -78,6 +78,26 @@ def make_camera_stream_frame_message(
     )
 
 
+def make_cv_result_message(
+    device_id: str,
+    run_id: str,
+    pipeline_type: str,
+    byte_count: int,
+    summary: dict[str, object],
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="cv_result",
+        payload={
+            "run_id": run_id,
+            "pipeline_type": pipeline_type,
+            "content_type": "application/zip",
+            "byte_count": byte_count,
+            "summary": summary,
+        },
+    )
+
+
 def make_telemetry_message(device_id: str) -> Message:
     return make_message(
         device_id=device_id,

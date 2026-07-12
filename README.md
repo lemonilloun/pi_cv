@@ -410,3 +410,114 @@ TCP is a byte stream, so the project uses length-prefixed packets:
 For `hello`, binary payload length is `0`.
 For `--image data/cat.jpg`, the JSON header contains image metadata and the binary payload contains the JPEG bytes.
 For `--camera-shot`, the JSON header has type `camera_frame` and the binary payload contains JPEG bytes captured from `Picamera2`.
+
+## CV Experiments
+
+The `research/` directory is ignored by Git and can keep local notes, model experiments, and downloaded references.
+The project code exposes a separate CV CLI:
+
+```bash
+./scripts/run_cv_client.sh --help
+```
+
+Install only the CV dependencies you need on Raspberry Pi:
+
+```bash
+cd ~/pi_cv
+source .venv/bin/activate
+pip install -r client/requirements-cv-min.txt
+```
+
+For YOLO on Raspberry Pi:
+
+```bash
+pip install -r client/requirements-yolo.txt
+yolo detect predict model=yolo11n.pt
+yolo export model=yolo11n.pt format=ncnn
+```
+
+Start the MacBook server:
+
+```bash
+cd /Users/lehacho/Desktop/works/cv_pojects/pi_cv
+./scripts/run_server.sh
+```
+
+### Depth Test
+
+Synthetic depth is useful for checking the transport and visualization without downloading a model:
+
+```bash
+./scripts/run_cv_client.sh depth \
+  --source camera \
+  --depth-backend synthetic \
+  --telemetry
+```
+
+Depth Anything V2 Small on Raspberry Pi CPU should be the first real depth target:
+
+```bash
+./scripts/run_cv_client.sh depth \
+  --source camera \
+  --depth-backend depth-anything-v2 \
+  --depth-model-path models/depth_anything_v2_vits.pth \
+  --depth-encoder vits \
+  --depth-input-size 392 \
+  --telemetry
+```
+
+### YOLO Test
+
+For detection with exported NCNN model:
+
+```bash
+./scripts/run_cv_client.sh yolo \
+  --source camera \
+  --yolo-model models/yolo11n_ncnn_model \
+  --yolo-task detect \
+  --yolo-confidence 0.5 \
+  --telemetry
+```
+
+For segmentation, use a segmentation model such as `yolo11n-seg.pt` exported to NCNN:
+
+```bash
+./scripts/run_cv_client.sh yolo \
+  --source camera \
+  --yolo-model models/yolo11n-seg_ncnn_model \
+  --yolo-task segment \
+  --yolo-confidence 0.5
+```
+
+### Combined Pipeline
+
+Capture one image, run YOLO, run depth, attach median depth values to each object box, and send all artifacts to the MacBook:
+
+```bash
+./scripts/run_cv_client.sh pipeline \
+  --source camera \
+  --yolo-model models/yolo11n_ncnn_model \
+  --yolo-task detect \
+  --yolo-confidence 0.5 \
+  --depth-backend depth-anything-v2 \
+  --depth-model-path models/depth_anything_v2_vits.pth \
+  --depth-encoder vits \
+  --depth-input-size 392 \
+  --telemetry
+```
+
+The server saves each result package here:
+
+```text
+data/received/cv/<run_id>/
+```
+
+Each run contains:
+
+- `metadata.json` with model settings, detections, and depth statistics.
+- `original.jpg`
+- `yolo_annotated.jpg` for YOLO and pipeline runs.
+- `depth_heatmap.jpg` for depth and pipeline runs.
+- `combined.jpg` for pipeline runs.
+
+Depth Anything V2 relative checkpoints produce relative depth, not true distance in meters. Use `--depth-is-metric` only when the selected model output is metric.

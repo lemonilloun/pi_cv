@@ -1,0 +1,5 @@
+# Raspberry Pi YOLO experiment dependencies.
+# Use with a venv created as:
+# python3 -m venv --system-site-packages .venv
+ultralytics
+ncnn
