@@ -44,7 +44,8 @@ Example:
 Contains Raspberry Pi client code.
 
 - `network.py` owns socket connection, send, receive, and disconnect behavior.
-- `protocol.py` creates client messages for `hello` and test image transfer.
+- `camera.py` captures one JPEG frame with `Picamera2` when running on Raspberry Pi.
+- `protocol.py` creates client messages for `hello`, telemetry, test image transfer, and camera frames.
 - `client.py` is the command-line entry point.
 
 ### `server/`
@@ -52,7 +53,7 @@ Contains Raspberry Pi client code.
 Contains MacBook server code.
 
 - `server.py` starts the TCP server and manages client sockets.
-- `handlers.py` processes valid messages, saves image payloads, and returns responses.
+- `handlers.py` processes valid messages, saves image and camera frame payloads, and returns responses.
 - `protocol.py` creates server responses.
 
 ## Current Flow
@@ -71,6 +72,15 @@ Contains MacBook server code.
 3. Client sends the message header plus raw JPEG bytes in one framed packet.
 4. Server validates the byte count.
 5. Server saves the file into `data/received/`.
+6. Server returns an `ack` response containing the saved path and byte count.
+
+## Camera Frame Flow
+
+1. Raspberry Pi captures one JPEG frame with `Picamera2` into memory.
+2. Client creates a `camera_frame` message with frame ID, resolution, format, content type, byte count, and source.
+3. Client sends the JSON header plus raw JPEG bytes in one framed packet.
+4. Server validates the byte count.
+5. Server saves the frame into `data/received/camera/`.
 6. Server returns an `ack` response containing the saved path and byte count.
 
 ## Next Steps

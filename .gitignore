@@ -17,3 +17,4 @@ htmlcov/
 .env
 
 data/received/
+data/camera_local/

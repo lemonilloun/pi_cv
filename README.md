@@ -8,11 +8,13 @@ Minimal Python communication layer for a distributed computer vision setup:
 
 The current first-stage implementation starts a TCP server, connects a TCP client, sends a test `hello` message, and receives an acknowledgement.
 It can also send a JPEG file as a binary payload with JSON metadata.
+On Raspberry Pi, it can capture one camera frame with `Picamera2` and send it to the MacBook.
 
 ## Requirements
 
 - Python 3.10+
 - No third-party Python packages
+- On Raspberry Pi camera capture uses the system package `python3-picamera2`
 
 ## Project Structure
 
@@ -153,6 +155,94 @@ Send telemetry and image in one client run over the same TCP connection:
 ./scripts/run_client.sh --telemetry --image data/cat.jpg
 ```
 
+## Raspberry Pi Camera Check
+
+Before using the project camera mode, check the camera directly on Raspberry Pi with a connected monitor:
+
+```bash
+rpicam-hello --list-cameras
+```
+
+Start a live preview:
+
+```bash
+rpicam-hello --timeout 0
+```
+
+Capture a test still image outside the project:
+
+```bash
+rpicam-still -o ~/camera_test.jpg
+```
+
+If you only need a JPEG capture check without a long preview:
+
+```bash
+rpicam-jpeg -o ~/camera_test.jpg --timeout 2000
+```
+
+## Raspberry Pi venv
+
+Install the minimal system packages:
+
+```bash
+sudo apt update
+sudo apt install python3-venv python3-picamera2 --no-install-recommends
+```
+
+Create a virtual environment in the project. Use `--system-site-packages` so the venv can see `python3-picamera2` installed by `apt`:
+
+```bash
+cd ~/pi_cv
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+```
+
+Check `Picamera2` inside the venv:
+
+```bash
+python3 -c "from picamera2 import Picamera2; print('picamera2 ok')"
+```
+
+`client/requirements.txt` intentionally stays minimal because `Picamera2` should be installed through Raspberry Pi OS packages, not `pip`.
+
+## Send Camera Shot
+
+Start the server on MacBook:
+
+```bash
+cd /Users/lehacho/Desktop/works/cv_pojects/pi_cv
+./scripts/run_server.sh
+```
+
+On Raspberry Pi over SSH:
+
+```bash
+ssh pi@192.168.1.137
+cd ~/pi_cv
+source .venv/bin/activate
+./scripts/run_client.sh --telemetry --camera-shot
+```
+
+Optional camera settings:
+
+```bash
+./scripts/run_client.sh --camera-shot --camera-width 1280 --camera-height 720 --camera-format jpeg
+```
+
+By default, the captured camera frame is kept in memory and sent to the MacBook without writing a JPEG to the Raspberry Pi SD card.
+If you explicitly want a local debug copy on Raspberry Pi:
+
+```bash
+./scripts/run_client.sh --camera-shot --camera-save-local true
+```
+
+The server saves camera frames into:
+
+```text
+data/received/camera/
+```
+
 ## One-shot Test
 
 For a quick local check, start the server in one-shot mode:
@@ -220,3 +310,4 @@ TCP is a byte stream, so the project uses length-prefixed packets:
 
 For `hello`, binary payload length is `0`.
 For `--image data/cat.jpg`, the JSON header contains image metadata and the binary payload contains the JPEG bytes.
+For `--camera-shot`, the JSON header has type `camera_frame` and the binary payload contains JPEG bytes captured from `Picamera2`.

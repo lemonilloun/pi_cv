@@ -26,6 +26,7 @@ def make_image_ack_response(request: Message, saved_path: str, byte_count: int) 
         payload={
             "received_type": request.type,
             "filename": request.payload.get("filename"),
+            "frame_id": request.payload.get("frame_id"),
             "bytes_received": byte_count,
             "saved_path": saved_path,
         },
