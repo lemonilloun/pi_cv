@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mac_server.handlers import handle_message
+from mac_server.preview import LatestFrameStore, MjpegPreviewServer
 from mac_server.protocol import make_error_response
 from shared.config import load_config
 from shared.framing import receive_packet, send_packet
@@ -28,11 +29,26 @@ DEFAULT_ENV_PATH = REPO_ROOT / ".env"
 
 
 class MacServer:
-    def __init__(self, host: str, port: int, backlog: int = 5, storage_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        backlog: int = 5,
+        storage_dir: Path | None = None,
+        preview_host: str = "127.0.0.1",
+        preview_port: int = 8080,
+        preview_enabled: bool = True,
+    ) -> None:
         self.host = host
         self.port = port
         self.backlog = backlog
         self.storage_dir = storage_dir or REPO_ROOT / "data/received"
+        self.preview_store = LatestFrameStore()
+        self.preview_server = (
+            MjpegPreviewServer(preview_host, preview_port, self.preview_store)
+            if preview_enabled
+            else None
+        )
         self._socket: socket.socket | None = None
         self._stop_event = threading.Event()
 
@@ -47,6 +63,8 @@ class MacServer:
 
         self._socket = server_socket
         logger.info("Server listening on %s:%s", self.host, self.port)
+        if self.preview_server is not None:
+            self.preview_server.start()
 
     def serve_forever(self, once: bool = False) -> None:
         self.start()
@@ -79,6 +97,8 @@ class MacServer:
             self._socket.close()
             self._socket = None
             logger.info("Server stopped")
+        if self.preview_server is not None:
+            self.preview_server.stop()
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
         with client_socket:
@@ -109,7 +129,7 @@ class MacServer:
 
     def _process_message(self, message: Message, binary_payload: bytes) -> Message:
         try:
-            return handle_message(message, binary_payload, self.storage_dir)
+            return handle_message(message, binary_payload, self.storage_dir, self.preview_store)
         except ValueError as exc:
             logger.warning("Invalid message: %s", exc)
             return make_error_response(str(exc))
@@ -139,6 +159,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", help="Override server host from config")
     parser.add_argument("--port", type=int, help="Override server port from config")
     parser.add_argument("--once", action="store_true", help="Handle one connection and exit")
+    parser.add_argument("--preview-host", help="HTTP MJPEG preview bind host")
+    parser.add_argument("--preview-port", type=int, help="HTTP MJPEG preview port")
+    parser.add_argument("--no-preview", action="store_true", help="Disable HTTP MJPEG preview server")
     return parser.parse_args()
 
 
@@ -154,8 +177,20 @@ def main() -> int:
     storage_dir = Path(server_config.get("storage_dir", "data/received"))
     if not storage_dir.is_absolute():
         storage_dir = REPO_ROOT / storage_dir
+    preview_config = config.get("preview", {})
+    preview_host = args.preview_host or preview_config.get("host", "127.0.0.1")
+    preview_port = args.preview_port or int(preview_config.get("port", 8080))
+    preview_enabled = bool(preview_config.get("enabled", True)) and not args.no_preview
 
-    server = MacServer(host=host, port=port, backlog=backlog, storage_dir=storage_dir)
+    server = MacServer(
+        host=host,
+        port=port,
+        backlog=backlog,
+        storage_dir=storage_dir,
+        preview_host=preview_host,
+        preview_port=preview_port,
+        preview_enabled=preview_enabled,
+    )
     try:
         server.serve_forever(once=args.once)
     except KeyboardInterrupt:

@@ -49,6 +49,35 @@ def make_camera_frame_message(device_id: str, frame: CameraFrame) -> Message:
     )
 
 
+def make_camera_stream_frame_message(
+    device_id: str,
+    frame: CameraFrame,
+    session_id: str,
+    frame_index: int,
+    fps: float,
+    jpeg_quality: int,
+    save_frame: bool,
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="camera_stream_frame",
+        payload={
+            "session_id": session_id,
+            "frame_id": frame.frame_id,
+            "frame_index": frame_index,
+            "width": frame.width,
+            "height": frame.height,
+            "format": frame.image_format,
+            "content_type": frame.content_type,
+            "byte_count": len(frame.data),
+            "source": "picamera2",
+            "fps": fps,
+            "jpeg_quality": jpeg_quality,
+            "save_frame": save_frame,
+        },
+    )
+
+
 def make_telemetry_message(device_id: str) -> Message:
     return make_message(
         device_id=device_id,

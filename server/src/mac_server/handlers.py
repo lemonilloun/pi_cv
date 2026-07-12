@@ -7,14 +7,21 @@ from pathlib import Path
 import time
 
 from mac_server.protocol import make_ack_response, make_image_ack_response
+from mac_server.preview import LatestFrameStore
 from shared.messages import Message
 
 
 logger = logging.getLogger(__name__)
 
 
-def handle_message(message: Message, binary_payload: bytes = b"", storage_dir: Path | None = None) -> Message:
-    logger.info(
+def handle_message(
+    message: Message,
+    binary_payload: bytes = b"",
+    storage_dir: Path | None = None,
+    preview_store: LatestFrameStore | None = None,
+) -> Message:
+    log = logger.debug if message.type == "camera_stream_frame" else logger.info
+    log(
         "Handling message from device_id=%s type=%s payload=%s binary_payload_bytes=%s",
         message.device_id,
         message.type,
@@ -31,6 +38,9 @@ def handle_message(message: Message, binary_payload: bytes = b"", storage_dir: P
         if storage_dir is None:
             raise ValueError("storage_dir is required for camera frame messages")
         return _handle_camera_frame_message(message, binary_payload, storage_dir)
+
+    if message.type == "camera_stream_frame":
+        return _handle_camera_stream_frame_message(message, binary_payload, storage_dir, preview_store)
 
     return make_ack_response(message)
 
@@ -64,20 +74,57 @@ def _handle_camera_frame_message(message: Message, binary_payload: bytes, storag
             f"Camera frame byte count mismatch: expected {expected_byte_count}, got {actual_byte_count}"
         )
 
+    saved_path = _save_camera_frame(message, binary_payload, storage_dir / "camera")
+    logger.info("Saved camera frame to %s", saved_path)
+    return make_image_ack_response(message, str(saved_path), actual_byte_count)
+
+
+def _handle_camera_stream_frame_message(
+    message: Message,
+    binary_payload: bytes,
+    storage_dir: Path | None,
+    preview_store: LatestFrameStore | None,
+) -> Message:
+    expected_byte_count = int(message.payload.get("byte_count", -1))
+    actual_byte_count = len(binary_payload)
+
+    if expected_byte_count != actual_byte_count:
+        raise ValueError(
+            f"Camera stream frame byte count mismatch: expected {expected_byte_count}, got {actual_byte_count}"
+        )
+
+    if preview_store is not None:
+        preview_store.update(binary_payload, message.payload)
+
+    saved_path = ""
+    if bool(message.payload.get("save_frame")):
+        if storage_dir is None:
+            raise ValueError("storage_dir is required to save stream frames")
+        saved_path = str(_save_camera_frame(message, binary_payload, storage_dir / "stream"))
+
+    frame_index = int(message.payload.get("frame_index", 0))
+    log = logger.info if frame_index == 1 or frame_index % 30 == 0 else logger.debug
+    log(
+        "Received stream frame session=%s index=%s bytes=%s saved=%s",
+        message.payload.get("session_id"),
+        frame_index,
+        actual_byte_count,
+        bool(saved_path),
+    )
+    return make_image_ack_response(message, saved_path, actual_byte_count)
+
+
+def _save_camera_frame(message: Message, binary_payload: bytes, target_dir: Path) -> Path:
     frame_id = _safe_filename_part(str(message.payload.get("frame_id", "frame")))
     device_id = _safe_filename_part(message.device_id)
     image_format = str(message.payload.get("format", "jpeg"))
     extension = "jpg" if image_format == "jpeg" else image_format
     timestamp_ms = int(time.time() * 1000)
 
-    camera_dir = storage_dir / "camera"
-    saved_path = camera_dir / f"{timestamp_ms}_{device_id}_{frame_id}.{extension}"
-
-    camera_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = target_dir / f"{timestamp_ms}_{device_id}_{frame_id}.{extension}"
+    target_dir.mkdir(parents=True, exist_ok=True)
     saved_path.write_bytes(binary_payload)
-
-    logger.info("Saved camera frame to %s", saved_path)
-    return make_image_ack_response(message, str(saved_path), actual_byte_count)
+    return saved_path
 
 
 def _safe_filename_part(value: str) -> str:

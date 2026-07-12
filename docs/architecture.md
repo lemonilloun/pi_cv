@@ -83,9 +83,17 @@ Contains MacBook server code.
 5. Server saves the frame into `data/received/camera/`.
 6. Server returns an `ack` response containing the saved path and byte count.
 
+## Camera Stream Flow
+
+1. Raspberry Pi starts `Picamera2` video capture and JPEG encoding.
+2. Client sends each frame as a `camera_stream_frame` packet.
+3. Server validates the byte count and updates the latest in-memory preview frame.
+4. Server exposes the latest frames as MJPEG at `http://127.0.0.1:8080/`.
+5. Stream frames are not saved by default; use `--stream-save-frames true` only for debugging.
+
 ## Next Steps
 
 - Add structured message types for camera frames, IMU samples, status, and errors.
 - Add integration tests that start a server on a random local port.
 - Add reconnection/backoff logic on the client.
-- Add chunking or streaming mode for continuous camera frames.
+- Add optional H.264 path with `rpicam-vid` for higher quality/lower bandwidth streaming.

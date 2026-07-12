@@ -39,6 +39,7 @@ def load_env_file(path: Path) -> None:
 def apply_env_overrides(config: dict[str, Any]) -> None:
     server_config = config.setdefault("server", {})
     client_config = config.setdefault("client", {})
+    preview_config = config.setdefault("preview", {})
     logging_config = config.setdefault("logging", {})
 
     if value := os.environ.get("PI_CV_SERVER_BIND_HOST"):
@@ -47,6 +48,13 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         server_config["port"] = int(value)
     if value := os.environ.get("PI_CV_STORAGE_DIR"):
         server_config["storage_dir"] = value
+
+    if value := os.environ.get("PI_CV_PREVIEW_HOST"):
+        preview_config["host"] = value
+    if value := os.environ.get("PI_CV_PREVIEW_PORT"):
+        preview_config["port"] = int(value)
+    if value := os.environ.get("PI_CV_PREVIEW_ENABLED"):
+        preview_config["enabled"] = value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
     if value := os.environ.get("PI_CV_SERVER_HOST"):
         client_config["server_host"] = value

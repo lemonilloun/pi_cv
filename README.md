@@ -243,6 +243,105 @@ The server saves camera frames into:
 data/received/camera/
 ```
 
+## Stream Camera Video
+
+Start the MacBook TCP server. It also starts a local browser preview server:
+
+```bash
+cd /Users/lehacho/Desktop/works/cv_pojects/pi_cv
+./scripts/run_server.sh
+```
+
+Open this URL on the MacBook:
+
+```text
+http://127.0.0.1:8080/
+```
+
+From Raspberry Pi over SSH, start streaming:
+
+```bash
+ssh pi@192.168.1.137
+cd ~/pi_cv
+source .venv/bin/activate
+./scripts/run_client.sh --telemetry --camera-stream
+```
+
+Default stream settings are conservative for Wi-Fi and SD-card lifetime:
+
+```text
+1280x720, 12 FPS, JPEG quality 85, no per-frame saving on Raspberry Pi or MacBook
+```
+
+Higher quality local Wi-Fi test:
+
+```bash
+./scripts/run_client.sh --camera-stream \
+  --camera-width 1920 \
+  --camera-height 1080 \
+  --stream-fps 15 \
+  --stream-quality 90
+```
+
+Stop streaming with `Ctrl+C` in the Raspberry Pi SSH terminal.
+
+If you explicitly want the MacBook server to save every streamed frame, use:
+
+```bash
+./scripts/run_client.sh --camera-stream --stream-save-frames true
+```
+
+This can fill disk quickly, so keep it off for normal preview.
+
+### Camera Module 3 Autofocus
+
+Continuous autofocus, normal range:
+
+```bash
+./scripts/run_client.sh --camera-stream \
+  --camera-autofocus-mode continuous \
+  --camera-autofocus-range normal \
+  --camera-autofocus-speed fast
+```
+
+Macro / close-object streaming:
+
+```bash
+./scripts/run_client.sh --camera-stream \
+  --camera-autofocus-mode continuous \
+  --camera-autofocus-range macro \
+  --camera-autofocus-speed fast
+```
+
+Manual focus example. `lens-position` is in dioptres: `0.0` is infinity, `2.0` is about 0.5 m:
+
+```bash
+./scripts/run_client.sh --camera-stream \
+  --camera-autofocus-mode manual \
+  --camera-lens-position 2.0
+```
+
+The same autofocus flags also work with one-shot capture:
+
+```bash
+./scripts/run_client.sh --telemetry --camera-shot --camera-autofocus-range macro
+```
+
+### Optional H.264 Direction
+
+The built-in project stream is MJPEG over the existing Python TCP protocol, which is simple and good for debugging and future CV frame handling.
+For the highest quality and lower bandwidth, the next streaming option should use `rpicam-vid` H.264. Raspberry Pi documents network video streaming with:
+
+```bash
+rpicam-vid -t 0 -n --inline -o udp://MACBOOK_IP:PORT
+```
+
+or TCP listener mode:
+
+```bash
+rpicam-vid -t 0 -n --inline --listen -o tcp://0.0.0.0:PORT
+```
+
 ## One-shot Test
 
 For a quick local check, start the server in one-shot mode:
