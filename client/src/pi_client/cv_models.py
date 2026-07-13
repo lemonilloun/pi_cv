@@ -102,59 +102,75 @@ def depth_to_npz_bytes(depth_map: Any) -> bytes:
     return buffer.getvalue()
 
 
-def run_yolo(image_bytes: bytes, model_path: str, confidence: float, task: str = "detect") -> YoloResult:
-    started_at = time.perf_counter()
-    try:
-        import cv2
-        import numpy as np
-        from ultralytics import YOLO
-    except ImportError as exc:
-        raise CvModelError(
-            "YOLO dependencies are missing. Install on Raspberry Pi with: "
-            "pip install ultralytics ncnn"
-        ) from exc
+class WarmYolo:
+    """YOLO model loaded once and reused across frames."""
 
-    image_array = _decode_image_bgr(image_bytes)
-    model = YOLO(model_path, task=task)
-    results = model(image_array, conf=confidence, verbose=False)
-    result = results[0]
+    def __init__(self, model_path: str, task: str = "detect") -> None:
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise CvModelError(
+                "YOLO dependencies are missing. Install on Raspberry Pi with: "
+                "pip install ultralytics ncnn"
+            ) from exc
 
-    names = result.names
-    detections: list[Detection] = []
-    boxes = result.boxes
-    masks = result.masks
+        self.model_path = model_path
+        self.task = task
+        self._model = YOLO(model_path, task=task)
 
-    for index in range(len(boxes)):
-        xyxy = boxes[index].xyxy.cpu().numpy().reshape(-1).astype(float).tolist()
-        class_id = int(boxes[index].cls.item())
-        class_name = str(names.get(class_id, class_id))
-        conf = float(boxes[index].conf.item())
-        polygon = None
-        if masks is not None and masks.xy is not None and index < len(masks.xy):
-            polygon = masks.xy[index].astype(float).tolist()
+    def infer_bgr(self, image_array: Any, confidence: float) -> YoloResult:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise CvModelError("OpenCV is required for YOLO inference") from exc
 
-        detections.append(
-            Detection(
-                class_id=class_id,
-                class_name=class_name,
-                confidence=conf,
-                bbox_xyxy=xyxy,
-                mask_polygon=polygon,
+        started_at = time.perf_counter()
+        results = self._model(image_array, conf=confidence, verbose=False)
+        result = results[0]
+
+        names = result.names
+        detections: list[Detection] = []
+        boxes = result.boxes
+        masks = result.masks
+
+        for index in range(len(boxes)):
+            xyxy = boxes[index].xyxy.cpu().numpy().reshape(-1).astype(float).tolist()
+            class_id = int(boxes[index].cls.item())
+            class_name = str(names.get(class_id, class_id))
+            conf = float(boxes[index].conf.item())
+            polygon = None
+            if masks is not None and masks.xy is not None and index < len(masks.xy):
+                polygon = masks.xy[index].astype(float).tolist()
+
+            detections.append(
+                Detection(
+                    class_id=class_id,
+                    class_name=class_name,
+                    confidence=conf,
+                    bbox_xyxy=xyxy,
+                    mask_polygon=polygon,
+                )
             )
+
+        plotted = result.plot()
+        ok, encoded = cv2.imencode(".jpg", plotted)
+        if not ok:
+            raise CvModelError("Failed to encode YOLO annotated image")
+
+        return YoloResult(
+            detections=detections,
+            annotated_image=encoded.tobytes(),
+            inference_ms=(time.perf_counter() - started_at) * 1000,
+            model_path=self.model_path,
+            task=self.task,
         )
 
-    plotted = result.plot()
-    ok, encoded = cv2.imencode(".jpg", plotted)
-    if not ok:
-        raise CvModelError("Failed to encode YOLO annotated image")
+    def infer(self, image_bytes: bytes, confidence: float) -> YoloResult:
+        return self.infer_bgr(_decode_image_bgr(image_bytes), confidence)
 
-    return YoloResult(
-        detections=detections,
-        annotated_image=encoded.tobytes(),
-        inference_ms=(time.perf_counter() - started_at) * 1000,
-        model_path=model_path,
-        task=task,
-    )
+
+def run_yolo(image_bytes: bytes, model_path: str, confidence: float, task: str = "detect") -> YoloResult:
+    return WarmYolo(model_path=model_path, task=task).infer(image_bytes, confidence)
 
 
 def run_depth(
@@ -307,6 +323,137 @@ def _run_synthetic_depth(image_bytes: bytes, input_size: int, is_metric: bool) -
     )
 
 
+class WarmDepthAnythingV2:
+    """Depth Anything V2 model loaded once and reused across frames."""
+
+    def __init__(
+        self,
+        model_path: str | None,
+        encoder: str,
+        input_size: int,
+        is_metric: bool,
+        torch_threads: int | None = None,
+    ) -> None:
+        resolved_model_path = _resolve_depth_anything_v2_model_path(model_path)
+        if not resolved_model_path.exists():
+            raise CvModelError(
+                f"Depth Anything V2 checkpoint not found: {resolved_model_path}. "
+                "Run: ./scripts/setup_depth_anything_v2.sh small"
+            )
+
+        _ensure_depth_anything_v2_import_path()
+
+        try:
+            import torch
+            from depth_anything_v2.dpt import DepthAnythingV2
+        except ImportError as exc:
+            raise CvModelError(
+                "Depth Anything V2 dependencies are missing. Run: ./scripts/setup_depth_anything_v2.sh small"
+            ) from exc
+
+        model_configs = {
+            "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+            "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+            "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+        }
+        if encoder not in model_configs:
+            raise CvModelError(f"Unsupported Depth Anything V2 encoder: {encoder}")
+
+        if torch_threads is not None and torch_threads > 0:
+            torch.set_num_threads(torch_threads)
+
+        self.model_id = str(resolved_model_path)
+        self.input_size = input_size
+        self.is_metric = is_metric
+        self._torch = torch
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = DepthAnythingV2(**model_configs[encoder])
+        checkpoint = torch.load(str(resolved_model_path), map_location="cpu")
+        model.load_state_dict(checkpoint)
+        self._model = model.to(self._device).eval()
+
+    def infer_bgr(self, image_array: Any) -> DepthResult:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise CvModelError("NumPy is required for depth inference") from exc
+
+        started_at = time.perf_counter()
+        with self._torch.no_grad():
+            depth = self._model.infer_image(image_array, self.input_size)
+        depth = np.asarray(depth, dtype="float32")
+
+        return DepthResult(
+            depth_map=depth,
+            heatmap_image=_depth_to_heatmap_jpeg(depth),
+            inference_ms=(time.perf_counter() - started_at) * 1000,
+            backend="depth-anything-v2",
+            model_id=self.model_id,
+            input_size=self.input_size,
+            is_metric=self.is_metric,
+            min_depth=float(np.min(depth)),
+            max_depth=float(np.max(depth)),
+        )
+
+    def infer(self, image_bytes: bytes) -> DepthResult:
+        return self.infer_bgr(_decode_image_bgr(image_bytes))
+
+
+class WarmSyntheticDepth:
+    """Synthetic gradient depth used for loopback testing without torch."""
+
+    def __init__(self, input_size: int, is_metric: bool) -> None:
+        self.input_size = input_size
+        self.is_metric = is_metric
+
+    def infer_bgr(self, image_array: Any) -> DepthResult:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise CvModelError("Synthetic depth backend requires NumPy") from exc
+
+        started_at = time.perf_counter()
+        height, width = image_array.shape[:2]
+        y_gradient = np.linspace(0.0, 1.0, height, dtype="float32").reshape(height, 1)
+        depth = np.repeat(y_gradient, width, axis=1)
+
+        return DepthResult(
+            depth_map=depth,
+            heatmap_image=_depth_to_heatmap_jpeg(depth),
+            inference_ms=(time.perf_counter() - started_at) * 1000,
+            backend="synthetic",
+            model_id="synthetic-gradient",
+            input_size=self.input_size,
+            is_metric=self.is_metric,
+            min_depth=float(np.min(depth)),
+            max_depth=float(np.max(depth)),
+        )
+
+    def infer(self, image_bytes: bytes) -> DepthResult:
+        return self.infer_bgr(_decode_image_bgr(image_bytes))
+
+
+def make_warm_depth_model(
+    backend: str,
+    model_path: str | None,
+    encoder: str,
+    input_size: int,
+    is_metric: bool,
+    torch_threads: int | None = None,
+) -> WarmDepthAnythingV2 | WarmSyntheticDepth:
+    if backend == "synthetic":
+        return WarmSyntheticDepth(input_size=input_size, is_metric=is_metric)
+    if backend == "depth-anything-v2":
+        return WarmDepthAnythingV2(
+            model_path=model_path,
+            encoder=encoder,
+            input_size=input_size,
+            is_metric=is_metric,
+            torch_threads=torch_threads,
+        )
+    raise CvModelError(f"Unsupported warm depth backend: {backend}")
+
+
 def _run_depth_anything_v2(
     image_bytes: bytes,
     model_path: str | None,
@@ -314,57 +461,12 @@ def _run_depth_anything_v2(
     input_size: int,
     is_metric: bool,
 ) -> DepthResult:
-    started_at = time.perf_counter()
-    resolved_model_path = _resolve_depth_anything_v2_model_path(model_path)
-
-    if not resolved_model_path.exists():
-        raise CvModelError(
-            f"Depth Anything V2 checkpoint not found: {resolved_model_path}. "
-            "Run: ./scripts/setup_depth_anything_v2.sh small"
-        )
-
-    _ensure_depth_anything_v2_import_path()
-
-    try:
-        import cv2
-        import numpy as np
-        import torch
-        from depth_anything_v2.dpt import DepthAnythingV2
-    except ImportError as exc:
-        raise CvModelError(
-            "Depth Anything V2 dependencies are missing. Run: ./scripts/setup_depth_anything_v2.sh small"
-        ) from exc
-
-    model_configs = {
-        "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
-        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
-        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
-    }
-    if encoder not in model_configs:
-        raise CvModelError(f"Unsupported Depth Anything V2 encoder: {encoder}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DepthAnythingV2(**model_configs[encoder])
-    checkpoint = torch.load(str(resolved_model_path), map_location="cpu")
-    model.load_state_dict(checkpoint)
-    model = model.to(device).eval()
-
-    image = _decode_image_bgr(image_bytes)
-    with torch.no_grad():
-        depth = model.infer_image(image, input_size)
-    depth = np.asarray(depth, dtype="float32")
-
-    return DepthResult(
-        depth_map=depth,
-        heatmap_image=_depth_to_heatmap_jpeg(depth),
-        inference_ms=(time.perf_counter() - started_at) * 1000,
-        backend="depth-anything-v2",
-        model_id=str(resolved_model_path),
+    return WarmDepthAnythingV2(
+        model_path=model_path,
+        encoder=encoder,
         input_size=input_size,
         is_metric=is_metric,
-        min_depth=float(np.min(depth)),
-        max_depth=float(np.max(depth)),
-    )
+    ).infer(image_bytes)
 
 
 def _run_depth_anything_v3(

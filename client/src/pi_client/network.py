@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 from types import TracebackType
 
 from shared.framing import receive_packet, send_packet
@@ -24,6 +25,7 @@ class PiClient:
         self.timeout_seconds = timeout_seconds
         self._socket: socket.socket | None = None
         self._reader = None
+        self._send_lock = threading.Lock()
 
     def connect(self) -> None:
         if self._socket is not None:
@@ -43,7 +45,8 @@ class PiClient:
             raise ClientConnectionError("Client is not connected")
 
         try:
-            send_packet(self._socket, message, binary_payload)
+            with self._send_lock:
+                send_packet(self._socket, message, binary_payload)
         except OSError as exc:
             self.close()
             raise ClientConnectionError("Failed to send message") from exc
@@ -78,6 +81,12 @@ class PiClient:
             len(binary_payload),
         )
         return response, binary_payload
+
+    def set_socket_timeout(self, timeout: float | None) -> None:
+        """Adjust the socket timeout (None = blocking). Long-running sessions
+        remove the connect timeout so the receiver thread can block freely."""
+        if self._socket is not None:
+            self._socket.settimeout(timeout)
 
     def request(self, message: Message, binary_payload: bytes = b"") -> tuple[Message, bytes]:
         self.connect()

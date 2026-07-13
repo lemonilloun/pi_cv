@@ -26,3 +26,5 @@ external/
 *.pt
 *.pth
 *_ncnn_model/
+
+CLAUDE.md

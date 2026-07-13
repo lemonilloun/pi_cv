@@ -53,6 +53,26 @@ def make_cv_result_ack_response(
     )
 
 
+def make_command_message(
+    command_id: str,
+    action: str,
+    mode: str | None = None,
+    params: dict[str, object] | None = None,
+) -> Message:
+    payload: dict[str, object] = {
+        "command_id": command_id,
+        "action": action,
+        "params": params or {},
+    }
+    if mode is not None:
+        payload["mode"] = mode
+    return make_message(
+        device_id=SERVER_DEVICE_ID,
+        message_type="command",
+        payload=payload,
+    )
+
+
 def make_error_response(error_message: str) -> Message:
     return make_message(
         device_id=SERVER_DEVICE_ID,

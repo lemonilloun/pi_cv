@@ -99,10 +99,37 @@ Contains MacBook server code.
 4. Client sends the package as a `cv_result` message.
 5. Server stores and extracts it in `data/received/cv/<run_id>/`.
 
+## Persistent Session Flow
+
+`scripts/run_pi_session.sh` starts one long-lived client (`pi_client/session.py`)
+controlled from the web panel served at `http://127.0.0.1:8080/`.
+
+Threads on the client per connection:
+
+- worker (main thread): mode state machine (idle/stream/depth/yolo/pipeline),
+  owns the camera and warm models, produces frames.
+- receiver: sole socket reader; acks release in-flight send slots, `command`
+  messages go to the worker's queue.
+- telemetry: 1 Hz `system_telemetry` from `/proc/stat`, `/proc/meminfo`, and
+  `/sys/class/thermal` (no psutil).
+
+On the server, `session_hello` registers the connection in `ClientRegistry`
+(`mac_server/registry.py`); the HTTP control panel (`mac_server/preview.py`)
+pushes `command` messages over the same TCP socket under a per-connection send
+lock. Telemetry history is kept in a rolling `TelemetryStore` deque and served
+via `GET /api/telemetry`.
+
+Backpressure: each outbound client message consumes one of 4 in-flight slots
+released by its ack; frames are dropped (never queued) when the window is full,
+so telemetry and command results stay responsive during streaming.
+
+The client reconnects with exponential backoff (1→30 s), re-sends
+`session_hello`, and re-applies the last requested mode. Models load lazily on
+first use and stay warm across mode switches and reconnects.
+
 ## Next Steps
 
-- Add structured message types for camera frames, IMU samples, status, and errors.
+- Add structured message types for IMU samples.
 - Add integration tests that start a server on a random local port.
-- Add reconnection/backoff logic on the client.
 - Add optional H.264 path with `rpicam-vid` for higher quality/lower bandwidth streaming.
 - Benchmark Depth Anything V2 Small, YOLO NCNN, and the combined pipeline on Raspberry Pi 5.

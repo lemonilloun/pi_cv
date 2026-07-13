@@ -15,6 +15,28 @@
     "host": "127.0.0.1",
     "port": 8080
   },
+  "session": {
+    "source": "camera",
+    "initial_mode": "idle",
+    "telemetry_hz": 1.0,
+    "camera_width": 1280,
+    "camera_height": 720,
+    "stream_fps": 30.0,
+    "stream_quality": 85,
+    "cv_fps": 1.0,
+    "reconnect_min_seconds": 1.0,
+    "reconnect_max_seconds": 30.0,
+    "synthetic_image": "data/cat.jpg",
+    "yolo_model": "models/yolo26n-seg_ncnn_model",
+    "yolo_task": "segment",
+    "yolo_confidence": 0.5,
+    "depth_backend": "depth-anything-v2",
+    "depth_model_path": "models/depth_anything_v2_vits.pth",
+    "depth_encoder": "vits",
+    "depth_input_size": 392,
+    "depth_is_metric": false,
+    "torch_threads": 3
+  },
   "logging": {
     "level": "INFO"
   }

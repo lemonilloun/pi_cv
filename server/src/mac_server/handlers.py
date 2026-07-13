@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import socket
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 import time
 import zipfile
@@ -10,10 +13,24 @@ from io import BytesIO
 
 from mac_server.protocol import make_ack_response, make_cv_result_ack_response, make_image_ack_response
 from mac_server.preview import LatestFrameStore
+from mac_server.registry import ClientHandle, ClientRegistry, TelemetryStore
 from shared.messages import Message
 
 
 logger = logging.getLogger(__name__)
+
+QUIET_MESSAGE_TYPES = {"camera_stream_frame", "system_telemetry"}
+
+
+@dataclass
+class SessionContext:
+    """Per-connection context so handlers can register session clients."""
+
+    registry: ClientRegistry
+    telemetry_store: TelemetryStore
+    client_socket: socket.socket
+    client_address: tuple[str, int]
+    send_lock: threading.Lock
 
 
 def handle_message(
@@ -21,8 +38,9 @@ def handle_message(
     binary_payload: bytes = b"",
     storage_dir: Path | None = None,
     preview_store: LatestFrameStore | None = None,
+    session_context: SessionContext | None = None,
 ) -> Message:
-    log = logger.debug if message.type == "camera_stream_frame" else logger.info
+    log = logger.debug if message.type in QUIET_MESSAGE_TYPES else logger.info
     log(
         "Handling message from device_id=%s type=%s payload=%s binary_payload_bytes=%s",
         message.device_id,
@@ -49,6 +67,54 @@ def handle_message(
             raise ValueError("storage_dir is required for CV result messages")
         return _handle_cv_result_message(message, binary_payload, storage_dir)
 
+    if message.type == "session_hello" and session_context is not None:
+        return _handle_session_hello_message(message, session_context)
+
+    if message.type == "system_telemetry" and session_context is not None:
+        return _handle_system_telemetry_message(message, session_context)
+
+    if message.type == "command_result" and session_context is not None:
+        return _handle_command_result_message(message, session_context)
+
+    return make_ack_response(message)
+
+
+def _handle_session_hello_message(message: Message, context: SessionContext) -> Message:
+    handle = ClientHandle(
+        device_id=message.device_id,
+        session_id=str(message.payload.get("session_id", "")),
+        sock=context.client_socket,
+        send_lock=context.send_lock,
+        address=context.client_address,
+        hello_payload=dict(message.payload),
+        mode=str(message.payload.get("mode", "idle")),
+    )
+    context.registry.register(handle)
+    return make_ack_response(message)
+
+
+def _handle_system_telemetry_message(message: Message, context: SessionContext) -> Message:
+    context.telemetry_store.add(message.device_id, message.payload)
+    handle = context.registry.find_by_socket(context.client_socket)
+    if handle is not None and message.payload.get("mode"):
+        handle.mode = str(message.payload["mode"])
+    return make_ack_response(message)
+
+
+def _handle_command_result_message(message: Message, context: SessionContext) -> Message:
+    handle = context.registry.find_by_socket(context.client_socket)
+    if handle is not None:
+        handle.last_command_result = dict(message.payload)
+        if message.payload.get("ok") and message.payload.get("mode"):
+            handle.mode = str(message.payload["mode"])
+    logger.info(
+        "Command result from device_id=%s command_id=%s ok=%s mode=%s error=%s",
+        message.device_id,
+        message.payload.get("command_id"),
+        message.payload.get("ok"),
+        message.payload.get("mode"),
+        message.payload.get("error"),
+    )
     return make_ack_response(message)
 
 

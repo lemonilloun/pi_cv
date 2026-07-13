@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi_cv Control Panel</title>
+<style>
+  :root {
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #222220;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --good: #0ca30c;
+    --critical: #d03b3b;
+    --series-1: #3987e5;
+    --series-2: #199e70;
+    --series-3: #c98500;
+    --series-4: #008300;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  .conn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+  .conn .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+  }
+  .conn.online .dot { background: var(--good); }
+  .conn.offline .dot { background: var(--critical); }
+  main {
+    display: grid;
+    grid-template-columns: minmax(420px, 1.6fr) minmax(340px, 1fr);
+    gap: 16px;
+    padding: 16px 20px;
+    max-width: 1500px;
+    margin: 0 auto;
+  }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .video-card { padding: 0; overflow: hidden; position: relative; }
+  .video-card img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: contain;
+    background: #000;
+  }
+  .video-overlay {
+    position: absolute;
+    top: 10px; left: 10px;
+    display: flex;
+    gap: 8px;
+  }
+  .badge {
+    background: rgba(13, 13, 13, 0.75);
+    border: 1px solid var(--border);
+    color: var(--ink-2);
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 12px;
+  }
+  .badge strong { color: var(--ink); font-weight: 600; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .controls button {
+    flex: 1 1 auto;
+    min-width: 84px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--ink-2);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .controls button:hover:not(:disabled) { border-color: var(--muted); color: var(--ink); }
+  .controls button:disabled { opacity: 0.45; cursor: default; }
+  .controls button.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .controls button.pending { border-color: var(--accent); color: var(--accent); }
+  .section-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 10px;
+  }
+  #cmdError {
+    color: var(--critical);
+    font-size: 12.5px;
+    margin: 8px 0 0;
+    min-height: 16px;
+  }
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+    gap: 8px;
+  }
+  .tile {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .tile .label { color: var(--muted); font-size: 11.5px; }
+  .tile .value { font-size: 20px; font-weight: 600; margin-top: 2px; }
+  .tile .value small { font-size: 12px; font-weight: 400; color: var(--ink-2); }
+  .chart-block { margin-top: 14px; }
+  .chart-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .chart-head .title { font-size: 13px; font-weight: 600; color: var(--ink-2); }
+  .legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-2); }
+  .legend .chip { display: inline-flex; align-items: center; gap: 5px; }
+  .legend .swatch { width: 10px; height: 3px; border-radius: 2px; }
+  .chart-wrap { position: relative; }
+  canvas { display: block; width: 100%; height: 110px; }
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(13, 13, 13, 0.92);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 11.5px;
+    color: var(--ink-2);
+    display: none;
+    white-space: nowrap;
+    z-index: 5;
+  }
+  .tooltip .row { display: flex; align-items: center; gap: 6px; }
+  .tooltip .swatch { width: 8px; height: 8px; border-radius: 2px; }
+  .tooltip .val { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 10px; }
+  .meta-line { color: var(--muted); font-size: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>pi_cv Control Panel</h1>
+  <span class="conn offline" id="conn"><span class="dot"></span><span id="connText">connecting…</span></span>
+  <span class="conn" id="deviceInfo" style="margin-left:auto"></span>
+</header>
+
+<main>
+  <section>
+    <div class="card video-card">
+      <img id="stream" src="/stream.mjpg" alt="Live stream from Raspberry Pi">
+      <div class="video-overlay">
+        <span class="badge" id="viewBadge">no frames yet</span>
+        <span class="badge" id="inferBadge" style="display:none"></span>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <p class="section-title">Mode</p>
+      <div class="controls" id="modeButtons">
+        <button data-mode="idle">Idle</button>
+        <button data-mode="stream">Stream</button>
+        <button data-mode="depth">Depth</button>
+        <button data-mode="yolo">YOLO</button>
+        <button data-mode="pipeline">Pipeline</button>
+      </div>
+      <p id="cmdError"></p>
+      <p class="meta-line" id="modelsLine"></p>
+    </div>
+  </section>
+
+  <section class="card">
+    <p class="section-title">Raspberry Pi Monitor</p>
+    <div class="tiles" id="tiles">
+      <div class="tile"><div class="label">CPU total</div><div class="value" id="tileCpu">–</div></div>
+      <div class="tile"><div class="label">Temperature</div><div class="value" id="tileTemp">–</div></div>
+      <div class="tile"><div class="label">Memory</div><div class="value" id="tileMem">–</div></div>
+      <div class="tile"><div class="label">Load 1m</div><div class="value" id="tileLoad">–</div></div>
+      <div class="tile"><div class="label">Stream FPS</div><div class="value" id="tileFps">–</div></div>
+    </div>
+
+    <div class="chart-block">
+      <div class="chart-head">
+        <span class="title">CPU per core, %</span>
+        <span class="legend" id="cpuLegend"></span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="cpuChart"></canvas>
+        <div class="tooltip" id="cpuTip"></div>
+      </div>
+    </div>
+
+    <div class="chart-block">
+      <div class="chart-head"><span class="title">Temperature, °C</span></div>
+      <div class="chart-wrap">
+        <canvas id="tempChart"></canvas>
+        <div class="tooltip" id="tempTip"></div>
+      </div>
+    </div>
+
+    <div class="chart-block">
+      <div class="chart-head"><span class="title">Memory used, %</span></div>
+      <div class="chart-wrap">
+        <canvas id="memChart"></canvas>
+        <div class="tooltip" id="memTip"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const SERIES_COLORS = ["#3987e5", "#199e70", "#c98500", "#008300"];
+const WINDOW_SAMPLES = 180;
+
+// ---------------------------------------------------------------- state
+const state = {
+  samples: [],          // [{ts, cpuTotal, perCore:[], temp, memPct, load, fps}]
+  device: null,
+  pendingMode: null,
+  pendingSince: 0,
+};
+
+function pushSample(payload) {
+  const ts = payload.sample_ts || payload.received_at;
+  if (!ts) return;
+  const last = state.samples[state.samples.length - 1];
+  if (last && Math.abs(last.ts - ts) < 0.01) return; // dedupe
+  state.samples.push({
+    ts,
+    cpuTotal: numOrNull(payload.cpu_percent_total),
+    perCore: Array.isArray(payload.cpu_percent_per_core) ? payload.cpu_percent_per_core : null,
+    temp: numOrNull(payload.temp_c),
+    memPct: numOrNull(payload.mem_percent),
+    load: numOrNull(payload.load_avg_1m),
+    fps: numOrNull(payload.fps_actual),
+  });
+  if (state.samples.length > WINDOW_SAMPLES) {
+    state.samples.splice(0, state.samples.length - WINDOW_SAMPLES);
+  }
+}
+
+function numOrNull(v) { return (typeof v === "number" && isFinite(v)) ? v : null; }
+
+// ---------------------------------------------------------------- charts
+function makeChart(canvasId, tipId, opts) {
+  const canvas = document.getElementById(canvasId);
+  const tip = document.getElementById(tipId);
+  const ctx = canvas.getContext("2d");
+  let hoverIndex = null;
+
+  function seriesList() { return opts.series(state.samples); }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const padL = 30, padR = 6, padT = 6, padB = 4;
+    const plotW = w - padL - padR, plotH = h - padT - padB;
+    const samples = state.samples;
+    const list = seriesList();
+
+    let [yMin, yMax] = opts.range(samples);
+    if (yMax - yMin < 1e-6) yMax = yMin + 1;
+
+    // gridlines + y labels
+    ctx.strokeStyle = "#2c2c2a";
+    ctx.fillStyle = "#898781";
+    ctx.lineWidth = 1;
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const gridSteps = 2;
+    for (let g = 0; g <= gridSteps; g++) {
+      const value = yMin + (yMax - yMin) * g / gridSteps;
+      const y = padT + plotH - plotH * g / gridSteps;
+      ctx.beginPath();
+      ctx.moveTo(padL, Math.round(y) + 0.5);
+      ctx.lineTo(w - padR, Math.round(y) + 0.5);
+      ctx.stroke();
+      ctx.fillText(opts.fmt(value), padL - 5, y);
+    }
+
+    if (samples.length < 2) return;
+
+    const x = (i) => padL + plotW * i / (WINDOW_SAMPLES - 1 || 1);
+    const offset = WINDOW_SAMPLES - samples.length;
+    const y = (v) => padT + plotH - plotH * (v - yMin) / (yMax - yMin);
+
+    list.forEach((series) => {
+      ctx.strokeStyle = series.color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      let started = false;
+      samples.forEach((s, i) => {
+        const v = series.value(s);
+        if (v === null || v === undefined) { started = false; return; }
+        const px = x(offset + i), py = y(v);
+        if (!started) { ctx.moveTo(px, py); started = true; }
+        else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    });
+
+    // hover crosshair + markers
+    if (hoverIndex !== null && samples[hoverIndex]) {
+      const px = x(offset + hoverIndex);
+      ctx.strokeStyle = "#383835";
+      ctx.beginPath();
+      ctx.moveTo(px, padT);
+      ctx.lineTo(px, padT + plotH);
+      ctx.stroke();
+      list.forEach((series) => {
+        const v = series.value(samples[hoverIndex]);
+        if (v === null || v === undefined) return;
+        ctx.fillStyle = series.color;
+        ctx.strokeStyle = "#1a1a19";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(px, y(v), 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      });
+    }
+  }
+
+  canvas.addEventListener("mousemove", (event) => {
+    const rect = canvas.getBoundingClientRect();
+    const padL = 30, padR = 6;
+    const plotW = rect.width - padL - padR;
+    const samples = state.samples;
+    if (samples.length < 2) return;
+    const offset = WINDOW_SAMPLES - samples.length;
+    const frac = (event.clientX - rect.left - padL) / plotW;
+    let idx = Math.round(frac * (WINDOW_SAMPLES - 1)) - offset;
+    idx = Math.max(0, Math.min(samples.length - 1, idx));
+    hoverIndex = idx;
+
+    const s = samples[idx];
+    const rows = seriesList().map((series) => {
+      const v = series.value(s);
+      return `<div class="row"><span class="swatch" style="background:${series.color}"></span>` +
+        `${series.name}<span class="val">${v === null || v === undefined ? "–" : opts.fmt(v)}</span></div>`;
+    }).join("");
+    const when = new Date(s.ts * 1000).toLocaleTimeString();
+    tip.innerHTML = `<div class="row" style="color:#898781">${when}</div>` + rows;
+    tip.style.display = "block";
+    const tipX = Math.min(event.clientX - rect.left + 12, rect.width - tip.offsetWidth - 4);
+    tip.style.left = Math.max(0, tipX) + "px";
+    tip.style.top = "4px";
+    draw();
+  });
+  canvas.addEventListener("mouseleave", () => {
+    hoverIndex = null;
+    tip.style.display = "none";
+    draw();
+  });
+
+  return { draw };
+}
+
+const cpuChart = makeChart("cpuChart", "cpuTip", {
+  series(samples) {
+    const cores = samples.reduce((max, s) => Math.max(max, s.perCore ? s.perCore.length : 0), 0);
+    const list = [];
+    for (let c = 0; c < Math.min(cores, SERIES_COLORS.length); c++) {
+      list.push({
+        name: "Core " + c,
+        color: SERIES_COLORS[c],
+        value: (s) => (s.perCore && s.perCore[c] !== undefined) ? s.perCore[c] : null,
+      });
+    }
+    if (!list.length) {
+      list.push({ name: "CPU", color: SERIES_COLORS[0], value: (s) => s.cpuTotal });
+    }
+    return list;
+  },
+  range() { return [0, 100]; },
+  fmt: (v) => Math.round(v) + "%",
+});
+
+const tempChart = makeChart("tempChart", "tempTip", {
+  series() { return [{ name: "SoC temp", color: SERIES_COLORS[0], value: (s) => s.temp }]; },
+  range(samples) {
+    const vals = samples.map((s) => s.temp).filter((v) => v !== null);
+    if (!vals.length) return [30, 80];
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    return [Math.floor((lo - 3) / 5) * 5, Math.ceil((hi + 3) / 5) * 5];
+  },
+  fmt: (v) => Math.round(v) + "°",
+});
+
+const memChart = makeChart("memChart", "memTip", {
+  series() { return [{ name: "Memory used", color: SERIES_COLORS[0], value: (s) => s.memPct }]; },
+  range() { return [0, 100]; },
+  fmt: (v) => Math.round(v) + "%",
+});
+
+function drawCharts() {
+  cpuChart.draw();
+  tempChart.draw();
+  memChart.draw();
+}
+
+function renderCpuLegend() {
+  const cores = state.samples.reduce((max, s) => Math.max(max, s.perCore ? s.perCore.length : 0), 0);
+  const legend = document.getElementById("cpuLegend");
+  if (!cores) { legend.innerHTML = ""; return; }
+  let html = "";
+  for (let c = 0; c < Math.min(cores, SERIES_COLORS.length); c++) {
+    html += `<span class="chip"><span class="swatch" style="background:${SERIES_COLORS[c]}"></span>Core ${c}</span>`;
+  }
+  legend.innerHTML = html;
+}
+
+// ---------------------------------------------------------------- status
+function fmtOrDash(v, suffix, digits) {
+  if (v === null || v === undefined) return "–";
+  return v.toFixed(digits === undefined ? 0 : digits) + (suffix || "");
+}
+
+function renderStatus(status) {
+  const conn = document.getElementById("conn");
+  const connText = document.getElementById("connText");
+  const device = status.devices && status.devices.length ? status.devices[0] : null;
+  state.device = device;
+
+  if (device) {
+    conn.className = "conn online";
+    connText.textContent = "session online";
+    document.getElementById("deviceInfo").textContent =
+      device.device_id + (device.hostname ? " · " + device.hostname : "") + " · " + device.address;
+  } else {
+    conn.className = "conn offline";
+    connText.textContent = "no session client";
+    document.getElementById("deviceInfo").textContent = "";
+  }
+
+  // telemetry
+  const t = device && device.telemetry;
+  if (t) {
+    pushSample(t);
+    document.getElementById("tileCpu").textContent = fmtOrDash(numOrNull(t.cpu_percent_total), "%");
+    document.getElementById("tileTemp").textContent = fmtOrDash(numOrNull(t.temp_c), "°C");
+    document.getElementById("tileMem").textContent = fmtOrDash(numOrNull(t.mem_percent), "%");
+    document.getElementById("tileLoad").textContent = fmtOrDash(numOrNull(t.load_avg_1m), "", 2);
+    document.getElementById("tileFps").textContent = fmtOrDash(numOrNull(t.fps_actual), "", 1);
+    renderCpuLegend();
+    drawCharts();
+  }
+
+  // mode buttons
+  const currentMode = device ? device.mode : null;
+  const result = device && device.last_command_result;
+  if (state.pendingMode) {
+    const confirmed = currentMode === state.pendingMode;
+    const failed = result && result.ok === false && (Date.now() / 1000 - state.pendingSince) < 60;
+    if (confirmed || failed || Date.now() / 1000 - state.pendingSince > 30) {
+      if (failed && !confirmed) {
+        document.getElementById("cmdError").textContent =
+          "Mode switch failed: " + (result.error || "unknown error");
+      }
+      state.pendingMode = null;
+    }
+  }
+  document.querySelectorAll("#modeButtons button").forEach((btn) => {
+    const mode = btn.dataset.mode;
+    btn.disabled = !device;
+    btn.classList.toggle("active", mode === currentMode && !state.pendingMode);
+    btn.classList.toggle("pending", mode === state.pendingMode);
+    btn.textContent = (mode === state.pendingMode ? "⏳ " : "") + mode.charAt(0).toUpperCase() + mode.slice(1);
+  });
+
+  // models line
+  const models = device && device.models;
+  document.getElementById("modelsLine").textContent = models
+    ? `YOLO: ${models.yolo_model || "–"} (${models.yolo_task || "–"}) · Depth: ${models.depth_backend || "–"} ${models.depth_encoder || ""}`
+    : "";
+
+  // frame badge
+  const frame = status.latest_frame;
+  const viewBadge = document.getElementById("viewBadge");
+  const inferBadge = document.getElementById("inferBadge");
+  if (frame) {
+    const view = frame.view || "camera";
+    viewBadge.innerHTML = `view: <strong>${view}</strong>` + (frame.mode ? ` · mode: <strong>${frame.mode}</strong>` : "");
+    if (frame.inference_ms !== undefined && frame.inference_ms !== null) {
+      inferBadge.style.display = "";
+      inferBadge.textContent = "inference " + Math.round(frame.inference_ms) + " ms";
+    } else {
+      inferBadge.style.display = "none";
+    }
+  }
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/api/status");
+    if (res.ok) renderStatus(await res.json());
+  } catch (err) {
+    document.getElementById("conn").className = "conn offline";
+    document.getElementById("connText").textContent = "server unreachable";
+  }
+}
+
+async function backfill() {
+  try {
+    const res = await fetch("/api/telemetry?seconds=180");
+    if (!res.ok) return;
+    const data = await res.json();
+    const deviceIds = Object.keys(data.devices || {});
+    if (!deviceIds.length) return;
+    for (const entry of data.devices[deviceIds[0]]) pushSample(entry);
+    renderCpuLegend();
+    drawCharts();
+  } catch (err) { /* server not ready yet */ }
+}
+
+document.getElementById("modeButtons").addEventListener("click", async (event) => {
+  const btn = event.target.closest("button");
+  if (!btn || btn.disabled) return;
+  const mode = btn.dataset.mode;
+  document.getElementById("cmdError").textContent = "";
+  state.pendingMode = mode;
+  state.pendingSince = Date.now() / 1000;
+  renderStatus({ devices: state.device ? [state.device] : [], latest_frame: null });
+  try {
+    const res = await fetch("/api/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      document.getElementById("cmdError").textContent = body.error || ("HTTP " + res.status);
+      state.pendingMode = null;
+    }
+  } catch (err) {
+    document.getElementById("cmdError").textContent = "Request failed: " + err;
+    state.pendingMode = null;
+  }
+  poll();
+});
+
+// MJPEG <img> stalls if the stream drops; nudge it periodically when broken.
+const streamImg = document.getElementById("stream");
+streamImg.addEventListener("error", () => {
+  setTimeout(() => { streamImg.src = "/stream.mjpg?" + Date.now(); }, 2000);
+});
+
+window.addEventListener("resize", drawCharts);
+
+backfill().then(poll);
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

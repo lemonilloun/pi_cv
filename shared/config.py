@@ -40,6 +40,7 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
     server_config = config.setdefault("server", {})
     client_config = config.setdefault("client", {})
     preview_config = config.setdefault("preview", {})
+    session_config = config.setdefault("session", {})
     logging_config = config.setdefault("logging", {})
 
     if value := os.environ.get("PI_CV_SERVER_BIND_HOST"):
@@ -62,6 +63,25 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         client_config["device_id"] = value
     if value := os.environ.get("PI_CV_CONNECT_TIMEOUT_SECONDS"):
         client_config["connect_timeout_seconds"] = float(value)
+
+    if value := os.environ.get("PI_CV_SESSION_SOURCE"):
+        session_config["source"] = value
+    if value := os.environ.get("PI_CV_SESSION_INITIAL_MODE"):
+        session_config["initial_mode"] = value
+    if value := os.environ.get("PI_CV_SESSION_STREAM_FPS"):
+        session_config["stream_fps"] = float(value)
+    if value := os.environ.get("PI_CV_SESSION_CV_FPS"):
+        session_config["cv_fps"] = float(value)
+    if value := os.environ.get("PI_CV_SESSION_YOLO_MODEL"):
+        session_config["yolo_model"] = value
+    if value := os.environ.get("PI_CV_SESSION_YOLO_TASK"):
+        session_config["yolo_task"] = value
+    if value := os.environ.get("PI_CV_SESSION_DEPTH_BACKEND"):
+        session_config["depth_backend"] = value
+    if value := os.environ.get("PI_CV_SESSION_DEPTH_MODEL_PATH"):
+        session_config["depth_model_path"] = value
+    if value := os.environ.get("PI_CV_SESSION_TORCH_THREADS"):
+        session_config["torch_threads"] = int(value)
 
     if value := os.environ.get("PI_CV_LOG_LEVEL"):
         logging_config["level"] = value

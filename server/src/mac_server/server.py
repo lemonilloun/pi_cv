@@ -15,9 +15,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mac_server.handlers import handle_message
+from mac_server.handlers import SessionContext, handle_message
 from mac_server.preview import LatestFrameStore, MjpegPreviewServer
 from mac_server.protocol import make_error_response
+from mac_server.registry import ClientRegistry, TelemetryStore
 from shared.config import load_config
 from shared.framing import receive_packet, send_packet
 from shared.messages import Message
@@ -44,8 +45,16 @@ class MacServer:
         self.backlog = backlog
         self.storage_dir = storage_dir or REPO_ROOT / "data/received"
         self.preview_store = LatestFrameStore()
+        self.registry = ClientRegistry()
+        self.telemetry_store = TelemetryStore()
         self.preview_server = (
-            MjpegPreviewServer(preview_host, preview_port, self.preview_store)
+            MjpegPreviewServer(
+                preview_host,
+                preview_port,
+                self.preview_store,
+                registry=self.registry,
+                telemetry_store=self.telemetry_store,
+            )
             if preview_enabled
             else None
         )
@@ -101,35 +110,59 @@ class MacServer:
             self.preview_server.stop()
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
-        with client_socket:
-            while not self._stop_event.is_set():
-                try:
-                    message, binary_payload = receive_packet(client_socket)
-                except EOFError:
-                    logger.info("Client disconnected %s:%s", address[0], address[1])
-                    return
-                except ValueError as exc:
-                    logger.warning("Invalid packet from %s:%s: %s", address[0], address[1], exc)
-                    try:
-                        send_packet(client_socket, make_error_response(str(exc)))
-                    except OSError:
-                        return
-                    return
-                except OSError as exc:
-                    logger.warning("Failed reading from %s:%s: %s", address[0], address[1], exc)
-                    return
-
-                response = self._process_message(message, binary_payload)
-
-                try:
-                    send_packet(client_socket, response)
-                except OSError as exc:
-                    logger.warning("Failed sending to %s:%s: %s", address[0], address[1], exc)
-                    return
-
-    def _process_message(self, message: Message, binary_payload: bytes) -> Message:
+        send_lock = threading.Lock()
+        session_context = SessionContext(
+            registry=self.registry,
+            telemetry_store=self.telemetry_store,
+            client_socket=client_socket,
+            client_address=address,
+            send_lock=send_lock,
+        )
         try:
-            return handle_message(message, binary_payload, self.storage_dir, self.preview_store)
+            with client_socket:
+                while not self._stop_event.is_set():
+                    try:
+                        message, binary_payload = receive_packet(client_socket)
+                    except EOFError:
+                        logger.info("Client disconnected %s:%s", address[0], address[1])
+                        return
+                    except ValueError as exc:
+                        logger.warning("Invalid packet from %s:%s: %s", address[0], address[1], exc)
+                        try:
+                            with send_lock:
+                                send_packet(client_socket, make_error_response(str(exc)))
+                        except OSError:
+                            return
+                        return
+                    except OSError as exc:
+                        logger.warning("Failed reading from %s:%s: %s", address[0], address[1], exc)
+                        return
+
+                    response = self._process_message(message, binary_payload, session_context)
+
+                    try:
+                        with send_lock:
+                            send_packet(client_socket, response)
+                    except OSError as exc:
+                        logger.warning("Failed sending to %s:%s: %s", address[0], address[1], exc)
+                        return
+        finally:
+            self.registry.unregister(client_socket)
+
+    def _process_message(
+        self,
+        message: Message,
+        binary_payload: bytes,
+        session_context: SessionContext,
+    ) -> Message:
+        try:
+            return handle_message(
+                message,
+                binary_payload,
+                self.storage_dir,
+                self.preview_store,
+                session_context=session_context,
+            )
         except ValueError as exc:
             logger.warning("Invalid message: %s", exc)
             return make_error_response(str(exc))
