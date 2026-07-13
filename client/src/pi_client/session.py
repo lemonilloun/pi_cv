@@ -240,12 +240,14 @@ class SessionRuntime:
                     self._produce_cv_frame()
                 else:
                     self._disconnected.wait(timeout=0.2)
-            except FrameSourceError as exc:
-                logger.error("Frame source failed in mode=%s: %s; falling back to idle", self._mode, exc)
-                self._switch_mode("idle", command_id=None)
             except ClientConnectionError:
                 self._disconnected.set()
                 return
+            except Exception as exc:
+                # A single bad frame (camera glitch, model postprocessing
+                # error) must not take down the whole session process.
+                logger.error("Frame production failed in mode=%s: %s; falling back to idle", self._mode, exc)
+                self._switch_mode("idle", command_id=None)
 
     def _drain_commands(self) -> None:
         while True:

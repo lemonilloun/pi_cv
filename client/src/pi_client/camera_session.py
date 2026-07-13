@@ -157,7 +157,18 @@ class PicameraCaptureSource:
         if self._picam2 is None:
             raise FrameSourceError("Camera capture source is not started")
         try:
-            return self._picam2.capture_array("main")
+            import numpy as np
+
+            array = self._picam2.capture_array("main")
+            # Picamera2 raw captures are frequently a strided view (row
+            # padding) and may carry a stray alpha channel; downstream
+            # NCNN inference needs a plain contiguous HxWx3 uint8 buffer,
+            # same as what cv2.imdecode always produced on the old path.
+            if array.ndim == 3 and array.shape[2] > 3:
+                array = array[:, :, :3]
+            return np.ascontiguousarray(array)
+        except FrameSourceError:
+            raise
         except Exception as exc:
             raise FrameSourceError(f"Failed to capture camera frame: {exc}") from exc
 
