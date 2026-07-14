@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mac_server.handlers import SessionContext, handle_message
-from mac_server.preview import LatestFrameStore, MjpegPreviewServer
+from mac_server.preview import FrameStoreHub, MjpegPreviewServer
 from mac_server.protocol import make_error_response
 from mac_server.registry import ClientRegistry, TelemetryStore
 from shared.config import load_config
@@ -39,27 +39,72 @@ class MacServer:
         preview_host: str = "127.0.0.1",
         preview_port: int = 8080,
         preview_enabled: bool = True,
+        server_cv_config: dict[str, Any] | None = None,
+        mapping_config: dict[str, Any] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.backlog = backlog
         self.storage_dir = storage_dir or REPO_ROOT / "data/received"
-        self.preview_store = LatestFrameStore()
+        self.frame_hub = FrameStoreHub()
+        self.preview_store = self.frame_hub.get("pi")
         self.registry = ClientRegistry()
         self.telemetry_store = TelemetryStore()
+        self.cv_worker = self._build_cv_worker(server_cv_config or {})
+        self.room_store, self.scan_controller = self._build_mapping(mapping_config or {})
         self.preview_server = (
             MjpegPreviewServer(
                 preview_host,
                 preview_port,
-                self.preview_store,
+                self.frame_hub,
                 registry=self.registry,
                 telemetry_store=self.telemetry_store,
+                cv_status_provider=(self.cv_worker.status if self.cv_worker is not None else None),
+                scan_controller=self.scan_controller,
+                room_store=self.room_store,
             )
             if preview_enabled
             else None
         )
         self._socket: socket.socket | None = None
         self._stop_event = threading.Event()
+
+    def _build_cv_worker(self, cv_config: dict[str, Any]):
+        if not cv_config.get("enabled", False):
+            return None
+        try:
+            from mac_server.cv_worker import ServerCvWorker
+        except ImportError as exc:
+            logger.warning("Server CV disabled (import failed): %s", exc)
+            return None
+        return ServerCvWorker(
+            pi_store=self.preview_store,
+            frame_hub=self.frame_hub,
+            config=cv_config,
+            repo_root=REPO_ROOT,
+        )
+
+    def _build_mapping(self, mapping_config: dict[str, Any]):
+        if self.cv_worker is None or not mapping_config:
+            return None, None
+        try:
+            from mac_server.mapping.rooms import RoomStore
+            from mac_server.mapping.scanner import ScanController
+        except ImportError as exc:
+            logger.warning("Mapping disabled (import failed): %s", exc)
+            return None, None
+        rooms_dir = Path(mapping_config.get("rooms_dir", "data/rooms"))
+        if not rooms_dir.is_absolute():
+            rooms_dir = REPO_ROOT / rooms_dir
+        room_store = RoomStore(rooms_dir, mapping_config)
+        scan_controller = ScanController(
+            room_store=room_store,
+            cv_worker=self.cv_worker,
+            frame_hub=self.frame_hub,
+            registry=self.registry,
+            config=mapping_config,
+        )
+        return room_store, scan_controller
 
     def start(self) -> None:
         if self._socket is not None:
@@ -74,6 +119,8 @@ class MacServer:
         logger.info("Server listening on %s:%s", self.host, self.port)
         if self.preview_server is not None:
             self.preview_server.start()
+        if self.cv_worker is not None:
+            self.cv_worker.start()
 
     def serve_forever(self, once: bool = False) -> None:
         self.start()
@@ -102,6 +149,10 @@ class MacServer:
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self.scan_controller is not None:
+            self.scan_controller.shutdown()
+        if self.cv_worker is not None:
+            self.cv_worker.stop()
         if self._socket is not None:
             self._socket.close()
             self._socket = None
@@ -195,6 +246,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-host", help="HTTP MJPEG preview bind host")
     parser.add_argument("--preview-port", type=int, help="HTTP MJPEG preview port")
     parser.add_argument("--no-preview", action="store_true", help="Disable HTTP MJPEG preview server")
+    parser.add_argument("--no-cv", action="store_true", help="Disable server-side CV worker and mapping")
     return parser.parse_args()
 
 
@@ -215,6 +267,12 @@ def main() -> int:
     preview_port = args.preview_port or int(preview_config.get("port", 8080))
     preview_enabled = bool(preview_config.get("enabled", True)) and not args.no_preview
 
+    server_cv_config = dict(config.get("server_cv", {}))
+    mapping_config = dict(config.get("mapping", {}))
+    if args.no_cv:
+        server_cv_config["enabled"] = False
+        mapping_config = {}
+
     server = MacServer(
         host=host,
         port=port,
@@ -223,6 +281,8 @@ def main() -> int:
         preview_host=preview_host,
         preview_port=preview_port,
         preview_enabled=preview_enabled,
+        server_cv_config=server_cv_config,
+        mapping_config=mapping_config,
     )
     try:
         server.serve_forever(once=args.once)

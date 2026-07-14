@@ -1,0 +1,8 @@
+# Optional server-side CV dependencies (Mac). The TCP server core is
+# stdlib-only; these are needed only when server_cv.enabled is true.
+# Install: python3 -m pip install -r server/requirements-server-cv.txt
+# Then run ./scripts/setup_server_cv.sh for the DA2 repo + metric checkpoint.
+torch>=2.1
+opencv-python
+numpy
+# ultralytics  # V3: server-side YOLO landmarks (not needed yet)

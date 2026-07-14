@@ -127,9 +127,39 @@ The client reconnects with exponential backoff (1→30 s), re-sends
 `session_hello`, and re-applies the last requested mode. Models load lazily on
 first use and stay warm across mode switches and reconnects.
 
+## Server-Side CV + Room Mapping Flow
+
+`mac_server/cv_worker.py` runs Depth Anything V2 metric (indoor) on the Mac
+(MPS) against the incoming 30 fps camera stream: heatmap JPEGs go to the
+`depth` view store, raw metric depth arrays (`DepthFrame`) go to a single-slot
+`LatestItemStore` consumed by the mapper. `FrameStoreHub` (preview.py) holds
+named frame stores (`pi`/`depth`/`map`) served via `/stream.mjpg?view=...`.
+
+Room mapping (`mac_server/mapping/`):
+
+1. `geometry.py` — pinhole intrinsics from the Camera Module 3 Wide FOV
+   (102°x67°), depth→3D points, height-band filtering (floor/ceiling removal),
+   per-frame wall-distance anchoring, camera→room transforms for the four
+   axis-aligned scan directions.
+2. `grid.py` — hit-count + max-height occupancy grid (0.05 m cells) and PNG
+   rendering (walls bright, obstacles colored by height, 1 m gridlines).
+3. `rooms.py` — room configs in `data/rooms/<id>.json`, scan state and
+   estimated dimensions in `data/rooms/<id>/state.json`.
+4. `scanner.py` — `ScanController` thread per active scan: consume depth
+   frames, anchor by facing-wall distance (EMA + jump rejection), accumulate
+   into the direction grid, re-render the fused map every 0.5 s, persist on
+   stop.
+
+Scan convention without IMU: the camera faces one wall and moves only along
+the viewing axis; each frame is independently anchored by its measured wall
+distance, so a stationary camera is a valid degenerate case and drift cannot
+accumulate. Four directional scans fuse into one grid by axis-aligned
+transforms and auto-estimate the room rectangle.
+
 ## Next Steps
 
-- Add structured message types for IMU samples.
-- Add integration tests that start a server on a random local port.
+- V3 mapping: YOLO object landmarks on the room map (ultralytics on the Mac),
+  person masking during scans.
+- Add structured message types for IMU samples; fuse IMU odometry into scans.
 - Add optional H.264 path with `rpicam-vid` for higher quality/lower bandwidth streaming.
-- Benchmark Depth Anything V2 Small, YOLO NCNN, and the combined pipeline on Raspberry Pi 5.
+- Benchmark the combined pipeline on Raspberry Pi 5 once the AI HAT arrives.

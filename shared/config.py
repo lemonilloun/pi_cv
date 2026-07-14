@@ -41,6 +41,7 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
     client_config = config.setdefault("client", {})
     preview_config = config.setdefault("preview", {})
     session_config = config.setdefault("session", {})
+    server_cv_config = config.setdefault("server_cv", {})
     logging_config = config.setdefault("logging", {})
 
     if value := os.environ.get("PI_CV_SERVER_BIND_HOST"):
@@ -82,6 +83,15 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         session_config["depth_model_path"] = value
     if value := os.environ.get("PI_CV_SESSION_TORCH_THREADS"):
         session_config["torch_threads"] = int(value)
+
+    if value := os.environ.get("PI_CV_SERVER_CV_ENABLED"):
+        server_cv_config["enabled"] = value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    if value := os.environ.get("PI_CV_SERVER_CV_DEVICE"):
+        server_cv_config["device"] = value
+    if value := os.environ.get("PI_CV_SERVER_CV_INPUT_SIZE"):
+        server_cv_config["depth_input_size"] = int(value)
+    if value := os.environ.get("PI_CV_SERVER_CV_TARGET_FPS"):
+        server_cv_config["target_fps"] = float(value)
 
     if value := os.environ.get("PI_CV_LOG_LEVEL"):
         logging_config["level"] = value

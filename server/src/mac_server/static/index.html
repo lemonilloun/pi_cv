@@ -81,6 +81,27 @@
     display: flex;
     gap: 8px;
   }
+  .view-pills {
+    position: absolute;
+    top: 10px; right: 10px;
+    display: flex;
+    gap: 4px;
+    background: rgba(13, 13, 13, 0.75);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px;
+  }
+  .view-pills button {
+    border: none;
+    background: transparent;
+    color: var(--ink-2);
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .view-pills button:disabled { opacity: 0.35; cursor: default; }
+  .view-pills button.active { background: var(--accent); color: #fff; }
   .badge {
     background: rgba(13, 13, 13, 0.75);
     border: 1px solid var(--border);
@@ -170,6 +191,51 @@
   .tooltip .swatch { width: 8px; height: 8px; border-radius: 2px; }
   .tooltip .val { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 10px; }
   .meta-line { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .map-room-row { display: flex; gap: 8px; }
+  .map-room-row select {
+    flex: 1;
+    background: var(--surface-2);
+    color: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .map-form-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .map-form-row input {
+    flex: 1;
+    min-width: 100px;
+    background: var(--surface-2);
+    color: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .ghost-btn {
+    background: var(--surface-2);
+    color: var(--ink-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .ghost-btn:hover { border-color: var(--muted); color: var(--ink); }
+  .scan-btn {
+    flex: 1;
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: #fff;
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .scan-btn:disabled { opacity: 0.45; cursor: default; }
+  .scan-btn.stop { background: var(--critical); border-color: var(--critical); }
+  #dirButtons button.done::after { content: " ✓"; color: var(--good); }
 </style>
 </head>
 <body>
@@ -182,10 +248,15 @@
 <main>
   <section>
     <div class="card video-card">
-      <img id="stream" src="/stream.mjpg" alt="Live stream from Raspberry Pi">
+      <img id="stream" src="/stream.mjpg?view=pi" alt="Live stream from Raspberry Pi">
       <div class="video-overlay">
         <span class="badge" id="viewBadge">no frames yet</span>
         <span class="badge" id="inferBadge" style="display:none"></span>
+      </div>
+      <div class="view-pills" id="viewPills">
+        <button data-view="pi" class="active">Pi</button>
+        <button data-view="depth" disabled>Depth</button>
+        <button data-view="map" disabled>Map</button>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -199,6 +270,37 @@
       </div>
       <p id="cmdError"></p>
       <p class="meta-line" id="modelsLine"></p>
+    </div>
+
+    <div class="card" style="margin-top:16px" id="mappingCard">
+      <p class="section-title">Mapping</p>
+      <div class="map-room-row">
+        <select id="roomSelect"><option value="">— select room —</option></select>
+        <button id="newRoomBtn" class="ghost-btn">+ New room</button>
+      </div>
+      <div id="newRoomForm" style="display:none">
+        <div class="map-form-row">
+          <input id="roomName" type="text" placeholder="Room name">
+          <input id="roomW" type="number" step="0.1" min="1" placeholder="Width, m (opt)">
+          <input id="roomL" type="number" step="0.1" min="1" placeholder="Length, m (opt)">
+          <input id="roomCamH" type="number" step="0.05" min="0" placeholder="Cam height, m" value="0.3">
+        </div>
+        <div class="map-form-row">
+          <button id="createRoomBtn" class="ghost-btn">Create</button>
+          <button id="cancelRoomBtn" class="ghost-btn">Cancel</button>
+        </div>
+      </div>
+      <div class="controls" id="dirButtons" style="margin-top:10px">
+        <button data-dir="north">North</button>
+        <button data-dir="east">East</button>
+        <button data-dir="south">South</button>
+        <button data-dir="west">West</button>
+      </div>
+      <div class="map-form-row" style="margin-top:10px">
+        <button id="scanBtn" class="scan-btn" disabled>Start scan</button>
+      </div>
+      <p class="meta-line" id="scanStatusLine"></p>
+      <p id="mapError" style="color:var(--critical);font-size:12.5px;min-height:16px;margin:6px 0 0"></p>
     </div>
   </section>
 
@@ -275,6 +377,41 @@ function pushSample(payload) {
 }
 
 function numOrNull(v) { return (typeof v === "number" && isFinite(v)) ? v : null; }
+
+// ------------------------------------------------------------ view pills
+state.currentView = "pi";
+
+function setView(view) {
+  if (state.currentView === view) return;
+  state.currentView = view;
+  document.getElementById("stream").src = "/stream.mjpg?view=" + view + "&t=" + Date.now();
+  document.querySelectorAll("#viewPills button").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.view === view);
+  });
+}
+
+document.getElementById("viewPills").addEventListener("click", (event) => {
+  const btn = event.target.closest("button");
+  if (!btn || btn.disabled) return;
+  setView(btn.dataset.view);
+});
+
+function renderViewPills(status) {
+  const views = status.views || {};
+  const cv = status.server_cv || {};
+  document.querySelectorAll("#viewPills button").forEach((btn) => {
+    const view = btn.dataset.view;
+    if (view === "pi") return; // always available
+    const hasFrames = views[view] !== undefined && views[view] !== null;
+    btn.disabled = !hasFrames;
+  });
+  // Falling back if the active view disappeared (e.g. server restart)
+  if (state.currentView !== "pi") {
+    const meta = views[state.currentView];
+    if (meta === undefined) setView("pi");
+  }
+  return cv;
+}
 
 // ---------------------------------------------------------------- charts
 function makeChart(canvasId, tipId, opts) {
@@ -518,18 +655,45 @@ function renderStatus(status) {
     ? `YOLO: ${models.yolo_model || "–"} (${models.yolo_task || "–"}) · Depth: ${models.depth_backend || "–"} ${models.depth_encoder || ""}`
     : "";
 
-  // frame badge
-  const frame = status.latest_frame;
+  // view pills availability
+  const cv = renderViewPills(status);
+
+  // scan status (embedded in the same 1 Hz poll)
+  if (status.scan !== undefined) {
+    const wasActive = state.scanActive;
+    state.scanActive = !!(status.scan && status.scan.active);
+    renderMappingCard(status.scan);
+    if (wasActive && !state.scanActive) loadRooms(); // refresh scans_done marks
+  }
+
+  // frame badge (depends on which view is displayed)
   const viewBadge = document.getElementById("viewBadge");
   const inferBadge = document.getElementById("inferBadge");
-  if (frame) {
-    const view = frame.view || "camera";
-    viewBadge.innerHTML = `view: <strong>${view}</strong>` + (frame.mode ? ` · mode: <strong>${frame.mode}</strong>` : "");
-    if (frame.inference_ms !== undefined && frame.inference_ms !== null) {
+  if (state.currentView === "depth") {
+    viewBadge.innerHTML = `view: <strong>server depth</strong>` +
+      (cv.fps ? ` · <strong>${cv.fps}</strong> fps` : "");
+    if (cv.inference_ms) {
       inferBadge.style.display = "";
-      inferBadge.textContent = "inference " + Math.round(frame.inference_ms) + " ms";
+      inferBadge.textContent = "inference " + Math.round(cv.inference_ms) + " ms (" + (cv.device || "?") + ")";
     } else {
       inferBadge.style.display = "none";
+    }
+  } else if (state.currentView === "map") {
+    const meta = (status.views || {}).map;
+    viewBadge.innerHTML = `view: <strong>room map</strong>` +
+      (meta && meta.room_id ? ` · <strong>${meta.room_id}</strong>` : "");
+    inferBadge.style.display = "none";
+  } else {
+    const frame = status.latest_frame;
+    if (frame) {
+      const view = frame.view || "camera";
+      viewBadge.innerHTML = `view: <strong>${view}</strong>` + (frame.mode ? ` · mode: <strong>${frame.mode}</strong>` : "");
+      if (frame.inference_ms !== undefined && frame.inference_ms !== null) {
+        inferBadge.style.display = "";
+        inferBadge.textContent = "inference " + Math.round(frame.inference_ms) + " ms";
+      } else {
+        inferBadge.style.display = "none";
+      }
     }
   }
 }
@@ -583,6 +747,146 @@ document.getElementById("modeButtons").addEventListener("click", async (event) =
   poll();
 });
 
+// ------------------------------------------------------------- mapping
+state.rooms = [];
+state.selectedDir = null;
+state.scanActive = false;
+
+async function loadRooms() {
+  try {
+    const res = await fetch("/api/rooms");
+    if (!res.ok) { document.getElementById("mappingCard").style.display = "none"; return; }
+    const data = await res.json();
+    state.rooms = data.rooms || [];
+    const select = document.getElementById("roomSelect");
+    const current = select.value;
+    select.innerHTML = '<option value="">— select room —</option>' +
+      state.rooms.map((r) => `<option value="${r.room_id}">${r.name}</option>`).join("");
+    if (current && state.rooms.some((r) => r.room_id === current)) select.value = current;
+    renderMappingCard();
+  } catch (err) { /* server not ready */ }
+}
+
+function selectedRoom() {
+  const id = document.getElementById("roomSelect").value;
+  return state.rooms.find((r) => r.room_id === id) || null;
+}
+
+function renderMappingCard(scan) {
+  const room = selectedRoom();
+  const scanActive = scan ? !!scan.active : state.scanActive;
+  document.querySelectorAll("#dirButtons button").forEach((btn) => {
+    const dir = btn.dataset.dir;
+    btn.disabled = !room || scanActive;
+    btn.classList.toggle("active", dir === state.selectedDir);
+    btn.classList.toggle("done", !!(room && room.scans_done && room.scans_done.includes(dir)));
+  });
+  const scanBtn = document.getElementById("scanBtn");
+  if (scanActive) {
+    scanBtn.disabled = false;
+    scanBtn.textContent = "Stop scan";
+    scanBtn.classList.add("stop");
+  } else {
+    scanBtn.disabled = !(room && state.selectedDir);
+    scanBtn.textContent = "Start scan";
+    scanBtn.classList.remove("stop");
+  }
+
+  const line = document.getElementById("scanStatusLine");
+  if (scan && scan.active) {
+    line.textContent =
+      `Scanning ${scan.room_id} · ${scan.direction} · wall ${scan.wall_distance_m ?? "–"} m · ` +
+      `max ${scan.d_max_m ?? "–"} m · frames ${scan.frames_used} (rejected ${scan.frames_rejected})`;
+  } else if (room) {
+    const dims = room.estimated_dims;
+    const dimsText = dims && (dims.width_m || dims.length_m)
+      ? ` · estimated ${dims.width_m ?? "?"}x${dims.length_m ?? "?"} m` : "";
+    line.textContent = `${room.name}: scans done [${(room.scans_done || []).join(", ") || "none"}]` + dimsText;
+  } else {
+    line.textContent = "";
+  }
+}
+
+document.getElementById("roomSelect").addEventListener("change", () => renderMappingCard());
+document.getElementById("dirButtons").addEventListener("click", (event) => {
+  const btn = event.target.closest("button");
+  if (!btn || btn.disabled) return;
+  state.selectedDir = btn.dataset.dir === state.selectedDir ? null : btn.dataset.dir;
+  renderMappingCard();
+});
+
+document.getElementById("newRoomBtn").addEventListener("click", () => {
+  document.getElementById("newRoomForm").style.display = "";
+});
+document.getElementById("cancelRoomBtn").addEventListener("click", () => {
+  document.getElementById("newRoomForm").style.display = "none";
+});
+document.getElementById("createRoomBtn").addEventListener("click", async () => {
+  const body = {
+    name: document.getElementById("roomName").value,
+    width_m: document.getElementById("roomW").value || null,
+    length_m: document.getElementById("roomL").value || null,
+    camera_height_m: parseFloat(document.getElementById("roomCamH").value) || 0.3,
+  };
+  document.getElementById("mapError").textContent = "";
+  try {
+    const res = await fetch("/api/rooms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      document.getElementById("mapError").textContent = data.error || ("HTTP " + res.status);
+      return;
+    }
+    document.getElementById("newRoomForm").style.display = "none";
+    await loadRooms();
+    document.getElementById("roomSelect").value = data.room.room_id;
+    renderMappingCard();
+  } catch (err) {
+    document.getElementById("mapError").textContent = "Request failed: " + err;
+  }
+});
+
+document.getElementById("scanBtn").addEventListener("click", async () => {
+  document.getElementById("mapError").textContent = "";
+  try {
+    if (state.scanActive) {
+      const res = await fetch("/api/scan/stop", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        document.getElementById("mapError").textContent = data.error || ("HTTP " + res.status);
+        return;
+      }
+      state.scanActive = false;
+      await loadRooms();
+    } else {
+      const room = selectedRoom();
+      if (!room || !state.selectedDir) return;
+      const res = await fetch("/api/scan/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room_id: room.room_id, direction: state.selectedDir }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        document.getElementById("mapError").textContent = data.error || ("HTTP " + res.status);
+        return;
+      }
+      state.scanActive = true;
+      // Watching the map build is the point of the scan.
+      setTimeout(() => {
+        const mapBtn = document.querySelector('#viewPills button[data-view="map"]');
+        if (mapBtn && !mapBtn.disabled) setView("map");
+      }, 1500);
+    }
+    renderMappingCard();
+  } catch (err) {
+    document.getElementById("mapError").textContent = "Request failed: " + err;
+  }
+});
+
 // MJPEG <img> stalls if the stream drops; nudge it periodically when broken.
 const streamImg = document.getElementById("stream");
 streamImg.addEventListener("error", () => {
@@ -592,6 +896,7 @@ streamImg.addEventListener("error", () => {
 window.addEventListener("resize", drawCharts);
 
 backfill().then(poll);
+loadRooms();
 setInterval(poll, 1000);
 </script>
 </body>

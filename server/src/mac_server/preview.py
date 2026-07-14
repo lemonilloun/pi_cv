@@ -52,21 +52,56 @@ class LatestFrameStore:
             return self._sequence, self._frame
 
 
+class FrameStoreHub:
+    """Named LatestFrameStores: 'pi' (frames from the Pi), 'depth' (server
+    computed heatmaps), 'map' (rendered room map). Stores are created lazily."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stores: dict[str, LatestFrameStore] = {}
+
+    def get(self, name: str) -> LatestFrameStore:
+        with self._lock:
+            store = self._stores.get(name)
+            if store is None:
+                store = LatestFrameStore()
+                self._stores[name] = store
+            return store
+
+    def peek(self, name: str) -> LatestFrameStore | None:
+        with self._lock:
+            return self._stores.get(name)
+
+    def names(self) -> list[str]:
+        with self._lock:
+            return list(self._stores.keys())
+
+
 class MjpegPreviewServer:
     def __init__(
         self,
         host: str,
         port: int,
-        frame_store: LatestFrameStore,
+        frame_hub: FrameStoreHub,
         registry: Any | None = None,
         telemetry_store: Any | None = None,
+        cv_status_provider: Any | None = None,
+        scan_controller: Any | None = None,
+        room_store: Any | None = None,
     ) -> None:
         self.host = host
         self.port = port
-        self.frame_store = frame_store
+        self.frame_hub = frame_hub
         self._httpd = _ThreadingHttpServer(
             (host, port),
-            _make_handler(frame_store, registry, telemetry_store),
+            _make_handler(
+                frame_hub,
+                registry,
+                telemetry_store,
+                cv_status_provider,
+                scan_controller,
+                room_store,
+            ),
         )
         self._thread: threading.Thread | None = None
 
@@ -92,9 +127,12 @@ class _ThreadingHttpServer(socketserver.ThreadingMixIn, server.HTTPServer):
 
 
 def _make_handler(
-    frame_store: LatestFrameStore,
+    frame_hub: FrameStoreHub,
     registry: Any | None = None,
     telemetry_store: Any | None = None,
+    cv_status_provider: Any | None = None,
+    scan_controller: Any | None = None,
+    room_store: Any | None = None,
 ) -> type[server.BaseHTTPRequestHandler]:
     class StreamingHandler(server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -103,16 +141,22 @@ def _make_handler(
                 self._serve_index()
                 return
             if parsed.path == "/stream.mjpg":
-                self._serve_stream()
+                self._serve_stream(parsed.query)
                 return
             if parsed.path == "/latest.jpg":
-                self._serve_latest_jpeg()
+                self._serve_latest_jpeg(parsed.query)
                 return
             if parsed.path == "/api/status":
                 self._serve_status()
                 return
             if parsed.path == "/api/telemetry":
                 self._serve_telemetry(parsed.query)
+                return
+            if parsed.path == "/api/rooms":
+                self._serve_rooms()
+                return
+            if parsed.path == "/api/scan/status":
+                self._serve_scan_status()
                 return
             self.send_error(404)
 
@@ -121,7 +165,23 @@ def _make_handler(
             if parsed.path == "/api/mode":
                 self._handle_mode_post()
                 return
+            if parsed.path == "/api/rooms":
+                self._handle_rooms_post()
+                return
+            if parsed.path == "/api/scan/start":
+                self._handle_scan_start()
+                return
+            if parsed.path == "/api/scan/stop":
+                self._handle_scan_stop()
+                return
             self._send_json({"error": "not found"}, status=404)
+
+        def _view_store(self, query: str) -> LatestFrameStore | None:
+            params = parse_qs(query)
+            view = params.get("view", ["pi"])[0]
+            if view == "pi":
+                return frame_hub.get("pi")
+            return frame_hub.peek(view)
 
         def log_message(self, format: str, *args: object) -> None:
             logger.debug("Control panel HTTP: " + format, *args)
@@ -158,9 +218,99 @@ def _make_handler(
                         entry["telemetry"] = telemetry_store.latest(handle.device_id)
                     devices.append(entry)
 
-            _, frame = frame_store.latest()
+            _, frame = frame_hub.get("pi").latest()
             frame_meta = frame.metadata if frame is not None else None
-            self._send_json({"devices": devices, "latest_frame": frame_meta})
+
+            views: dict[str, Any] = {}
+            for name in frame_hub.names():
+                store = frame_hub.peek(name)
+                if store is None:
+                    continue
+                _, view_frame = store.latest()
+                views[name] = view_frame.metadata if view_frame is not None else None
+
+            payload: dict[str, Any] = {
+                "devices": devices,
+                "latest_frame": frame_meta,
+                "views": views,
+            }
+            if cv_status_provider is not None:
+                try:
+                    payload["server_cv"] = cv_status_provider()
+                except Exception as exc:  # a broken provider must not kill /api/status
+                    payload["server_cv"] = {"state": "error", "error": str(exc)}
+            else:
+                payload["server_cv"] = {"state": "disabled"}
+            if scan_controller is not None:
+                try:
+                    payload["scan"] = scan_controller.status()
+                except Exception as exc:
+                    payload["scan"] = {"active": False, "error": str(exc)}
+            self._send_json(payload)
+
+        def _serve_rooms(self) -> None:
+            if room_store is None:
+                self._send_json({"error": "mapping is not enabled"}, status=503)
+                return
+            self._send_json({"rooms": room_store.list_rooms()})
+
+        def _handle_rooms_post(self) -> None:
+            if room_store is None:
+                self._send_json({"error": "mapping is not enabled"}, status=503)
+                return
+            body = self._read_json_body()
+            if body is None or not str(body.get("name", "")).strip():
+                self._send_json({"error": "JSON body with non-empty 'name' is required"}, status=400)
+                return
+            try:
+                room = room_store.create_room(body)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"ok": True, "room": room})
+
+        def _serve_scan_status(self) -> None:
+            if scan_controller is None:
+                self._send_json({"active": False, "error": "mapping is not enabled"}, status=503)
+                return
+            self._send_json(scan_controller.status())
+
+        def _handle_scan_start(self) -> None:
+            if scan_controller is None:
+                self._send_json({"error": "mapping is not enabled"}, status=503)
+                return
+            body = self._read_json_body()
+            if body is None:
+                self._send_json({"error": "invalid JSON body"}, status=400)
+                return
+            from mac_server.mapping.scanner import ScanError
+
+            try:
+                result = scan_controller.start_scan(
+                    room_id=str(body.get("room_id", "")),
+                    direction=str(body.get("direction", "")),
+                    lateral_offset_m=body.get("lateral_offset_m"),
+                )
+            except ScanError as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"ok": True, **result})
+
+        def _handle_scan_stop(self) -> None:
+            if scan_controller is None:
+                self._send_json({"error": "mapping is not enabled"}, status=503)
+                return
+            from mac_server.mapping.scanner import ScanError
+
+            try:
+                result = scan_controller.stop_scan()
+            except ScanError as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._send_json({"ok": True, **result})
 
         def _serve_telemetry(self, query: str) -> None:
             if telemetry_store is None:
@@ -223,20 +373,30 @@ def _make_handler(
             self.end_headers()
             self.wfile.write(content)
 
-        def _serve_latest_jpeg(self) -> None:
-            _, frame = frame_store.latest()
+        def _serve_latest_jpeg(self, query: str = "") -> None:
+            store = self._view_store(query)
+            if store is None:
+                self.send_error(404, "Unknown view")
+                return
+            _, frame = store.latest()
             if frame is None:
-                self.send_error(404, "No camera stream frame received yet")
+                self.send_error(404, "No frame received yet for this view")
                 return
 
             self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
+            self.send_header(
+                "Content-Type", str(frame.metadata.get("content_type", "image/jpeg"))
+            )
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(frame.data)))
             self.end_headers()
             self.wfile.write(frame.data)
 
-        def _serve_stream(self) -> None:
+        def _serve_stream(self, query: str = "") -> None:
+            store = self._view_store(query)
+            if store is None:
+                self.send_error(404, "Unknown view")
+                return
             self.send_response(200)
             self.send_header("Age", "0")
             self.send_header("Cache-Control", "no-cache, private")
@@ -247,12 +407,14 @@ def _make_handler(
             sequence = -1
             try:
                 while True:
-                    sequence, frame = frame_store.wait_for_next(sequence)
+                    sequence, frame = store.wait_for_next(sequence)
                     if frame is None:
                         continue
 
                     self.wfile.write(b"--FRAME\r\n")
-                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header(
+                        "Content-Type", str(frame.metadata.get("content_type", "image/jpeg"))
+                    )
                     self.send_header("Content-Length", str(len(frame.data)))
                     self.end_headers()
                     self.wfile.write(frame.data)

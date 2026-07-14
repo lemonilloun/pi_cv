@@ -19,6 +19,7 @@ htmlcov/
 data/received/
 data/camera_local/
 data/cv_runs/
+data/rooms/
 
 research/
 models/

@@ -37,6 +37,34 @@
     "depth_is_metric": false,
     "torch_threads": 3
   },
+  "server_cv": {
+    "enabled": true,
+    "device": "mps",
+    "depth_model_path": "models/depth_anything_v2_metric_hypersim_vits.pth",
+    "depth_encoder": "vits",
+    "depth_input_size": 392,
+    "depth_max_depth_m": 20.0,
+    "display_max_m": 8.0,
+    "target_fps": 15.0
+  },
+  "mapping": {
+    "rooms_dir": "data/rooms",
+    "grid_resolution_m": 0.05,
+    "height_band_m": [0.1, 2.0],
+    "camera_height_m": 0.3,
+    "hfov_deg": 102.0,
+    "vfov_deg": 67.0,
+    "point_stride": 4,
+    "edge_crop_frac": 0.1,
+    "min_hits": 3,
+    "max_depth_use_m": 8.0,
+    "wall_jump_reject_m": 0.5,
+    "wall_ema_alpha": 0.4,
+    "body_offset_m": 0.4,
+    "max_room_m": 10.0,
+    "min_wall_height_m": 1.6,
+    "depth_scale_correction": 1.0
+  },
   "logging": {
     "level": "INFO"
   }
