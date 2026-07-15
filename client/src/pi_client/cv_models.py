@@ -173,6 +173,173 @@ def run_yolo(image_bytes: bytes, model_path: str, confidence: float, task: str =
     return WarmYolo(model_path=model_path, task=task).infer(image_bytes, confidence)
 
 
+COCO80_CLASS_NAMES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
+    "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+    "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
+    "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
+    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
+)
+
+
+class WarmHailoYolo:
+    """YOLO detection on the Raspberry Pi AI HAT (Hailo) via picamera2's
+    Hailo device helper. Expects a Hailo Model Zoo detection .hef with
+    on-chip NMS postprocess (e.g. yolov8s): the output is a per-class list
+    of (N, 5) arrays [ymin, xmin, ymax, xmax, score], normalized 0..1.
+    """
+
+    def __init__(self, hef_path: str, labels_path: str | None = None) -> None:
+        resolved_hef = Path(hef_path)
+        if not resolved_hef.is_absolute():
+            resolved_hef = REPO_ROOT / resolved_hef
+        if not resolved_hef.exists():
+            raise CvModelError(
+                f"Hailo model not found: {resolved_hef}. Install the AI HAT stack with "
+                "'sudo apt install hailo-all' (models land in /usr/share/hailo-models) "
+                "or point --hailo-hef at a Model Zoo .hef"
+            )
+
+        try:
+            from picamera2.devices import Hailo
+        except ImportError as exc:
+            raise CvModelError(
+                "Hailo support is missing. On Raspberry Pi OS install it with: "
+                "sudo apt install hailo-all (then reboot). Requires the AI HAT/HAT+."
+            ) from exc
+
+        self.model_path = str(resolved_hef)
+        self.task = "detect"
+        self.class_names = self._load_labels(labels_path)
+        try:
+            self._hailo = Hailo(self.model_path)
+        except Exception as exc:
+            raise CvModelError(f"Failed to open Hailo device/model: {exc}") from exc
+        input_shape = self._hailo.get_input_shape()
+        self.input_h, self.input_w = int(input_shape[0]), int(input_shape[1])
+
+    @staticmethod
+    def _load_labels(labels_path: str | None) -> tuple[str, ...]:
+        if not labels_path:
+            return COCO80_CLASS_NAMES
+        path = Path(labels_path)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        try:
+            names = tuple(
+                line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+            )
+            return names or COCO80_CLASS_NAMES
+        except OSError:
+            return COCO80_CLASS_NAMES
+
+    def infer_bgr(self, image_array: Any, confidence: float) -> YoloResult:
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as exc:
+            raise CvModelError("OpenCV/NumPy are required for Hailo inference") from exc
+
+        frame_h, frame_w = image_array.shape[:2]
+        # Zoo models are trained on RGB; plain stretch-resize keeps the
+        # normalized output boxes directly mappable to the original frame.
+        rgb = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
+        model_input = cv2.resize(rgb, (self.input_w, self.input_h))
+
+        started_at = time.perf_counter()
+        raw_output = self._hailo.run(model_input)
+        inference_ms = (time.perf_counter() - started_at) * 1000
+
+        detections = self._extract_detections(raw_output, frame_w, frame_h, confidence, np)
+        annotated = self._draw(image_array.copy(), detections, cv2)
+        ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            raise CvModelError("Failed to encode Hailo annotated image")
+
+        return YoloResult(
+            detections=detections,
+            annotated_image=encoded.tobytes(),
+            inference_ms=inference_ms,
+            model_path=self.model_path,
+            task=self.task,
+        )
+
+    def _extract_detections(
+        self,
+        raw_output: Any,
+        frame_w: int,
+        frame_h: int,
+        confidence: float,
+        np: Any,
+    ) -> list[Detection]:
+        # The Hailo helper returns a single output for NMS-postprocessed
+        # detection hefs; unwrap one nesting level if present.
+        output = raw_output
+        if isinstance(output, list) and len(output) == 1 and isinstance(output[0], (list, tuple)):
+            output = output[0]
+
+        detections: list[Detection] = []
+        for class_id, class_dets in enumerate(output):
+            class_dets = np.asarray(class_dets)
+            if class_dets.size == 0:
+                continue
+            class_dets = class_dets.reshape(-1, class_dets.shape[-1])
+            for det in class_dets:
+                score = float(det[4])
+                if score < confidence:
+                    continue
+                y0, x0, y1, x1 = (float(v) for v in det[:4])
+                detections.append(
+                    Detection(
+                        class_id=class_id,
+                        class_name=(
+                            self.class_names[class_id]
+                            if class_id < len(self.class_names)
+                            else str(class_id)
+                        ),
+                        confidence=score,
+                        bbox_xyxy=[
+                            x0 * frame_w,
+                            y0 * frame_h,
+                            x1 * frame_w,
+                            y1 * frame_h,
+                        ],
+                    )
+                )
+        return detections
+
+    @staticmethod
+    def _draw(image: Any, detections: list[Detection], cv2: Any) -> Any:
+        for det in detections:
+            xmin, ymin, xmax, ymax = (int(v) for v in det.bbox_xyxy)
+            label = f"{det.class_name} {det.confidence:.2f}"
+            cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (30, 220, 30), 2)
+            cv2.putText(
+                image,
+                label,
+                (xmin, max(20, ymin - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (30, 220, 30),
+                2,
+            )
+        return image
+
+    def close(self) -> None:
+        try:
+            self._hailo.close()
+        except Exception:
+            pass
+
+
 def run_depth(
     image_bytes: bytes,
     backend: str,

@@ -73,10 +73,16 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         session_config["stream_fps"] = float(value)
     if value := os.environ.get("PI_CV_SESSION_CV_FPS"):
         session_config["cv_fps"] = float(value)
+    if value := os.environ.get("PI_CV_SESSION_YOLO_BACKEND"):
+        session_config["yolo_backend"] = value
     if value := os.environ.get("PI_CV_SESSION_YOLO_MODEL"):
         session_config["yolo_model"] = value
     if value := os.environ.get("PI_CV_SESSION_YOLO_TASK"):
         session_config["yolo_task"] = value
+    if value := os.environ.get("PI_CV_SESSION_YOLO_FPS"):
+        session_config["yolo_fps"] = float(value)
+    if value := os.environ.get("PI_CV_SESSION_HAILO_HEF"):
+        session_config["hailo_hef"] = value
     if value := os.environ.get("PI_CV_SESSION_DEPTH_BACKEND"):
         session_config["depth_backend"] = value
     if value := os.environ.get("PI_CV_SESSION_DEPTH_MODEL_PATH"):

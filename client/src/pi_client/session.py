@@ -65,9 +65,13 @@ class SessionSettings:
     connect_timeout_seconds: float = 5.0
     reconnect_min_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
+    yolo_backend: str = "hailo"
     yolo_model: str | None = None
     yolo_task: str = "detect"
     yolo_confidence: float = 0.5
+    yolo_fps: float = 25.0
+    hailo_hef: str = "/usr/share/hailo-models/yolov8s_h8l.hef"
+    hailo_labels: str | None = None
     depth_backend: str = "depth-anything-v2"
     depth_model_path: str | None = None
     depth_encoder: str = "vits"
@@ -152,8 +156,14 @@ class SessionRuntime:
     def _send_hello(self) -> None:
         assert self._client is not None
         models = {
-            "yolo_model": self.settings.yolo_model,
+            "yolo_backend": self.settings.yolo_backend,
+            "yolo_model": (
+                self.settings.hailo_hef
+                if self.settings.yolo_backend == "hailo"
+                else self.settings.yolo_model
+            ),
             "yolo_task": self.settings.yolo_task,
+            "yolo_fps": self.settings.yolo_fps,
             "depth_backend": self.settings.depth_backend,
             "depth_model_path": self.settings.depth_model_path,
             "depth_encoder": self.settings.depth_encoder,
@@ -236,7 +246,7 @@ class SessionRuntime:
                     if now < next_cv_tick:
                         self._disconnected.wait(timeout=min(0.1, next_cv_tick - now))
                         continue
-                    next_cv_tick = max(next_cv_tick + 1.0 / max(self.settings.cv_fps, 0.05), now)
+                    next_cv_tick = max(next_cv_tick + 1.0 / max(self._mode_fps(), 0.05), now)
                     self._produce_cv_frame()
                 else:
                     self._disconnected.wait(timeout=0.2)
@@ -248,6 +258,13 @@ class SessionRuntime:
                 # error) must not take down the whole session process.
                 logger.error("Frame production failed in mode=%s: %s; falling back to idle", self._mode, exc)
                 self._switch_mode("idle", command_id=None)
+
+    def _mode_fps(self) -> float:
+        """CV modes tick rate: yolo runs fast on the AI HAT, depth/pipeline
+        stay at the (CPU-bound) cv_fps."""
+        if self._mode == "yolo" and self.settings.yolo_backend == "hailo":
+            return self.settings.yolo_fps
+        return self.settings.cv_fps
 
     def _drain_commands(self) -> None:
         while True:
@@ -354,6 +371,22 @@ class SessionRuntime:
     def _ensure_warm_yolo(self) -> None:
         if self._warm_yolo is not None:
             return
+
+        if self.settings.yolo_backend == "hailo":
+            from pi_client.cv_models import WarmHailoYolo
+
+            logger.info("Loading Hailo YOLO model %s ...", self.settings.hailo_hef)
+            self._warm_yolo = WarmHailoYolo(
+                hef_path=self.settings.hailo_hef,
+                labels_path=self.settings.hailo_labels,
+            )
+            logger.info(
+                "Hailo YOLO ready (input %sx%s)",
+                self._warm_yolo.input_w,
+                self._warm_yolo.input_h,
+            )
+            return
+
         if not self.settings.yolo_model:
             raise RuntimeError("yolo_model is not configured (set session.yolo_model or --yolo-model)")
         from pi_client.cv_models import WarmYolo
@@ -429,7 +462,7 @@ class SessionRuntime:
             data,
             width=width,
             height=height,
-            fps=self.settings.cv_fps,
+            fps=self._mode_fps(),
             jpeg_quality=self.settings.cv_jpeg_quality,
             view=view,
             inference_ms=inference_ms,
