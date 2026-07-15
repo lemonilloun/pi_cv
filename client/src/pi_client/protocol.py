@@ -60,6 +60,7 @@ def make_camera_stream_frame_message(
     view: str = "camera",
     mode: str | None = None,
     inference_ms: float | None = None,
+    objects: list[dict[str, object]] | None = None,
 ) -> Message:
     payload = {
         "session_id": session_id,
@@ -80,6 +81,8 @@ def make_camera_stream_frame_message(
         payload["mode"] = mode
     if inference_ms is not None:
         payload["inference_ms"] = round(inference_ms, 1)
+    if objects is not None:
+        payload["objects"] = objects
     return make_message(
         device_id=device_id,
         message_type="camera_stream_frame",

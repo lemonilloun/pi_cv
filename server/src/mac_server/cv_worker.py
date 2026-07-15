@@ -154,6 +154,7 @@ class ServerCvWorker:
         self._inference_ms: float | None = None
         self._frame_times: deque[float] = deque(maxlen=60)
         self._device = str(config.get("device", "mps"))
+        self._latest_objects: dict[str, Any] | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -182,6 +183,7 @@ class ServerCvWorker:
             "fps": fps,
             "inference_ms": round(self._inference_ms, 1) if self._inference_ms else None,
             "error": self._error,
+            "objects": self._latest_objects,
         }
 
     # ------------------------------------------------------------- worker
@@ -217,9 +219,12 @@ class ServerCvWorker:
             sequence, frame = self._pi_store.wait_for_next(sequence, timeout=1.0)
             if frame is None or self._stop_event.is_set():
                 continue
-            # Only raw camera frames: never run depth on Pi-rendered
-            # depth/yolo heatmaps.
-            if frame.metadata.get("view", "camera") != "camera":
+            # Never run depth on Pi-rendered depth heatmaps. Annotated
+            # yolo/combined frames are allowed: the thin box overlays barely
+            # affect depth, and their `objects` metadata is what we attach
+            # metric distances to.
+            view = frame.metadata.get("view", "camera")
+            if view not in {"camera", "yolo", "combined"}:
                 continue
             now = time.monotonic()
             if now - last_started < min_interval:
@@ -257,6 +262,20 @@ class ServerCvWorker:
             )
             self.depth_store.update(depth_frame)
 
+            # Attach metric distances to Pi-detected objects (data channel:
+            # the Pi runs YOLO on the AI HAT, the Mac contributes meters).
+            objects = frame.metadata.get("objects")
+            if objects:
+                try:
+                    self._latest_objects = {
+                        "pi_frame_index": frame.metadata.get("frame_index"),
+                        "view": view,
+                        "computed_at": time.time(),
+                        "objects": _attach_depth_to_objects(objects, depth_m, np),
+                    }
+                except Exception as exc:
+                    logger.debug("Object depth attachment failed: %s", exc)
+
             heatmap = _depth_to_heatmap_jpeg_fixed(depth_m, display_max_m)
             self._depth_view_store.update(
                 heatmap,
@@ -286,6 +305,28 @@ class ServerCvWorker:
             device=str(self._config.get("device", "mps")),
             metric_repo_dir=self._repo_root / "external/Depth-Anything-V2/metric_depth",
         )
+
+
+def _attach_depth_to_objects(objects: list[dict[str, Any]], depth_m: Any, np: Any) -> list[dict[str, Any]]:
+    """Median metric depth of each bbox's inner 50% region (robust against
+    background pixels near the box edges)."""
+    height, width = depth_m.shape[:2]
+    enriched = []
+    for obj in objects:
+        entry = dict(obj)
+        bbox = obj.get("bbox_xyxy")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            x0, y0, x1, y1 = (float(v) for v in bbox)
+            dx, dy = (x1 - x0) * 0.25, (y1 - y0) * 0.25
+            ix0 = max(0, min(width - 1, int(x0 + dx)))
+            ix1 = max(ix0 + 1, min(width, int(x1 - dx)))
+            iy0 = max(0, min(height - 1, int(y0 + dy)))
+            iy1 = max(iy0 + 1, min(height, int(y1 - dy)))
+            region = depth_m[iy0:iy1, ix0:ix1]
+            if region.size:
+                entry["depth_median_m"] = round(float(np.median(region)), 3)
+        enriched.append(entry)
+    return enriched
 
 
 def _depth_to_heatmap_jpeg_fixed(depth_m: Any, display_max_m: float) -> bytes:

@@ -429,6 +429,7 @@ class SessionRuntime:
         image_bgr = self._source.capture_bgr()
         height, width = image_bgr.shape[:2]
         inference_ms = 0.0
+        objects: list[dict[str, Any]] | None = None
 
         if self._mode == "depth":
             result = self._warm_depth.infer_bgr(image_bgr)
@@ -440,6 +441,7 @@ class SessionRuntime:
             data = result.annotated_image
             view = "yolo"
             inference_ms = result.inference_ms
+            objects = _detections_to_payload(result.detections)
         elif self._mode == "pipeline":
             from pi_client.cv_models import attach_depth_to_detections, render_combined_image
 
@@ -455,6 +457,7 @@ class SessionRuntime:
             data = render_combined_image(_encode_jpeg(image_bgr, self.settings.cv_jpeg_quality), detections)
             view = "combined"
             inference_ms = yolo_result.inference_ms + depth_result.inference_ms
+            objects = _detections_to_payload(detections)
         else:
             return
 
@@ -466,6 +469,7 @@ class SessionRuntime:
             jpeg_quality=self.settings.cv_jpeg_quality,
             view=view,
             inference_ms=inference_ms,
+            objects=objects,
         )
 
     def _send_frame(
@@ -477,6 +481,7 @@ class SessionRuntime:
         jpeg_quality: int,
         view: str,
         inference_ms: float | None,
+        objects: list[dict[str, Any]] | None = None,
     ) -> None:
         self._frame_index += 1
         frame = CameraFrame(
@@ -498,6 +503,7 @@ class SessionRuntime:
             view=view,
             mode=self._mode,
             inference_ms=inference_ms,
+            objects=objects,
         )
         sent = self._send_with_slot(message, data, slot_timeout=0.5, drop_label="frame")
         if sent:
@@ -517,6 +523,25 @@ class SessionRuntime:
             self._in_flight.release()
             self._disconnected.set()
             return False
+
+
+def _detections_to_payload(detections: Any) -> list[dict[str, Any]]:
+    """Compact per-object payload attached to CV frame headers so the server
+    can use detections as data (distances, mapping) — not just pixels."""
+    payload: list[dict[str, Any]] = []
+    for det in detections:
+        entry: dict[str, Any] = {
+            "class": det.class_name,
+            "confidence": round(float(det.confidence), 3),
+            "bbox_xyxy": [round(float(v), 1) for v in det.bbox_xyxy],
+        }
+        if det.depth:
+            median = det.depth.get("median")
+            if median is not None:
+                entry["depth_median"] = round(float(median), 3)
+                entry["depth_unit"] = det.depth.get("unit")
+        payload.append(entry)
+    return payload
 
 
 def _encode_jpeg(image_bgr: Any, quality: int) -> bytes:
