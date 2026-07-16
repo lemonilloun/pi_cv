@@ -5,6 +5,7 @@ Run: python3 -m unittest discover server/tests
 
 from __future__ import annotations
 
+import math
 import sys
 import tempfile
 import unittest
@@ -86,6 +87,69 @@ class IntrinsicsTest(unittest.TestCase):
         scaled = intr.scaled(640, 360)
         self.assertAlmostEqual(scaled.fx, intr.fx / 2)
         self.assertAlmostEqual(scaled.cy, intr.cy / 2)
+
+
+@unittest.skipUnless(HAS_NUMPY, "numpy is required for mapping tests")
+class BboxBearingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from mac_server.mapping.geometry import CameraIntrinsics
+
+        self.intr = CameraIntrinsics.from_fov(1280, 720, hfov_deg=102.0, vfov_deg=67.0)
+
+    def test_centered_bbox_has_zero_bearing(self) -> None:
+        from mac_server.mapping.geometry import bbox_bearing_deg
+
+        bbox = [590.0, 300.0, 690.0, 500.0]  # center x = 640 = cx
+        self.assertAlmostEqual(bbox_bearing_deg(bbox, self.intr), 0.0, delta=0.01)
+
+    def test_edge_bbox_approaches_half_hfov(self) -> None:
+        from mac_server.mapping.geometry import bbox_bearing_deg
+
+        left_edge = [0.0, 300.0, 0.0, 500.0]
+        right_edge = [1280.0, 300.0, 1280.0, 500.0]
+        self.assertAlmostEqual(bbox_bearing_deg(left_edge, self.intr), -51.0, delta=0.5)
+        self.assertAlmostEqual(bbox_bearing_deg(right_edge, self.intr), 51.0, delta=0.5)
+
+    def test_camera_xy_uses_tan_not_sin(self) -> None:
+        """A polar (sin/cos) plot would diverge sharply from the correct
+        tan-based lateral offset at wide angles — assert the real formula."""
+        from mac_server.mapping.geometry import bbox_bearing_rad, bbox_camera_xy
+
+        bbox = [1150.0, 300.0, 1280.0, 500.0]  # near the right edge
+        forward_m = 3.0
+        lateral, forward = bbox_camera_xy(bbox, forward_m, self.intr)
+
+        bearing = bbox_bearing_rad(bbox, self.intr)
+        expected_lateral = math.tan(bearing) * forward_m
+        wrong_polar_lateral = math.sin(bearing) * forward_m
+
+        self.assertAlmostEqual(lateral, expected_lateral, delta=1e-6)
+        self.assertEqual(forward, forward_m)
+        # The two formulas must disagree materially at this wide angle —
+        # otherwise this test wouldn't actually catch the sin/cos regression.
+        self.assertGreater(abs(lateral - wrong_polar_lateral), 0.3)
+
+    def test_camera_xy_consistent_with_depth_to_points(self) -> None:
+        """Same pixel column, same depth: bbox_camera_xy must agree with the
+        already-tested full-frame projection depth_to_points."""
+        from mac_server.mapping.geometry import bbox_camera_xy, depth_to_points
+
+        wall_distance = 3.0
+        depth = np.full((720, 1280), wall_distance, dtype=np.float32)
+        points = depth_to_points(depth, self.intr, stride=1, edge_crop_frac=0.0)
+
+        # Pick a point roughly 100px right of center at row = cy.
+        target_u, target_v = 740, 360
+        row = points[
+            (np.abs(points[:, 2] - wall_distance) < 1e-3)
+            & (np.abs(points[:, 0] - (target_u - self.intr.cx) / self.intr.fx * wall_distance) < 1e-2)
+        ]
+        self.assertTrue(len(row) > 0)
+        expected_lateral = float(row[0, 0])
+
+        bbox = [float(target_u), float(target_v), float(target_u), float(target_v)]
+        lateral, _ = bbox_camera_xy(bbox, wall_distance, self.intr)
+        self.assertAlmostEqual(lateral, expected_lateral, delta=1e-2)
 
 
 @unittest.skipUnless(HAS_NUMPY, "numpy is required for mapping tests")

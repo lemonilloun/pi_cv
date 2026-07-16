@@ -49,7 +49,9 @@
     "depth_input_size": 392,
     "depth_max_depth_m": 20.0,
     "display_max_m": 8.0,
-    "target_fps": 15.0
+    "target_fps": 15.0,
+    "hfov_deg": 102.0,
+    "vfov_deg": 67.0
   },
   "mapping": {
     "rooms_dir": "data/rooms",

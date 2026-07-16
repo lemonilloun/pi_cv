@@ -158,6 +158,9 @@ def _make_handler(
             if parsed.path == "/api/scan/status":
                 self._serve_scan_status()
                 return
+            if parsed.path == "/api/objects":
+                self._serve_objects()
+                return
             self.send_error(404)
 
         def do_POST(self) -> None:
@@ -247,6 +250,20 @@ def _make_handler(
                 except Exception as exc:
                     payload["scan"] = {"active": False, "error": str(exc)}
             self._send_json(payload)
+
+        def _serve_objects(self) -> None:
+            """Fast-poll endpoint for the live radar view — decoupled from
+            /api/status so its ~5 Hz cadence doesn't grow the 1 Hz payload
+            the telemetry charts and mode buttons already poll."""
+            if cv_status_provider is None:
+                self._send_json({"error": "server CV is not enabled"}, status=503)
+                return
+            try:
+                status = cv_status_provider()
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json(status.get("objects") or {"objects": []})
 
         def _serve_rooms(self) -> None:
             if room_store is None:

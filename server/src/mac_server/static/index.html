@@ -236,6 +236,32 @@
   .scan-btn:disabled { opacity: 0.45; cursor: default; }
   .scan-btn.stop { background: var(--critical); border-color: var(--critical); }
   #dirButtons button.done::after { content: " ✓"; color: var(--good); }
+  #radarCanvas {
+    display: none;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+  }
+  .radar-legend {
+    display: none;
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    gap: 6px;
+    flex-wrap: wrap;
+    z-index: 4;
+  }
+  .radar-legend .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px;
+    color: var(--ink-2);
+    background: rgba(13, 13, 13, 0.7);
+    padding: 2px 8px;
+    border-radius: 6px;
+  }
+  .radar-legend .swatch { width: 8px; height: 8px; border-radius: 50%; }
 </style>
 </head>
 <body>
@@ -257,7 +283,11 @@
         <button data-view="pi" class="active">Pi</button>
         <button data-view="depth" disabled>Depth</button>
         <button data-view="map" disabled>Map</button>
+        <button data-view="radar" disabled>Radar</button>
       </div>
+      <canvas id="radarCanvas"></canvas>
+      <div class="tooltip" id="radarTip"></div>
+      <div class="radar-legend" id="radarLegend"></div>
     </div>
     <div class="card" style="margin-top:16px">
       <p class="section-title">Mode</p>
@@ -380,11 +410,27 @@ function numOrNull(v) { return (typeof v === "number" && isFinite(v)) ? v : null
 
 // ------------------------------------------------------------ view pills
 state.currentView = "pi";
+state.serverCv = {};
 
 function setView(view) {
   if (state.currentView === view) return;
+  const previousView = state.currentView;
   state.currentView = view;
-  document.getElementById("stream").src = "/stream.mjpg?view=" + view + "&t=" + Date.now();
+
+  if (previousView === "radar") stopRadarPoll();
+
+  if (view === "radar") {
+    document.getElementById("stream").style.display = "none";
+    document.getElementById("radarCanvas").style.display = "block";
+    document.getElementById("radarLegend").style.display = "flex";
+    startRadarPoll();
+  } else {
+    document.getElementById("stream").style.display = "";
+    document.getElementById("radarCanvas").style.display = "none";
+    document.getElementById("radarLegend").style.display = "none";
+    document.getElementById("radarTip").style.display = "none";
+    document.getElementById("stream").src = "/stream.mjpg?view=" + view + "&t=" + Date.now();
+  }
   document.querySelectorAll("#viewPills button").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.view === view);
   });
@@ -399,14 +445,22 @@ document.getElementById("viewPills").addEventListener("click", (event) => {
 function renderViewPills(status) {
   const views = status.views || {};
   const cv = status.server_cv || {};
+  state.serverCv = cv;
   document.querySelectorAll("#viewPills button").forEach((btn) => {
     const view = btn.dataset.view;
     if (view === "pi") return; // always available
+    if (view === "radar") {
+      // Not an MJPEG view (no frame_hub store) — gated on the CV worker
+      // itself, available even with zero objects currently detected.
+      btn.disabled = cv.state !== "running";
+      return;
+    }
     const hasFrames = views[view] !== undefined && views[view] !== null;
     btn.disabled = !hasFrames;
   });
-  // Falling back if the active view disappeared (e.g. server restart)
-  if (state.currentView !== "pi") {
+  // Falling back if the active view disappeared (e.g. server restart).
+  // "radar" has no frame_hub entry by design, so it must never trigger this.
+  if (state.currentView !== "pi" && state.currentView !== "radar") {
     const meta = views[state.currentView];
     if (meta === undefined) setView("pi");
   }
@@ -683,6 +737,11 @@ function renderStatus(status) {
     viewBadge.innerHTML = `view: <strong>room map</strong>` +
       (meta && meta.room_id ? ` · <strong>${meta.room_id}</strong>` : "");
     inferBadge.style.display = "none";
+  } else if (state.currentView === "radar") {
+    const latest = state.radarHistory[state.radarHistory.length - 1];
+    const count = latest ? latest.objects.length : 0;
+    viewBadge.innerHTML = `view: <strong>radar</strong> · <strong>${count}</strong> object${count === 1 ? "" : "s"}`;
+    inferBadge.style.display = "none";
   } else {
     const frame = status.latest_frame;
     if (frame) {
@@ -886,6 +945,160 @@ document.getElementById("scanBtn").addEventListener("click", async () => {
     document.getElementById("mapError").textContent = "Request failed: " + err;
   }
 });
+
+// --------------------------------------------------------------- radar
+// Top-down live scatter: camera at bottom-center, forward = up. Object
+// positions come pre-computed server-side as Cartesian (lateral_m,
+// forward_m) — NOT (bearing, depth) polar, which would be geometrically
+// wrong (lateral offset for a given Z-depth grows with tan(bearing), not
+// sin(bearing); the two diverge fast on this camera's 102 deg lens). The
+// client only does linear scaling of those meters to pixels — no trig on
+// the data path. Range rings use the canvas's native arc() (true circles,
+// a decorative reference only); the FOV wedge boundary uses one Math.tan
+// at draw-setup time.
+const RADAR_POLL_MS = 200;
+const RADAR_HISTORY_MAX = 3;
+state.radarHistory = []; // ring buffer of {objects: [...]}
+let radarPollTimer = null;
+let radarHoverTargets = []; // [{x, y, obj}] in canvas CSS-pixel space, refreshed each draw
+
+function classColor(className) {
+  let hash = 0;
+  for (let i = 0; i < className.length; i++) hash = (hash * 31 + className.charCodeAt(i)) >>> 0;
+  return SERIES_COLORS[hash % SERIES_COLORS.length];
+}
+
+async function pollObjects() {
+  try {
+    const res = await fetch("/api/objects");
+    if (!res.ok) return;
+    const data = await res.json();
+    state.radarHistory.push({ objects: data.objects || [] });
+    if (state.radarHistory.length > RADAR_HISTORY_MAX) state.radarHistory.shift();
+    drawRadar();
+  } catch (err) { /* transient network hiccup, next poll retries */ }
+}
+
+function startRadarPoll() {
+  if (radarPollTimer) return;
+  pollObjects();
+  radarPollTimer = setInterval(pollObjects, RADAR_POLL_MS);
+}
+
+function stopRadarPoll() {
+  if (radarPollTimer) { clearInterval(radarPollTimer); radarPollTimer = null; }
+  state.radarHistory = [];
+  radarHoverTargets = [];
+}
+
+function drawRadar() {
+  const canvas = document.getElementById("radarCanvas");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+
+  const hfovDeg = state.serverCv.hfov_deg || 102.0;
+  const maxRange = state.serverCv.display_max_m || 8.0;
+  const halfAngleRad = (hfovDeg / 2) * Math.PI / 180;
+  const originX = w / 2, originY = h - 14;
+  const maxLateralAtRange = maxRange * Math.tan(halfAngleRad); // the one client-side trig call
+  const pxPerMeter = Math.min((w / 2 - 12) / maxLateralAtRange, (originY - 10) / maxRange);
+
+  function toScreen(lateralM, forwardM) {
+    return [originX + lateralM * pxPerMeter, originY - forwardM * pxPerMeter];
+  }
+
+  // Range rings: true circles (canvas-native arc, angle bounds only), a
+  // static reference guide — not derived from any measured object.
+  ctx.strokeStyle = "#2c2c2a";
+  ctx.fillStyle = "#898781";
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  const ringStep = maxRange > 4 ? 2 : 1;
+  for (let r = ringStep; r <= maxRange + 1e-6; r += ringStep) {
+    ctx.beginPath();
+    ctx.arc(originX, originY, r * pxPerMeter, -Math.PI / 2 - halfAngleRad, -Math.PI / 2 + halfAngleRad);
+    ctx.stroke();
+    ctx.fillText(r + "m", originX + 4, originY - r * pxPerMeter);
+  }
+
+  // FOV wedge boundary (straight lines in this Cartesian space).
+  ctx.strokeStyle = "#383835";
+  ctx.beginPath();
+  ctx.moveTo(originX, originY);
+  let [ex, ey] = toScreen(-maxLateralAtRange, maxRange);
+  ctx.lineTo(ex, ey);
+  ctx.moveTo(originX, originY);
+  [ex, ey] = toScreen(maxLateralAtRange, maxRange);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+
+  // Camera marker.
+  ctx.fillStyle = "#c3c2b7";
+  ctx.beginPath();
+  ctx.arc(originX, originY, 4, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Objects: fading trail (older polls fainter), pure linear placement.
+  const seenClasses = new Set();
+  radarHoverTargets = [];
+  state.radarHistory.forEach((snapshot, idx) => {
+    const age = state.radarHistory.length - 1 - idx; // 0 = newest
+    const alpha = Math.max(0.15, 1 - age * 0.3);
+    snapshot.objects.forEach((obj) => {
+      if (obj.lateral_m === undefined || obj.forward_m === undefined) return;
+      seenClasses.add(obj.class);
+      const [sx, sy] = toScreen(obj.lateral_m, obj.forward_m);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = classColor(obj.class);
+      ctx.beginPath();
+      ctx.arc(sx, sy, age === 0 ? 6 : 4, 0, Math.PI * 2);
+      ctx.fill();
+      if (age === 0) {
+        ctx.strokeStyle = "#0d0d0d";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        radarHoverTargets.push({ x: sx, y: sy, obj });
+      }
+    });
+  });
+  ctx.globalAlpha = 1;
+
+  const legend = document.getElementById("radarLegend");
+  legend.innerHTML = Array.from(seenClasses).map((c) =>
+    `<span class="chip"><span class="swatch" style="background:${classColor(c)}"></span>${c}</span>`
+  ).join("");
+}
+
+document.getElementById("radarCanvas").addEventListener("mousemove", (event) => {
+  const rect = event.target.getBoundingClientRect();
+  const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+  const tip = document.getElementById("radarTip");
+  const hit = radarHoverTargets.find((t) => Math.hypot(t.x - mx, t.y - my) <= 10);
+  if (!hit) { tip.style.display = "none"; return; }
+  const obj = hit.obj;
+  const range = Math.sqrt(obj.lateral_m * obj.lateral_m + obj.forward_m * obj.forward_m);
+  tip.innerHTML =
+    `<div class="row"><span class="swatch" style="background:${classColor(obj.class)}"></span>${obj.class}` +
+    `<span class="val">${range.toFixed(2)} m</span></div>` +
+    `<div class="row" style="color:#898781">confidence ${(obj.confidence * 100).toFixed(0)}%</div>`;
+  tip.style.display = "block";
+  tip.style.left = Math.min(mx + 12, rect.width - tip.offsetWidth - 4) + "px";
+  tip.style.top = Math.max(4, my - 10) + "px";
+});
+document.getElementById("radarCanvas").addEventListener("mouseleave", () => {
+  document.getElementById("radarTip").style.display = "none";
+});
+
+window.addEventListener("resize", () => { if (state.currentView === "radar") drawRadar(); });
 
 // MJPEG <img> stalls if the stream drops; nudge it periodically when broken.
 const streamImg = document.getElementById("stream");

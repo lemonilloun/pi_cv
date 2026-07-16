@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 
 DIRECTIONS = ("north", "east", "south", "west")
@@ -82,6 +82,37 @@ def depth_to_points(
     xs = (uu - intr.cx) / intr.fx * zz
     ys = (vv - intr.cy) / intr.fy * zz
     return np.stack([xs, ys, zz], axis=1)
+
+
+def bbox_bearing_rad(bbox_xyxy: Sequence[float], intrinsics: CameraIntrinsics) -> float:
+    """Ray angle (radians, +right) for a bbox's horizontal center column.
+
+    This is the pixel column's true ray angle regardless of measured depth —
+    the same (u-cx)/fx relationship depth_to_points uses, just as an angle.
+    """
+    cx_box = (bbox_xyxy[0] + bbox_xyxy[2]) / 2.0
+    return math.atan2(cx_box - intrinsics.cx, intrinsics.fx)
+
+
+def bbox_bearing_deg(bbox_xyxy: Sequence[float], intrinsics: CameraIntrinsics) -> float:
+    return math.degrees(bbox_bearing_rad(bbox_xyxy, intrinsics))
+
+
+def bbox_camera_xy(
+    bbox_xyxy: Sequence[float],
+    forward_m: float,
+    intrinsics: CameraIntrinsics,
+) -> tuple[float, float]:
+    """Camera-frame (lateral_m, forward_m) for one bbox at a known Z-depth.
+
+    Single-point specialization of depth_to_points's X = (u-cx)/fx * z:
+    lateral = tan(bearing) * forward_m. NOT sin/cos of bearing — a polar
+    (bearing, depth) plot is a different point except at bearing=0 (the
+    lateral offset for a given Z-depth grows with tan, not sin, of the ray
+    angle; the two diverge fast on a wide lens: at 51 deg, sin/tan ≈ 0.63).
+    """
+    bearing = bbox_bearing_rad(bbox_xyxy, intrinsics)
+    return math.tan(bearing) * forward_m, forward_m
 
 
 def filter_height_band(

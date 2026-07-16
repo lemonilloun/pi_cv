@@ -184,6 +184,8 @@ class ServerCvWorker:
             "inference_ms": round(self._inference_ms, 1) if self._inference_ms else None,
             "error": self._error,
             "objects": self._latest_objects,
+            "hfov_deg": float(self._config.get("hfov_deg", 102.0)),
+            "display_max_m": float(self._config.get("display_max_m", 8.0)),
         }
 
     # ------------------------------------------------------------- worker
@@ -209,6 +211,8 @@ class ServerCvWorker:
         import numpy as np
 
         display_max_m = float(self._config.get("display_max_m", 8.0))
+        hfov_deg = float(self._config.get("hfov_deg", 102.0))
+        vfov_deg = float(self._config.get("vfov_deg", 67.0))
         target_fps = float(self._config.get("target_fps", 15.0))
         min_interval = 1.0 / target_fps if target_fps > 0 else 0.0
         sequence = -1
@@ -262,16 +266,20 @@ class ServerCvWorker:
             )
             self.depth_store.update(depth_frame)
 
-            # Attach metric distances to Pi-detected objects (data channel:
-            # the Pi runs YOLO on the AI HAT, the Mac contributes meters).
+            # Attach metric distances + bearing to Pi-detected objects (data
+            # channel: the Pi runs YOLO on the AI HAT, the Mac contributes
+            # meters and camera-frame position).
             objects = frame.metadata.get("objects")
             if objects:
                 try:
+                    from mac_server.mapping.geometry import CameraIntrinsics
+
+                    intrinsics = CameraIntrinsics.from_fov(width, height, hfov_deg, vfov_deg)
                     self._latest_objects = {
                         "pi_frame_index": frame.metadata.get("frame_index"),
                         "view": view,
                         "computed_at": time.time(),
-                        "objects": _attach_depth_to_objects(objects, depth_m, np),
+                        "objects": _attach_depth_to_objects(objects, depth_m, np, intrinsics),
                     }
                 except Exception as exc:
                     logger.debug("Object depth attachment failed: %s", exc)
@@ -307,9 +315,22 @@ class ServerCvWorker:
         )
 
 
-def _attach_depth_to_objects(objects: list[dict[str, Any]], depth_m: Any, np: Any) -> list[dict[str, Any]]:
+def _attach_depth_to_objects(
+    objects: list[dict[str, Any]],
+    depth_m: Any,
+    np: Any,
+    intrinsics: Any = None,
+) -> list[dict[str, Any]]:
     """Median metric depth of each bbox's inner 50% region (robust against
-    background pixels near the box edges)."""
+    background pixels near the box edges), plus camera-frame bearing and
+    Cartesian (lateral_m, forward_m) for the radar view.
+
+    lateral_m is NOT range*sin(bearing) — that's a different point on a wide
+    lens. It's tan(bearing)*forward_m, the same relationship depth_to_points
+    uses for the full-frame room-mapping projection (see mapping/geometry.py).
+    """
+    from mac_server.mapping.geometry import bbox_bearing_deg, bbox_camera_xy
+
     height, width = depth_m.shape[:2]
     enriched = []
     for obj in objects:
@@ -324,7 +345,13 @@ def _attach_depth_to_objects(objects: list[dict[str, Any]], depth_m: Any, np: An
             iy1 = max(iy0 + 1, min(height, int(y1 - dy)))
             region = depth_m[iy0:iy1, ix0:ix1]
             if region.size:
-                entry["depth_median_m"] = round(float(np.median(region)), 3)
+                forward_m = float(np.median(region))
+                entry["depth_median_m"] = round(forward_m, 3)
+                if intrinsics is not None:
+                    entry["bearing_deg"] = round(bbox_bearing_deg(bbox, intrinsics), 1)
+                    lateral_m, forward_m = bbox_camera_xy(bbox, forward_m, intrinsics)
+                    entry["lateral_m"] = round(lateral_m, 3)
+                    entry["forward_m"] = round(forward_m, 3)
         enriched.append(entry)
     return enriched
 
