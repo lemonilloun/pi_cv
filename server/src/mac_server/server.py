@@ -123,6 +123,7 @@ class MacServer:
         data_dir = Path(monitoring_config.get("data_dir", "data/monitoring"))
         if not data_dir.is_absolute():
             data_dir = REPO_ROOT / data_dir
+        self._monitoring_data_dir = data_dir
 
         agent = None
         agent_config = monitoring_config.get("agent", {})
@@ -132,13 +133,28 @@ class MacServer:
 
                 agent = ApfelClient(
                     base_url=str(agent_config.get("base_url", "http://127.0.0.1:11434")),
-                    model=str(agent_config.get("model", "apfel")),
+                    model=str(agent_config.get("model", "apple-foundationmodel")),
                     timeout_s=float(agent_config.get("timeout_s", 20.0)),
                     max_input_tokens=int(agent_config.get("max_input_tokens", 2500)),
                     max_output_tokens=int(agent_config.get("max_output_tokens", 400)),
                 )
             except Exception as exc:
                 logger.warning("Monitoring agent disabled: %s", exc)
+
+        vision = None
+        vision_config = monitoring_config.get("vision", {})
+        if vision_config.get("enabled", False):
+            try:
+                from mac_server.monitoring.vision import OllamaVisionClient
+
+                vision = OllamaVisionClient(
+                    base_url=str(vision_config.get("base_url", "http://127.0.0.1:11434")),
+                    model=str(vision_config.get("model", "gemma4:e4b-it-qat")),
+                    timeout_s=float(vision_config.get("timeout_s", 30.0)),
+                    keep_alive=str(vision_config.get("keep_alive", "0s")),
+                )
+            except Exception as exc:
+                logger.warning("Monitoring vision captioning disabled: %s", exc)
 
         return MonitorController(
             cv_worker=self.cv_worker,
@@ -147,6 +163,7 @@ class MacServer:
             scene_store=SceneStore(data_dir / "scenes"),
             store=MonitoringStore(data_dir),
             config=monitoring_config,
+            vision=vision,
             scan_controller=self.scan_controller,
             agent=agent,
         )
@@ -166,6 +183,9 @@ class MacServer:
             self.preview_server.start()
         if self.cv_worker is not None:
             self.cv_worker.start()
+        # apfel/Ollama are never auto-started (deliberate — they sit idle in
+        # RAM otherwise): run `apfel --serve` / `ollama serve` yourself
+        # before using monitoring digests/summaries/vision captions.
 
     def serve_forever(self, once: bool = False) -> None:
         self.start()

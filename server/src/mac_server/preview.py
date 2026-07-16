@@ -546,6 +546,24 @@ def _make_handler(
 
             digests = monitor_controller.store.digests_between(scene_id, now - hours * 3600, now)
             agent = monitor_controller.agent
+
+            # Fast path: an incrementally-maintained rolling summary already
+            # exists (updated every digest cycle) — serve it directly instead
+            # of re-merging a growing pile of digests on every request.
+            rolling = monitor_controller.store.get_rolling_summary(scene_id)
+            if rolling is not None:
+                self._send_json(
+                    {
+                        "summary": rolling["text"],
+                        "rolling": True,
+                        "event_count": rolling["event_count"],
+                        "updated_at": rolling["updated_at"],
+                        "digests": digests,
+                        "agent_healthy": agent.healthy if agent else False,
+                    }
+                )
+                return
+
             if agent is None:
                 self._send_json(
                     {"summary": None, "digests": digests, "agent_healthy": False},
@@ -553,12 +571,15 @@ def _make_handler(
                 )
                 return
 
+            # Cold start: no rolling summary yet (first digest cycle hasn't
+            # run). Fall back to merging whatever digests exist so far.
             scene = monitor_controller.scene_store.load_scene(scene_id) or {}
             period = f"last {hours:g}h"
             summary = agent.summarize(scene.get("name", scene_id), period, digests)
             self._send_json(
                 {
                     "summary": summary,
+                    "rolling": False,
                     "digests": digests,
                     "agent_healthy": agent.healthy,
                 },

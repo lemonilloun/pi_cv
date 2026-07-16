@@ -118,9 +118,14 @@ def is_stationary(
 
 
 class GreedyTracker:
-    def __init__(self, config: TrackerConfig, mobile_classes: set[str]) -> None:
+    """Tracks every YOLO class EXCEPT `excluded_classes` (furniture/anchor
+    classes — those are handled as frozen reference points instead, see
+    scenes.py). No hand-picked allowlist: whatever the detector tags gets
+    tracked, native to how YOLO already works."""
+
+    def __init__(self, config: TrackerConfig, excluded_classes: set[str]) -> None:
         self.config = config
-        self.mobile_classes = mobile_classes
+        self.excluded_classes = excluded_classes
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
 
@@ -131,7 +136,7 @@ class GreedyTracker:
         candidates = [
             det
             for det in detections
-            if det.get("class") in self.mobile_classes
+            if det.get("class") not in self.excluded_classes
             and float(det.get("confidence", 0.0)) >= cfg.min_confidence
             and isinstance(det.get("bbox_xyxy"), list)
             and len(det["bbox_xyxy"]) == 4

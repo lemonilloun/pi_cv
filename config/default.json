@@ -75,7 +75,6 @@
     "enabled": true,
     "data_dir": "data/monitoring",
     "min_confidence": 0.35,
-    "mobile_classes": ["person", "cat", "dog"],
     "anchor_classes": ["couch", "bed", "chair", "dining table", "tv"],
     "iou_gate": 0.1,
     "centroid_gate_frac": 0.15,
@@ -97,12 +96,21 @@
     "max_snapshot_mb": 200,
     "agent": {
       "enabled": true,
-      "base_url": "http://127.0.0.1:11434",
-      "model": "apfel",
+      "base_url": "http://127.0.0.1:11500",
+      "model": "apple-foundationmodel",
       "digest_interval_s": 300,
       "timeout_s": 20,
       "max_input_tokens": 2500,
       "max_output_tokens": 400
+    },
+    "vision": {
+      "enabled": true,
+      "base_url": "http://127.0.0.1:11434",
+      "model": "gemma4:e4b-it-qat",
+      "keep_alive": "0s",
+      "timeout_s": 120,
+      "crop_margin_frac": 0.15,
+      "caption_events": ["on_furniture"]
     }
   },
   "logging": {

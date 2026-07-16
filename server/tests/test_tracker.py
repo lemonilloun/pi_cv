@@ -24,9 +24,9 @@ def det(cls: str, bbox: list[float], conf: float = 0.9) -> dict:
     return {"class": cls, "confidence": conf, "bbox_xyxy": bbox, "depth_median_m": 2.0}
 
 
-def make_tracker(**overrides) -> GreedyTracker:
+def make_tracker(excluded_classes=frozenset({"couch", "bed", "chair", "dining table", "tv"}), **overrides) -> GreedyTracker:
     config = TrackerConfig(**overrides)
-    return GreedyTracker(config, mobile_classes={"person", "cat", "dog"})
+    return GreedyTracker(config, excluded_classes=set(excluded_classes))
 
 
 class IouTest(unittest.TestCase):
@@ -128,6 +128,21 @@ class TrackerLifecycleTest(unittest.TestCase):
         tracker = make_tracker()
         tracker.update([det("couch", [0, 0, 500, 400])], 0.0)
         self.assertEqual(len(tracker.tracks), 0)
+
+    def test_any_non_anchor_class_is_tracked(self) -> None:
+        """No hand-picked allowlist: whatever YOLO tags (laptop, backpack,
+        a random COCO class) gets tracked as long as it isn't furniture."""
+        tracker = make_tracker(confirm_hits=2)
+        bbox = [100, 100, 200, 300]
+        tracker.update([det("laptop", bbox)], 0.0)
+        updates = tracker.update([det("laptop", bbox)], 0.1)
+        self.assertEqual(len(updates.confirmed_new), 1)
+        self.assertEqual(updates.confirmed_new[0].class_name, "laptop")
+
+        tracker2 = make_tracker(confirm_hits=2)
+        tracker2.update([det("backpack", bbox)], 0.0)
+        updates2 = tracker2.update([det("backpack", bbox)], 0.1)
+        self.assertEqual(len(updates2.confirmed_new), 1)
 
     def test_low_confidence_filtered(self) -> None:
         tracker = make_tracker(min_confidence=0.5)

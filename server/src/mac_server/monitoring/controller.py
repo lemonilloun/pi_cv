@@ -42,6 +42,7 @@ class MonitorController:
         config: dict[str, Any],
         scan_controller: Any = None,
         agent: Any = None,
+        vision: Any = None,
     ) -> None:
         self._cv_worker = cv_worker
         self._frame_hub = frame_hub
@@ -51,6 +52,7 @@ class MonitorController:
         self._config = config
         self._scan_controller = scan_controller
         self.agent = agent  # ApfelClient | None (S3)
+        self.vision = vision  # OllamaVisionClient | None
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._digester_thread: threading.Thread | None = None
@@ -130,7 +132,7 @@ class MonitorController:
                 "scene": scene,
                 "tracker": GreedyTracker(
                     tracker_config,
-                    mobile_classes=set(self._config.get("mobile_classes", ["person", "cat", "dog"])),
+                    excluded_classes=set(self._config.get("anchor_classes", [])),
                 ),
                 "engine": EventEngine(rule_config),
                 "started_at": time.time(),
@@ -175,16 +177,22 @@ class MonitorController:
         tracker: GreedyTracker = session["tracker"]
         engine: EventEngine = session["engine"]
         closed = 0
-        for track in tracker.force_end_all(now):
-            for transition in engine.track_ended(track, now):
+        try:
+            for track in tracker.force_end_all(now):
+                for transition in engine.track_ended(track, now):
+                    self._persist_transition(session, transition)
+                    closed += 1
+            for transition in engine.force_close_all(now):
                 self._persist_transition(session, transition)
                 closed += 1
-        for transition in engine.force_close_all(now):
-            self._persist_transition(session, transition)
-            closed += 1
-
-        with self._lock:
-            self._session = None
+        except Exception as exc:
+            # A persistence failure here must never leave the controller
+            # stuck (active=False but _session non-None, refusing new
+            # start() calls or reporting stale status forever).
+            logger.error("Failed to close out monitoring session cleanly: %s", exc)
+        finally:
+            with self._lock:
+                self._session = None
         return {"scene_id": session["scene_id"], "events_closed": closed}
 
     def shutdown(self) -> None:
@@ -333,6 +341,8 @@ class MonitorController:
                 transition.active.db_id = event_id
                 if "on_furniture" in self._config.get("snapshot_events", []) and transition.event_type == "on_furniture":
                     self._save_snapshot(session, track, event_id)
+                if transition.event_type in self._config.get("vision", {}).get("caption_events", []):
+                    self._request_caption(session, track, transition, event_id)
             return event_id
         if transition.action == "close":
             active = transition.active
@@ -417,6 +427,66 @@ class MonitorController:
         except Exception as exc:
             logger.debug("Snapshot failed: %s", exc)
 
+    # --------------------------------------------------- vision captioning
+
+    def _request_caption(
+        self, session: dict[str, Any], track: Track, transition: EventTransition, event_id: int
+    ) -> None:
+        """Fire-and-forget: caption this event's crop with the vision model
+        on a short-lived thread. Never blocks the tick loop — with
+        keep_alive=0 a call can take several seconds (full model load), and
+        the caption is expected to land in the event feed a moment after the
+        event itself, not synchronously with it."""
+        if self.vision is None:
+            return
+        anchor_bbox = None
+        for anchor in session["scene"].get("anchors", []):
+            if anchor.get("anchor_id") == transition.object_label:
+                anchor_bbox = anchor.get("bbox_xyxy")
+                break
+        subject_bbox = tuple(track.bbox)
+        thread = threading.Thread(
+            target=self._caption_worker,
+            args=(event_id, subject_bbox, anchor_bbox),
+            daemon=True,
+            name="monitor-caption",
+        )
+        thread.start()
+
+    def _caption_worker(
+        self,
+        event_id: int,
+        subject_bbox: tuple[float, float, float, float],
+        anchor_bbox: list[float] | None,
+    ) -> None:
+        try:
+            import cv2
+            import numpy as np
+
+            from mac_server.monitoring.vision import union_bbox_with_margin
+
+            _, frame = self._frame_hub.get("pi").latest()
+            if frame is None:
+                return
+            image = cv2.imdecode(np.frombuffer(frame.data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                return
+            h, w = image.shape[:2]
+            box_b = tuple(anchor_bbox) if anchor_bbox else subject_bbox
+            margin = float(self._config.get("vision", {}).get("crop_margin_frac", 0.15))
+            x0, y0, x1, y1 = union_bbox_with_margin(subject_bbox, box_b, margin, w, h)
+            crop = image[y0:y1, x0:x1]
+            if crop.size == 0:
+                return
+            ok, encoded = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                return
+            caption = self.vision.caption(encoded.tobytes())
+            if caption:
+                self.store.set_event_caption(event_id, caption)
+        except Exception as exc:
+            logger.debug("Vision caption failed: %s", exc)
+
     # -------------------------------------------------------- S3: digester
 
     def _digester_run(self) -> None:
@@ -430,14 +500,25 @@ class MonitorController:
             if time.time() - window_start < interval:
                 continue
             window_end = time.time()
+            scene_id = session["scene_id"]
+            scene_name = session["scene"].get("name", scene_id)
             try:
-                events = self.store.events_between(session["scene_id"], window_start, window_end)
+                events = self.store.events_between(scene_id, window_start, window_end)
                 if events:
-                    text = agent.digest(session["scene"].get("name", session["scene_id"]), events)
+                    text = agent.digest(scene_name, events)
                     if text:
-                        self.store.insert_digest(
-                            session["scene_id"], window_start, window_end, text, agent.model
-                        )
+                        self.store.insert_digest(scene_id, window_start, window_end, text, agent.model)
+
+                    # Efficient context: fold this window into one running
+                    # summary instead of re-merging a growing pile of digests
+                    # on every /api/monitor/summary request.
+                    previous = self.store.get_rolling_summary(scene_id)
+                    updated_text = agent.update_rolling_summary(
+                        scene_name, previous["text"] if previous else None, events
+                    )
+                    if updated_text:
+                        total_events = (previous["event_count"] if previous else 0) + len(events)
+                        self.store.upsert_rolling_summary(scene_id, updated_text, total_events, window_end)
             except Exception as exc:
                 logger.warning("Digest cycle failed: %s", exc)
             window_start = window_end

@@ -137,6 +137,32 @@ class ClientTest(unittest.TestCase):
         sent = _FakeApfel.calls[0]
         self.assertIn("Person#1 on couch_1", sent["messages"][1]["content"])
 
+    def test_rolling_summary_first_update(self) -> None:
+        events = [event("entered", "Person#1", t_start=1000.0)]
+        updated = self.client.update_rolling_summary("Living room", None, events)
+        self.assertIsNotNone(updated)
+        sent = _FakeApfel.calls[0]
+        self.assertIn("none yet", sent["messages"][1]["content"])
+        self.assertIn("Person#1 entered", sent["messages"][1]["content"])
+
+    def test_rolling_summary_incorporates_previous(self) -> None:
+        events = [event("on_furniture", "Person#1", object_label="couch_1", posture="sitting")]
+        self.client.update_rolling_summary("Living room", "Person#1 entered the room.", events)
+        sent = _FakeApfel.calls[0]
+        self.assertIn("Person#1 entered the room.", sent["messages"][1]["content"])
+
+    def test_rolling_summary_falls_back_on_failure(self) -> None:
+        _FakeApfel.fail = True
+        result = self.client.update_rolling_summary(
+            "Living room", "Existing summary.", [event("entered", "Cat#1")]
+        )
+        self.assertEqual(result, "Existing summary.")
+
+    def test_rolling_summary_no_new_events_keeps_previous(self) -> None:
+        result = self.client.update_rolling_summary("Living room", "Existing summary.", [])
+        self.assertEqual(result, "Existing summary.")
+        self.assertEqual(len(_FakeApfel.calls), 0)
+
     def test_failure_marks_unhealthy(self) -> None:
         _FakeApfel.fail = True
         result = self.client.chat("s", "u")

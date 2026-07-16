@@ -31,6 +31,19 @@ DIGEST_SYSTEM_PROMPT = (
     "no preamble."
 )
 
+ROLLING_SUMMARY_SYSTEM_PROMPT = (
+    "You maintain a running summary of what has happened in a room, based on "
+    "events from a fixed camera. You will be given the CURRENT summary (may "
+    "be empty, if this is the first update) and NEW events observed since "
+    "that summary was last updated. Produce an UPDATED summary that "
+    "incorporates the new events. Do not just append — actually merge and "
+    "compress: keep older details only if still relevant, drop stale ones "
+    "(e.g. someone who left long ago and hasn't returned). Identities "
+    "(Person#1, Cat#1) persist across updates — refer to them by name. Keep "
+    "the whole summary to at most a short paragraph. Factual, chronological, "
+    "no preamble, no speculation."
+)
+
 SUMMARY_SYSTEM_PROMPT = (
     "You summarize home-monitoring digests. Identities (Person#1, Cat#1) "
     "persist across digests. Answer: who was present, when, and what they "
@@ -115,7 +128,7 @@ class ApfelClient:
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:11434",
-        model: str = "apfel",
+        model: str = "apple-foundationmodel",
         timeout_s: float = 20.0,
         max_input_tokens: int = 2500,
         max_output_tokens: int = 400,
@@ -178,6 +191,28 @@ class ApfelClient:
         t1 = datetime.fromtimestamp(events[-1]["t_start"]).strftime("%H:%M")
         user = f"Scene: {scene_name}. Window {t0}-{t1}.\n" + "\n".join(lines)
         return self.chat(DIGEST_SYSTEM_PROMPT, user, max_tokens=160)
+
+    # -------------------------------------------------- rolling summary
+
+    def update_rolling_summary(
+        self,
+        scene_name: str,
+        previous_summary: str | None,
+        new_events: list[dict[str, Any]],
+    ) -> str | None:
+        """Fold new_events into previous_summary via one incremental call —
+        the summary itself stays roughly constant-sized over an arbitrarily
+        long session, since each update explicitly asks the model to compress
+        rather than append. This is the efficient alternative to re-merging
+        a growing pile of independent digests on every summary request."""
+        lines = budget_lines([format_event_line(e) for e in new_events], self.max_input_chars // 2)
+        if not lines:
+            return previous_summary
+
+        current = previous_summary.strip() if previous_summary else "(none yet — first update)"
+        user = f"Scene: {scene_name}.\nCurrent summary:\n{current}\n\nNew events:\n" + "\n".join(lines)
+        updated = self.chat(ROLLING_SUMMARY_SYSTEM_PROMPT, user, max_tokens=220)
+        return updated if updated else previous_summary
 
     # ------------------------------------------------------------ summary
 

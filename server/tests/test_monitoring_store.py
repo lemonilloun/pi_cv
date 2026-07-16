@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -88,6 +89,57 @@ class StoreTest(unittest.TestCase):
         digests = self.store.digests_between("living", 0, 1000)
         self.assertEqual(len(digests), 1)
         self.assertIn("couch", digests[0]["text"])
+
+    def test_rolling_summary_upsert(self) -> None:
+        self.assertIsNone(self.store.get_rolling_summary("living"))
+        self.store.upsert_rolling_summary("living", "Person#1 entered.", 1, 100.0)
+        rolling = self.store.get_rolling_summary("living")
+        self.assertEqual(rolling["text"], "Person#1 entered.")
+        self.assertEqual(rolling["event_count"], 1)
+
+        self.store.upsert_rolling_summary("living", "Person#1 sat on the couch.", 3, 200.0)
+        rolling = self.store.get_rolling_summary("living")
+        self.assertEqual(rolling["text"], "Person#1 sat on the couch.")
+        self.assertEqual(rolling["event_count"], 3)
+        self.assertEqual(rolling["updated_at"], 200.0)
+
+    def test_rolling_summary_scoped_per_scene(self) -> None:
+        self.store.upsert_rolling_summary("living", "Living room text.", 1, 100.0)
+        self.store.upsert_rolling_summary("bedroom", "Bedroom text.", 1, 100.0)
+        self.assertEqual(self.store.get_rolling_summary("living")["text"], "Living room text.")
+        self.assertEqual(self.store.get_rolling_summary("bedroom")["text"], "Bedroom text.")
+
+    def test_writes_from_other_threads_do_not_raise(self) -> None:
+        """Regression test: the store is constructed on the main thread but
+        MonitorController writes from its own tick/digester threads. Without
+        check_same_thread=False (+ a lock), sqlite3 raises ProgrammingError
+        on every cross-thread call — silently swallowed by the controller's
+        broad except, which is exactly how a real 3-hour session logged zero
+        rows while the panel still showed live in-memory tracks."""
+        errors: list[Exception] = []
+
+        def writer_thread(track_num: int) -> None:
+            try:
+                db_id = self.store.insert_track("living", "person", 100.0 + track_num)
+                self.store.finish_track(db_id, 200.0 + track_num, frames=10, entity_id=None)
+                self.store.insert_event(
+                    "living", "entered", f"person track#{track_num}", 100.0 + track_num, None
+                )
+                self.store.events_between("living", 0, 1000)
+            except Exception as exc:  # pragma: no cover - failure path under test
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer_thread, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [], f"Cross-thread store access raised: {errors}")
+        conn = self.store.read_connection()
+        count = conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 8)
 
 
 class SceneStoreTest(unittest.TestCase):

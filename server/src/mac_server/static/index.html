@@ -263,6 +263,7 @@
   .event-row .time { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
   .event-row .txt { flex: 1; }
   .event-row .txt strong { color: var(--ink); font-weight: 600; }
+  .event-caption { color: var(--muted); font-style: italic; font-size: 11.5px; margin-top: 1px; }
   .event-row a { color: var(--muted); text-decoration: none; flex: none; }
   .event-row a:hover { color: var(--ink); }
   .summary-text {
@@ -401,6 +402,14 @@
         <button id="freezeBtn" class="ghost-btn" disabled
           title="Save current furniture detections (couch, bed, chair, table, tv) as scene anchors. Do this while the room is empty.">Freeze anchors</button>
       </div>
+      <p class="meta-line" style="opacity:0.75">
+        "Freeze anchors" saves the furniture YOLO currently sees (couch, bed, chair,
+        table, tv) as fixed reference points for this scene — click it once while the
+        room is <strong>empty</strong> (no person/pet blocking the furniture), before or
+        during monitoring. Without frozen anchors, the "on furniture" event (e.g. "sitting
+        on the couch") never fires — everything else (entered/exited/stationary/moving)
+        works without it.
+      </p>
       <p class="meta-line" id="monitorStatusLine"></p>
       <div id="eventFeed" class="event-feed"></div>
       <div class="map-form-row" id="summaryRow" style="margin-top:10px">
@@ -1260,21 +1269,24 @@ function renderMonitorCard(monitor) {
 function eventText(ev) {
   const subject = `<strong>${ev.subject_label}</strong>`;
   const details = ev.details || {};
-  if (ev.type === "entered") return `${subject} entered`;
-  if (ev.type === "exited") {
+  const caption = details.caption ? `<div class="event-caption">"${details.caption}"</div>` : "";
+  let line;
+  if (ev.type === "entered") {
+    line = `${subject} entered`;
+  } else if (ev.type === "exited") {
     const v = details.visible_s ? ` (visible ${fmtDur(details.visible_s)})` : "";
-    return `${subject} exited${v}`;
-  }
-  if (ev.type === "on_furniture") {
+    line = `${subject} exited${v}`;
+  } else if (ev.type === "on_furniture") {
     const posture = details.posture && details.posture !== "unclear" ? ` · ${details.posture}` : "";
     const dur = ev.t_end ? ` · ${fmtDur(details.duration_s)}` : " · ongoing";
-    return `${subject} on <strong>${ev.object_label}</strong>${posture}${dur}`;
-  }
-  if (ev.type === "stationary" || ev.type === "moving") {
+    line = `${subject} on <strong>${ev.object_label}</strong>${posture}${dur}`;
+  } else if (ev.type === "stationary" || ev.type === "moving") {
     const dur = ev.t_end ? ` · ${fmtDur(details.duration_s)}` : " · ongoing";
-    return `${subject} ${ev.type}${dur}`;
+    line = `${subject} ${ev.type}${dur}`;
+  } else {
+    line = `${subject} ${ev.type}`;
   }
-  return `${subject} ${ev.type}`;
+  return line + caption;
 }
 
 function fmtDur(seconds) {
