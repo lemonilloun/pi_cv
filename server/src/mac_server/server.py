@@ -41,6 +41,7 @@ class MacServer:
         preview_enabled: bool = True,
         server_cv_config: dict[str, Any] | None = None,
         mapping_config: dict[str, Any] | None = None,
+        monitoring_config: dict[str, Any] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -52,6 +53,7 @@ class MacServer:
         self.telemetry_store = TelemetryStore()
         self.cv_worker = self._build_cv_worker(server_cv_config or {})
         self.room_store, self.scan_controller = self._build_mapping(mapping_config or {})
+        self.monitor_controller = self._build_monitoring(monitoring_config or {})
         self.preview_server = (
             MjpegPreviewServer(
                 preview_host,
@@ -62,6 +64,7 @@ class MacServer:
                 cv_status_provider=(self.cv_worker.status if self.cv_worker is not None else None),
                 scan_controller=self.scan_controller,
                 room_store=self.room_store,
+                monitor_controller=self.monitor_controller,
             )
             if preview_enabled
             else None
@@ -106,6 +109,48 @@ class MacServer:
         )
         return room_store, scan_controller
 
+    def _build_monitoring(self, monitoring_config: dict[str, Any]):
+        if self.cv_worker is None or not monitoring_config.get("enabled", False):
+            return None
+        try:
+            from mac_server.monitoring.controller import MonitorController
+            from mac_server.monitoring.scenes import SceneStore
+            from mac_server.monitoring.store import MonitoringStore
+        except ImportError as exc:
+            logger.warning("Monitoring disabled (import failed): %s", exc)
+            return None
+
+        data_dir = Path(monitoring_config.get("data_dir", "data/monitoring"))
+        if not data_dir.is_absolute():
+            data_dir = REPO_ROOT / data_dir
+
+        agent = None
+        agent_config = monitoring_config.get("agent", {})
+        if agent_config.get("enabled", False):
+            try:
+                from mac_server.monitoring.agent import ApfelClient
+
+                agent = ApfelClient(
+                    base_url=str(agent_config.get("base_url", "http://127.0.0.1:11434")),
+                    model=str(agent_config.get("model", "apfel")),
+                    timeout_s=float(agent_config.get("timeout_s", 20.0)),
+                    max_input_tokens=int(agent_config.get("max_input_tokens", 2500)),
+                    max_output_tokens=int(agent_config.get("max_output_tokens", 400)),
+                )
+            except Exception as exc:
+                logger.warning("Monitoring agent disabled: %s", exc)
+
+        return MonitorController(
+            cv_worker=self.cv_worker,
+            frame_hub=self.frame_hub,
+            registry=self.registry,
+            scene_store=SceneStore(data_dir / "scenes"),
+            store=MonitoringStore(data_dir),
+            config=monitoring_config,
+            scan_controller=self.scan_controller,
+            agent=agent,
+        )
+
     def start(self) -> None:
         if self._socket is not None:
             return
@@ -149,6 +194,8 @@ class MacServer:
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self.monitor_controller is not None:
+            self.monitor_controller.shutdown()
         if self.scan_controller is not None:
             self.scan_controller.shutdown()
         if self.cv_worker is not None:
@@ -269,9 +316,11 @@ def main() -> int:
 
     server_cv_config = dict(config.get("server_cv", {}))
     mapping_config = dict(config.get("mapping", {}))
+    monitoring_config = dict(config.get("monitoring", {}))
     if args.no_cv:
         server_cv_config["enabled"] = False
         mapping_config = {}
+        monitoring_config = {}
 
     server = MacServer(
         host=host,
@@ -283,6 +332,7 @@ def main() -> int:
         preview_enabled=preview_enabled,
         server_cv_config=server_cv_config,
         mapping_config=mapping_config,
+        monitoring_config=monitoring_config,
     )
     try:
         server.serve_forever(once=args.once)

@@ -156,10 +156,36 @@ distance, so a stationary camera is a valid degenerate case and drift cannot
 accumulate. Four directional scans fuse into one grid by axis-aligned
 transforms and auto-estimate the room rectangle.
 
+## Smart Monitoring Flow
+
+For a fixed camera placement, `mac_server/monitoring/` turns the enriched
+25 fps detection stream (Hailo YOLO on the Pi + metric depth on the Mac) into
+a persistent semantic log:
+
+1. `cv_worker` publishes every enriched objects batch — including empty
+   ones — into `objects_store` (a `LatestItemStore`).
+2. `controller.py` (`MonitorController`, one thread per active session)
+   consumes it: `tracker.py` (greedy IoU/centroid association, no Kalman)
+   maintains short-term tracks; `events.py` derives hysteresis-gated events
+   (`entered`, `exited`, `stationary`/`moving`, `on_furniture` with posture
+   from bbox aspect ratio); `signatures.py` resolves persistent entities
+   (`Person#1`) via HSV-histogram matching, split-biased so uncertain matches
+   create new entities rather than merging strangers.
+3. `store.py` persists everything to SQLite (WAL, controller thread is the
+   only writer) with bbox-crop snapshots and a retention sweep; `scenes.py`
+   holds per-placement configs with explicitly frozen furniture anchors.
+4. `agent.py` (optional) talks to apfel — Apple's on-device model behind an
+   OpenAI-compatible endpoint — producing 5-minute event digests and
+   on-demand hierarchical summaries within the model's 4096-token budget.
+
+Timestamps are Mac wall clock at enrichment time; Pi frame indices are used
+only for deduplication, sidestepping Pi↔Mac clock skew.
+
 ## Next Steps
 
-- V3 mapping: YOLO object landmarks on the room map (ultralytics on the Mac),
-  person masking during scans.
+- Hailo osnet re-id embeddings behind the `SignatureProvider` seam (robust
+  person identity across clothing changes).
+- TF-Luna ToF sensor as metric-depth ground truth (`depth_scale_correction`
+  calibration), then revisit room mapping.
 - Add structured message types for IMU samples; fuse IMU odometry into scans.
 - Add optional H.264 path with `rpicam-vid` for higher quality/lower bandwidth streaming.
-- Benchmark the combined pipeline on Raspberry Pi 5 once the AI HAT arrives.

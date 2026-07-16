@@ -71,6 +71,40 @@
     "min_wall_height_m": 1.6,
     "depth_scale_correction": 1.0
   },
+  "monitoring": {
+    "enabled": true,
+    "data_dir": "data/monitoring",
+    "min_confidence": 0.35,
+    "mobile_classes": ["person", "cat", "dog"],
+    "anchor_classes": ["couch", "bed", "chair", "dining table", "tv"],
+    "iou_gate": 0.1,
+    "centroid_gate_frac": 0.15,
+    "confirm_hits": 3,
+    "lost_after_s": 2.0,
+    "end_after_s": 10.0,
+    "event_open_hold_s": 2.0,
+    "event_close_hold_s": 3.0,
+    "overlap_on_ratio": 0.3,
+    "depth_agree_m": 0.7,
+    "stationary_window_s": 5.0,
+    "stationary_px_frac": 0.02,
+    "signature_refresh_s": 10.0,
+    "reacquire_window_h": 24,
+    "match_threshold": 0.6,
+    "match_margin": 0.1,
+    "snapshot_events": ["entered", "on_furniture"],
+    "retention_days": 14,
+    "max_snapshot_mb": 200,
+    "agent": {
+      "enabled": true,
+      "base_url": "http://127.0.0.1:11434",
+      "model": "apfel",
+      "digest_interval_s": 300,
+      "timeout_s": 20,
+      "max_input_tokens": 2500,
+      "max_output_tokens": 400
+    }
+  },
   "logging": {
     "level": "INFO"
   }

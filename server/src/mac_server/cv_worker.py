@@ -145,6 +145,7 @@ class ServerCvWorker:
         self._pi_store = pi_store
         self._depth_view_store = frame_hub.get("depth")
         self.depth_store = LatestItemStore()
+        self.objects_store = LatestItemStore()
         self._config = config
         self._repo_root = repo_root
         self._stop_event = threading.Event()
@@ -268,9 +269,11 @@ class ServerCvWorker:
 
             # Attach metric distances + bearing to Pi-detected objects (data
             # channel: the Pi runs YOLO on the AI HAT, the Mac contributes
-            # meters and camera-frame position).
+            # meters and camera-frame position). Empty lists are published
+            # too: consumers (radar, monitoring tracker) need "nothing in
+            # view" ticks to clear points and to age out tracks.
             objects = frame.metadata.get("objects")
-            if objects:
+            if objects is not None:
                 try:
                     from mac_server.mapping.geometry import CameraIntrinsics
 
@@ -281,6 +284,7 @@ class ServerCvWorker:
                         "computed_at": time.time(),
                         "objects": _attach_depth_to_objects(objects, depth_m, np, intrinsics),
                     }
+                    self.objects_store.update(self._latest_objects)
                 except Exception as exc:
                     logger.debug("Object depth attachment failed: %s", exc)
 

@@ -42,6 +42,7 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
     preview_config = config.setdefault("preview", {})
     session_config = config.setdefault("session", {})
     server_cv_config = config.setdefault("server_cv", {})
+    monitoring_config = config.setdefault("monitoring", {})
     logging_config = config.setdefault("logging", {})
 
     if value := os.environ.get("PI_CV_SERVER_BIND_HOST"):
@@ -98,6 +99,19 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         server_cv_config["depth_input_size"] = int(value)
     if value := os.environ.get("PI_CV_SERVER_CV_TARGET_FPS"):
         server_cv_config["target_fps"] = float(value)
+
+    if value := os.environ.get("PI_CV_MONITORING_ENABLED"):
+        monitoring_config["enabled"] = value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    if value := os.environ.get("PI_CV_MONITORING_DATA_DIR"):
+        monitoring_config["data_dir"] = value
+    if value := os.environ.get("PI_CV_MONITORING_AGENT_ENABLED"):
+        monitoring_config.setdefault("agent", {})["enabled"] = value.strip().lower() in {
+            "1", "true", "yes", "y", "on",
+        }
+    if value := os.environ.get("PI_CV_MONITORING_AGENT_BASE_URL"):
+        monitoring_config.setdefault("agent", {})["base_url"] = value
+    if value := os.environ.get("PI_CV_MONITORING_DIGEST_INTERVAL_S"):
+        monitoring_config.setdefault("agent", {})["digest_interval_s"] = float(value)
 
     if value := os.environ.get("PI_CV_LOG_LEVEL"):
         logging_config["level"] = value

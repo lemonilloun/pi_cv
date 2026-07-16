@@ -236,6 +236,54 @@
   .scan-btn:disabled { opacity: 0.45; cursor: default; }
   .scan-btn.stop { background: var(--critical); border-color: var(--critical); }
   #dirButtons button.done::after { content: " ✓"; color: var(--good); }
+  .event-feed {
+    margin-top: 10px;
+    max-height: 220px;
+    overflow-y: auto;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    background: var(--surface-2);
+  }
+  .event-feed.visible { display: flex; }
+  .event-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    padding: 3px 2px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .event-row:last-child { border-bottom: none; }
+  .event-row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .event-row .time { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+  .event-row .txt { flex: 1; }
+  .event-row .txt strong { color: var(--ink); font-weight: 600; }
+  .event-row a { color: var(--muted); text-decoration: none; flex: none; }
+  .event-row a:hover { color: var(--ink); }
+  .summary-text {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--ink);
+    white-space: pre-wrap;
+  }
+  #summaryRow select {
+    background: var(--surface-2);
+    color: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
   #radarCanvas {
     display: none;
     width: 100%;
@@ -331,6 +379,42 @@
       </div>
       <p class="meta-line" id="scanStatusLine"></p>
       <p id="mapError" style="color:var(--critical);font-size:12.5px;min-height:16px;margin:6px 0 0"></p>
+    </div>
+
+    <div class="card" style="margin-top:16px" id="monitorCard">
+      <p class="section-title">Monitoring</p>
+      <div class="map-room-row">
+        <select id="sceneSelect"><option value="">— select scene —</option></select>
+        <button id="newSceneBtn" class="ghost-btn">+ New scene</button>
+      </div>
+      <div id="newSceneForm" style="display:none">
+        <div class="map-form-row">
+          <input id="sceneName" type="text" placeholder="Scene name (e.g. Living room)">
+        </div>
+        <div class="map-form-row">
+          <button id="createSceneBtn" class="ghost-btn">Create</button>
+          <button id="cancelSceneBtn" class="ghost-btn">Cancel</button>
+        </div>
+      </div>
+      <div class="map-form-row" style="margin-top:10px">
+        <button id="monitorBtn" class="scan-btn" disabled>Start monitoring</button>
+        <button id="freezeBtn" class="ghost-btn" disabled
+          title="Save current furniture detections (couch, bed, chair, table, tv) as scene anchors. Do this while the room is empty.">Freeze anchors</button>
+      </div>
+      <p class="meta-line" id="monitorStatusLine"></p>
+      <div id="eventFeed" class="event-feed"></div>
+      <div class="map-form-row" id="summaryRow" style="margin-top:10px">
+        <select id="summaryHours" style="flex:0 0 90px">
+          <option value="1">1 h</option>
+          <option value="3">3 h</option>
+          <option value="6">6 h</option>
+          <option value="24">24 h</option>
+        </select>
+        <button id="summaryBtn" class="ghost-btn" disabled
+          title="Ask the local AI (apfel) to summarize what happened">Summarize</button>
+      </div>
+      <div id="summaryText" class="summary-text" style="display:none"></div>
+      <p id="monitorError" style="color:var(--critical);font-size:12.5px;min-height:16px;margin:6px 0 0"></p>
     </div>
   </section>
 
@@ -720,6 +804,19 @@ function renderStatus(status) {
     if (wasActive && !state.scanActive) loadRooms(); // refresh scans_done marks
   }
 
+  // monitoring status (same poll)
+  if (status.monitor !== undefined) {
+    const wasMonitoring = state.monitorActive;
+    state.monitorActive = !!(status.monitor && status.monitor.active);
+    renderMonitorCard(status.monitor);
+    if (state.monitorActive && !wasMonitoring) {
+      state.lastEventTs = state.lastEventTs || Date.now() / 1000 - 3600;
+      setEventPolling(true);
+    } else if (!state.monitorActive && wasMonitoring) {
+      setEventPolling(false);
+    }
+  }
+
   // frame badge (depends on which view is displayed)
   const viewBadge = document.getElementById("viewBadge");
   const inferBadge = document.getElementById("inferBadge");
@@ -1100,6 +1197,253 @@ document.getElementById("radarCanvas").addEventListener("mouseleave", () => {
 
 window.addEventListener("resize", () => { if (state.currentView === "radar") drawRadar(); });
 
+// ----------------------------------------------------------- monitoring
+state.scenes = [];
+state.monitorActive = false;
+state.lastEventTs = 0;
+state.eventRows = new Map(); // event id -> row element
+let eventPollTimer = null;
+
+async function loadScenes() {
+  try {
+    const res = await fetch("/api/scenes");
+    if (!res.ok) { document.getElementById("monitorCard").style.display = "none"; return; }
+    const data = await res.json();
+    state.scenes = data.scenes || [];
+    const select = document.getElementById("sceneSelect");
+    const current = select.value;
+    select.innerHTML = '<option value="">— select scene —</option>' +
+      state.scenes.map((s) => `<option value="${s.scene_id}">${s.name}</option>`).join("");
+    if (current && state.scenes.some((s) => s.scene_id === current)) select.value = current;
+    renderMonitorCard();
+  } catch (err) { /* server not ready */ }
+}
+
+function selectedScene() {
+  const id = document.getElementById("sceneSelect").value;
+  return state.scenes.find((s) => s.scene_id === id) || null;
+}
+
+function renderMonitorCard(monitor) {
+  const scene = selectedScene();
+  const active = monitor ? !!monitor.active : state.monitorActive;
+  const monitorBtn = document.getElementById("monitorBtn");
+  const freezeBtn = document.getElementById("freezeBtn");
+
+  monitorBtn.disabled = !scene && !active;
+  monitorBtn.textContent = active ? "Stop monitoring" : "Start monitoring";
+  monitorBtn.classList.toggle("stop", active);
+  freezeBtn.disabled = !scene && !active;
+
+  const line = document.getElementById("monitorStatusLine");
+  if (monitor && monitor.active) {
+    const agent = monitor.agent || {};
+    const agentPart = agent.enabled ? (agent.healthy ? " · agent ok" : " · agent down") : "";
+    const stalledPart = monitor.stalled ? " · ⚠ stalled — is the Pi in yolo mode?" : "";
+    line.textContent =
+      `active · ${monitor.scene_id} · ${(monitor.tracks || []).length} tracks · ` +
+      `${monitor.open_events} open · ${monitor.events_total} events` +
+      (monitor.tick_hz ? ` · ${monitor.tick_hz} Hz` : "") + agentPart + stalledPart;
+  } else if (scene) {
+    const anchors = (scene.anchors || []).map((a) => a.anchor_id).join(", ") || "none";
+    line.textContent = `${scene.name}: anchors [${anchors}]`;
+  } else {
+    line.textContent = "";
+  }
+
+  const agentOk = monitor && monitor.agent && monitor.agent.enabled;
+  document.getElementById("summaryBtn").disabled = !(scene || active) || !agentOk;
+
+  document.getElementById("eventFeed").classList.toggle("visible", active || state.eventRows.size > 0);
+}
+
+function eventText(ev) {
+  const subject = `<strong>${ev.subject_label}</strong>`;
+  const details = ev.details || {};
+  if (ev.type === "entered") return `${subject} entered`;
+  if (ev.type === "exited") {
+    const v = details.visible_s ? ` (visible ${fmtDur(details.visible_s)})` : "";
+    return `${subject} exited${v}`;
+  }
+  if (ev.type === "on_furniture") {
+    const posture = details.posture && details.posture !== "unclear" ? ` · ${details.posture}` : "";
+    const dur = ev.t_end ? ` · ${fmtDur(details.duration_s)}` : " · ongoing";
+    return `${subject} on <strong>${ev.object_label}</strong>${posture}${dur}`;
+  }
+  if (ev.type === "stationary" || ev.type === "moving") {
+    const dur = ev.t_end ? ` · ${fmtDur(details.duration_s)}` : " · ongoing";
+    return `${subject} ${ev.type}${dur}`;
+  }
+  return `${subject} ${ev.type}`;
+}
+
+function fmtDur(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  seconds = Number(seconds);
+  return seconds < 90 ? Math.round(seconds) + "s" : Math.round(seconds / 60) + "m";
+}
+
+function renderEvent(ev) {
+  const feed = document.getElementById("eventFeed");
+  const existing = state.eventRows.get(ev.id);
+  const time = new Date(ev.t_start * 1000).toLocaleTimeString();
+  const cls = (ev.subject_label || "").split(/[# ]/)[0].toLowerCase();
+  const snapLink = ev.snapshot
+    ? ` <a href="/monitor/snapshot.jpg?id=${ev.id}" target="_blank" title="Snapshot">📷</a>` : "";
+  const html =
+    `<span class="dot" style="background:${classColor(cls)}"></span>` +
+    `<span class="time">${time}</span>` +
+    `<span class="txt">${eventText(ev)}</span>` + snapLink;
+  if (existing) {
+    existing.innerHTML = html;
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "event-row";
+  row.innerHTML = html;
+  feed.prepend(row);
+  state.eventRows.set(ev.id, row);
+  while (feed.children.length > 80) {
+    const last = feed.lastChild;
+    for (const [id, el] of state.eventRows) if (el === last) state.eventRows.delete(id);
+    feed.removeChild(last);
+  }
+}
+
+async function pollEvents() {
+  try {
+    const res = await fetch(`/api/monitor/events?since=${state.lastEventTs || (Date.now() / 1000 - 3600)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const events = (data.events || []).slice().reverse(); // oldest first for stable prepend
+    for (const ev of events) {
+      renderEvent(ev);
+      if (ev.t_start > state.lastEventTs) state.lastEventTs = ev.t_start;
+    }
+    if (events.length) document.getElementById("eventFeed").classList.add("visible");
+  } catch (err) { /* transient */ }
+}
+
+function setEventPolling(on) {
+  if (on && eventPollTimer === null) {
+    pollEvents();
+    eventPollTimer = setInterval(pollEvents, 2000);
+  } else if (!on && eventPollTimer !== null) {
+    clearInterval(eventPollTimer);
+    eventPollTimer = null;
+  }
+}
+
+document.getElementById("sceneSelect").addEventListener("change", () => renderMonitorCard());
+document.getElementById("newSceneBtn").addEventListener("click", () => {
+  document.getElementById("newSceneForm").style.display = "";
+});
+document.getElementById("cancelSceneBtn").addEventListener("click", () => {
+  document.getElementById("newSceneForm").style.display = "none";
+});
+document.getElementById("createSceneBtn").addEventListener("click", async () => {
+  document.getElementById("monitorError").textContent = "";
+  try {
+    const res = await fetch("/api/scenes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: document.getElementById("sceneName").value }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      document.getElementById("monitorError").textContent = data.error || ("HTTP " + res.status);
+      return;
+    }
+    document.getElementById("newSceneForm").style.display = "none";
+    await loadScenes();
+    document.getElementById("sceneSelect").value = data.scene.scene_id;
+    renderMonitorCard();
+  } catch (err) {
+    document.getElementById("monitorError").textContent = "Request failed: " + err;
+  }
+});
+
+document.getElementById("freezeBtn").addEventListener("click", async () => {
+  document.getElementById("monitorError").textContent = "";
+  const scene = selectedScene();
+  try {
+    const res = await fetch("/api/monitor/anchors/freeze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scene ? { scene_id: scene.scene_id } : {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      document.getElementById("monitorError").textContent = data.error || ("HTTP " + res.status);
+      return;
+    }
+    await loadScenes();
+  } catch (err) {
+    document.getElementById("monitorError").textContent = "Request failed: " + err;
+  }
+});
+
+document.getElementById("monitorBtn").addEventListener("click", async () => {
+  document.getElementById("monitorError").textContent = "";
+  try {
+    if (state.monitorActive) {
+      const res = await fetch("/api/monitor/stop", { method: "POST" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        document.getElementById("monitorError").textContent = data.error || ("HTTP " + res.status);
+        return;
+      }
+      state.monitorActive = false;
+      setEventPolling(false);
+    } else {
+      const scene = selectedScene();
+      if (!scene) return;
+      const res = await fetch("/api/monitor/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scene_id: scene.scene_id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        document.getElementById("monitorError").textContent = data.error || ("HTTP " + res.status);
+        return;
+      }
+      state.monitorActive = true;
+      state.lastEventTs = Date.now() / 1000 - 60;
+      setEventPolling(true);
+    }
+    renderMonitorCard();
+  } catch (err) {
+    document.getElementById("monitorError").textContent = "Request failed: " + err;
+  }
+});
+
+document.getElementById("summaryBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("summaryBtn");
+  const out = document.getElementById("summaryText");
+  const hours = document.getElementById("summaryHours").value;
+  btn.disabled = true;
+  btn.textContent = "Summarizing…";
+  out.style.display = "";
+  out.textContent = "Asking the local AI…";
+  try {
+    const res = await fetch(`/api/monitor/summary?hours=${hours}`);
+    const data = await res.json().catch(() => ({}));
+    if (data.summary) {
+      out.textContent = data.summary;
+    } else if (data.digests && data.digests.length) {
+      out.textContent = "Agent unavailable — raw digests:\n\n" +
+        data.digests.map((d) => d.text).join("\n");
+    } else {
+      out.textContent = data.error || "No digests yet — the agent digests events every 5 minutes while monitoring is active.";
+    }
+  } catch (err) {
+    out.textContent = "Request failed: " + err;
+  }
+  btn.textContent = "Summarize";
+  btn.disabled = false;
+});
+
 // MJPEG <img> stalls if the stream drops; nudge it periodically when broken.
 const streamImg = document.getElementById("stream");
 streamImg.addEventListener("error", () => {
@@ -1110,6 +1454,7 @@ window.addEventListener("resize", drawCharts);
 
 backfill().then(poll);
 loadRooms();
+loadScenes();
 setInterval(poll, 1000);
 </script>
 </body>
