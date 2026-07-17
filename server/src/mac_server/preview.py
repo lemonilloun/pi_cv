@@ -179,6 +179,9 @@ def _make_handler(
             if parsed.path == "/api/monitor/summary":
                 self._serve_monitor_summary(parsed.query)
                 return
+            if parsed.path == "/api/graph":
+                self._serve_graph(parsed.query)
+                return
             if parsed.path == "/monitor/snapshot.jpg":
                 self._serve_monitor_snapshot(parsed.query)
                 return
@@ -206,6 +209,9 @@ def _make_handler(
                 return
             if parsed.path == "/api/monitor/stop":
                 self._handle_monitor_stop()
+                return
+            if parsed.path == "/api/monitor/ask":
+                self._handle_monitor_ask()
                 return
             if parsed.path == "/api/monitor/anchors/freeze":
                 self._handle_anchors_freeze()
@@ -472,10 +478,14 @@ def _make_handler(
             conn = monitor_controller.store.read_connection()
             try:
                 rows = conn.execute(
-                    "SELECT id, type, subject_label, object_label, t_start, t_end,"
-                    " details, snapshot_path FROM events"
-                    " WHERE scene_id = ? AND (t_start >= ? OR t_end IS NULL)"
-                    " ORDER BY t_start DESC LIMIT ?",
+                    "SELECT e.id, e.relation, s.label AS subject_label,"
+                    " d.label AS object_label, e.t_start, e.t_end, e.details,"
+                    " e.caption, e.key_moment, e.snapshot_path"
+                    " FROM graph_edges e"
+                    " JOIN graph_nodes s ON s.id = e.src_node"
+                    " LEFT JOIN graph_nodes d ON d.id = e.dst_node"
+                    " WHERE e.scene_id = ? AND (e.t_start >= ? OR e.t_end IS NULL)"
+                    " ORDER BY e.t_start DESC LIMIT ?",
                     (scene_id, since, limit),
                 ).fetchall()
             finally:
@@ -483,12 +493,14 @@ def _make_handler(
             events = [
                 {
                     "id": row["id"],
-                    "type": row["type"],
+                    "type": row["relation"],
                     "subject_label": row["subject_label"],
                     "object_label": row["object_label"],
                     "t_start": row["t_start"],
                     "t_end": row["t_end"],
                     "details": json.loads(row["details"]) if row["details"] else {},
+                    "caption": row["caption"],
+                    "key_moment": bool(row["key_moment"]),
                     "snapshot": bool(row["snapshot_path"]),
                 }
                 for row in rows
@@ -505,8 +517,8 @@ def _make_handler(
             conn = monitor_controller.store.read_connection()
             try:
                 rows = conn.execute(
-                    "SELECT id, label, class, first_seen, last_seen, total_visible_s"
-                    " FROM entities WHERE scene_id = ? ORDER BY last_seen DESC",
+                    "SELECT id, kind, label, class, first_seen, last_seen, total_visible_s"
+                    " FROM graph_nodes WHERE scene_id = ? ORDER BY last_seen DESC",
                     (scene_id or "",),
                 ).fetchall()
             finally:
@@ -516,6 +528,7 @@ def _make_handler(
                     "entities": [
                         {
                             "id": row["id"],
+                            "kind": row["kind"],
                             "label": row["label"],
                             "class": row["class"],
                             "first_seen": row["first_seen"],
@@ -547,43 +560,98 @@ def _make_handler(
             digests = monitor_controller.store.digests_between(scene_id, now - hours * 3600, now)
             agent = monitor_controller.agent
 
-            # Fast path: an incrementally-maintained rolling summary already
-            # exists (updated every digest cycle) — serve it directly instead
-            # of re-merging a growing pile of digests on every request.
+            # The rolling summary is maintained incrementally every digest
+            # cycle; this endpoint just serves it (Q&A replaced the old
+            # merge-on-demand summary — see POST /api/monitor/ask).
             rolling = monitor_controller.store.get_rolling_summary(scene_id)
-            if rolling is not None:
-                self._send_json(
-                    {
-                        "summary": rolling["text"],
-                        "rolling": True,
-                        "event_count": rolling["event_count"],
-                        "updated_at": rolling["updated_at"],
-                        "digests": digests,
-                        "agent_healthy": agent.healthy if agent else False,
-                    }
-                )
-                return
-
-            if agent is None:
-                self._send_json(
-                    {"summary": None, "digests": digests, "agent_healthy": False},
-                    status=503 if not digests else 200,
-                )
-                return
-
-            # Cold start: no rolling summary yet (first digest cycle hasn't
-            # run). Fall back to merging whatever digests exist so far.
-            scene = monitor_controller.scene_store.load_scene(scene_id) or {}
-            period = f"last {hours:g}h"
-            summary = agent.summarize(scene.get("name", scene_id), period, digests)
             self._send_json(
                 {
-                    "summary": summary,
-                    "rolling": False,
+                    "summary": rolling["text"] if rolling else None,
+                    "rolling": rolling is not None,
+                    "event_count": rolling["event_count"] if rolling else 0,
+                    "updated_at": rolling["updated_at"] if rolling else None,
                     "digests": digests,
-                    "agent_healthy": agent.healthy,
+                    "agent_healthy": agent.healthy if agent else False,
                 },
-                status=200 if (summary or digests) else 503,
+                status=200 if (rolling or digests) else 503,
+            )
+
+        def _handle_monitor_ask(self) -> None:
+            if self._monitor_unavailable():
+                return
+            body = self._read_json_body()
+            if body is None or not str(body.get("question", "")).strip():
+                self._send_json({"error": "question is required"}, status=400)
+                return
+            try:
+                hours = min(24.0, max(0.25, float(body.get("hours", 3.0))))
+            except (TypeError, ValueError):
+                hours = 3.0
+            from mac_server.monitoring.controller import MonitorError
+
+            try:
+                result = monitor_controller.ask(str(body["question"]).strip(), hours=hours)
+            except MonitorError as exc:
+                self._send_json({"error": str(exc)}, status=503)
+                return
+            for moment in result.get("key_moments", []):
+                moment["snapshot"] = bool(moment.pop("snapshot_path", None))
+            self._send_json(result)
+
+        def _serve_graph(self, query: str) -> None:
+            if self._monitor_unavailable():
+                return
+            params = parse_qs(query)
+            import time as _time
+
+            now = _time.time()
+            try:
+                hours = min(168.0, max(0.25, float(params.get("hours", ["24"])[0])))
+            except ValueError:
+                hours = 24.0
+            scene_id = params.get("scene_id", [None])[0]
+            if scene_id is None:
+                scene_id = monitor_controller.status().get("scene_id")
+            if not scene_id:
+                self._send_json({"error": "no scene active or given"}, status=400)
+                return
+            conn = monitor_controller.store.read_connection()
+            try:
+                node_rows = conn.execute(
+                    "SELECT id, kind, class, label, first_seen, last_seen,"
+                    " total_visible_s, best_snapshot_path FROM graph_nodes"
+                    " WHERE scene_id = ?",
+                    (scene_id,),
+                ).fetchall()
+                edge_rows = conn.execute(
+                    "SELECT e.id, e.src_node, e.dst_node, e.relation, e.t_start,"
+                    " e.t_end, e.details, e.caption, e.key_moment"
+                    " FROM graph_edges e WHERE e.scene_id = ?"
+                    " AND (e.t_end IS NULL OR e.t_end >= ?) AND e.t_start < ?"
+                    " ORDER BY e.t_start LIMIT 1000",
+                    (scene_id, now - hours * 3600, now),
+                ).fetchall()
+            finally:
+                conn.close()
+            self._send_json(
+                {
+                    "scene_id": scene_id,
+                    "nodes": [dict(row) for row in node_rows],
+                    "edges": [
+                        {
+                            "id": row["id"],
+                            "src_node": row["src_node"],
+                            "dst_node": row["dst_node"],
+                            "relation": row["relation"],
+                            "t_start": row["t_start"],
+                            "t_end": row["t_end"],
+                            "details": json.loads(row["details"]) if row["details"] else {},
+                            "caption": row["caption"],
+                            "key_moment": bool(row["key_moment"]),
+                        }
+                        for row in edge_rows
+                    ],
+                }
             )
 
         def _serve_monitor_snapshot(self, query: str) -> None:
@@ -598,7 +666,7 @@ def _make_handler(
             conn = monitor_controller.store.read_connection()
             try:
                 row = conn.execute(
-                    "SELECT snapshot_path FROM events WHERE id = ?", (event_id,)
+                    "SELECT snapshot_path FROM graph_edges WHERE id = ?", (event_id,)
                 ).fetchone()
             finally:
                 conn.close()

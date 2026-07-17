@@ -55,8 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-model", help="Path to YOLO .pt or exported NCNN model directory (ncnn backend)")
     parser.add_argument("--yolo-task", choices=["detect", "segment"])
     parser.add_argument("--yolo-confidence", type=float)
-    parser.add_argument("--yolo-fps", type=float, help="YOLO mode FPS (hailo backend)")
+    parser.add_argument("--yolo-fps", type=float, help="YOLO mode FPS cap (CPU-bound best effort on ncnn)")
     parser.add_argument("--hailo-hef", help="Path to Hailo .hef model (hailo backend)")
+    parser.add_argument("--hailo-arch", choices=["yolov8", "yolo26"], help="Hef head format: yolov8 = on-chip NMS, yolo26 = raw outputs")
     parser.add_argument("--hailo-labels", help="Optional labels txt for the hef (default: COCO80)")
 
     parser.add_argument("--depth-backend", choices=["synthetic", "depth-anything-v2"])
@@ -129,12 +130,13 @@ def build_settings(args: argparse.Namespace) -> SessionSettings:
         connect_timeout_seconds=float(client_config.get("connect_timeout_seconds", 5)),
         reconnect_min_seconds=float(session_config.get("reconnect_min_seconds", 1.0)),
         reconnect_max_seconds=float(session_config.get("reconnect_max_seconds", 30.0)),
-        yolo_backend=str(pick(args.yolo_backend, "yolo_backend", "hailo")),
+        yolo_backend=str(pick(args.yolo_backend, "yolo_backend", "ncnn")),
         yolo_model=pick(args.yolo_model, "yolo_model", None),
         yolo_task=str(pick(args.yolo_task, "yolo_task", "detect")),
         yolo_confidence=float(pick(args.yolo_confidence, "yolo_confidence", 0.5)),
         yolo_fps=float(pick(args.yolo_fps, "yolo_fps", 25.0)),
         hailo_hef=str(pick(args.hailo_hef, "hailo_hef", "/usr/share/hailo-models/yolov8s_h8l.hef")),
+        hailo_arch=str(pick(args.hailo_arch, "hailo_arch", "yolov8")),
         hailo_labels=pick(args.hailo_labels, "hailo_labels", None),
         depth_backend=str(pick(args.depth_backend, "depth_backend", "depth-anything-v2")),
         depth_model_path=pick(args.depth_model_path, "depth_model_path", None),

@@ -27,12 +27,13 @@
     "reconnect_min_seconds": 1.0,
     "reconnect_max_seconds": 30.0,
     "synthetic_image": "data/cat.jpg",
-    "yolo_backend": "hailo",
+    "yolo_backend": "ncnn",
     "yolo_model": "models/yolo26n_ncnn_model",
     "yolo_task": "detect",
     "yolo_confidence": 0.5,
     "yolo_fps": 25.0,
     "hailo_hef": "/usr/share/hailo-models/yolov8s_h8l.hef",
+    "hailo_arch": "yolov8",
     "hailo_labels": null,
     "depth_backend": "depth-anything-v2",
     "depth_model_path": "models/depth_anything_v2_vits.pth",
@@ -85,13 +86,26 @@
     "event_close_hold_s": 3.0,
     "overlap_on_ratio": 0.3,
     "depth_agree_m": 0.7,
-    "stationary_window_s": 5.0,
-    "stationary_px_frac": 0.02,
-    "signature_refresh_s": 10.0,
-    "reacquire_window_h": 24,
-    "match_threshold": 0.6,
-    "match_margin": 0.1,
-    "snapshot_events": ["entered", "on_furniture"],
+    "presence": {
+      "exit_edge_frac": 0.10,
+      "exit_absent_s": 25.0,
+      "presence_timeout_s": 300.0
+    },
+    "relations": {
+      "near_gap_frac": 0.05,
+      "near_depth_agree_m": 1.0,
+      "move_min_frac": 0.15
+    },
+    "embeddings": {
+      "enabled": true,
+      "model": "MobileCLIP-S1",
+      "device": "mps"
+    },
+    "qa": {
+      "key_moments_per_digest": 3,
+      "key_snapshot_retention_h": 24
+    },
+    "snapshot_events": ["entered", "on"],
     "retention_days": 14,
     "max_snapshot_mb": 200,
     "agent": {
@@ -112,7 +126,7 @@
       "keep_alive": "0s",
       "timeout_s": 120,
       "crop_margin_frac": 0.15,
-      "caption_events": ["on_furniture"]
+      "caption_events": ["on"]
     }
   },
   "logging": {

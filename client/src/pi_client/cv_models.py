@@ -340,6 +340,123 @@ class WarmHailoYolo:
             pass
 
 
+class WarmHailoYolo26:
+    """YOLO26 detection on the Hailo NPU from a custom-compiled .hef
+    (scripts/compile_yolo26_hef/ — the Model Zoo has no yolo26).
+
+    Unlike the Zoo yolov8 hefs, a yolo26 hef has NO on-chip NMS: the raw
+    head outputs are decoded on the host by the yolo26_hailo project
+    (https://github.com/DanielDubinsky/yolo26_hailo), which
+    scripts/setup_yolo26_hailo.sh clones into external/yolo26_hailo. This
+    class is a thin adapter over that project's inference engine so its
+    tested decode is reused rather than re-implemented here.
+    """
+
+    def __init__(self, hef_path: str, labels_path: str | None = None) -> None:
+        resolved_hef = Path(hef_path)
+        if not resolved_hef.is_absolute():
+            resolved_hef = REPO_ROOT / resolved_hef
+        if not resolved_hef.exists():
+            raise CvModelError(
+                f"YOLO26 hef not found: {resolved_hef}. Compile it with "
+                "scripts/compile_yolo26_hef/ (x86 Linux/Docker) and copy it to the Pi."
+            )
+
+        repo_dir = REPO_ROOT / "external" / "yolo26_hailo"
+        if not repo_dir.exists():
+            raise CvModelError(
+                "external/yolo26_hailo is missing — run ./scripts/setup_yolo26_hailo.sh "
+                "on the Pi first (it provides the host-side decode for yolo26 hefs)."
+            )
+        for entry in (str(repo_dir), str(repo_dir / "python")):
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+        try:
+            from common import HailoPythonInferenceEngine  # type: ignore
+        except ImportError as exc:
+            raise CvModelError(
+                f"Failed to import the yolo26_hailo inference engine: {exc}. "
+                "Check external/yolo26_hailo and its requirements "
+                "(pip install -r external/yolo26_hailo/requirements.txt)."
+            ) from exc
+
+        self.model_path = str(resolved_hef)
+        self.task = "detect"
+        self.class_names = WarmHailoYolo._load_labels(labels_path)
+        try:
+            self._engine = HailoPythonInferenceEngine(self.model_path)
+        except Exception as exc:
+            raise CvModelError(f"Failed to open Hailo device/yolo26 model: {exc}") from exc
+
+    def infer_bgr(self, image_array: Any, confidence: float) -> YoloResult:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise CvModelError("OpenCV is required for Hailo inference") from exc
+
+        frame_h, frame_w = image_array.shape[:2]
+        started_at = time.perf_counter()
+        try:
+            # The engine's preprocess handles letterboxing; it accepts a
+            # path or an ndarray depending on the repo version — try the
+            # array first (no disk roundtrip at 25 fps).
+            preprocess = type(self._engine).preprocess
+            input_data, _orig, scale, pad_w, pad_h = preprocess(image_array)
+            results, _stats = self._engine.infer(
+                input_data, conf_threshold=confidence
+            )
+            from common import scale_detections_to_original  # type: ignore
+
+            results = scale_detections_to_original(
+                results, frame_h, frame_w, scale, pad_w, pad_h
+            )
+        except Exception as exc:
+            raise CvModelError(
+                f"yolo26 Hailo inference failed: {exc}. The yolo26_hailo API may "
+                "have changed — see external/yolo26_hailo/python/detect_image.py "
+                "for the current call shape."
+            ) from exc
+        inference_ms = (time.perf_counter() - started_at) * 1000
+
+        detections: list[Detection] = []
+        for det in results:
+            # Repo format: [x0, y0, x1, y1, score, class_id] per detection.
+            x0, y0, x1, y1, score, class_id = (float(v) for v in list(det)[:6])
+            if score < confidence:
+                continue
+            class_id = int(class_id)
+            detections.append(
+                Detection(
+                    class_id=class_id,
+                    class_name=(
+                        self.class_names[class_id]
+                        if class_id < len(self.class_names)
+                        else str(class_id)
+                    ),
+                    confidence=score,
+                    bbox_xyxy=[x0, y0, x1, y1],
+                )
+            )
+
+        annotated = WarmHailoYolo._draw(image_array.copy(), detections, cv2)
+        ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            raise CvModelError("Failed to encode Hailo annotated image")
+        return YoloResult(
+            detections=detections,
+            annotated_image=encoded.tobytes(),
+            inference_ms=inference_ms,
+            model_path=self.model_path,
+            task=self.task,
+        )
+
+    def close(self) -> None:
+        try:
+            self._engine.close()
+        except Exception:
+            pass
+
+
 def run_depth(
     image_bytes: bytes,
     backend: str,

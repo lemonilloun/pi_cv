@@ -5,4 +5,5 @@
 torch>=2.1
 opencv-python
 numpy
+open_clip_torch  # monitoring v2: CLIP appearance embeddings (MobileCLIP)
 # ultralytics  # V3: server-side YOLO landmarks (not needed yet)

@@ -84,6 +84,8 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         session_config["yolo_fps"] = float(value)
     if value := os.environ.get("PI_CV_SESSION_HAILO_HEF"):
         session_config["hailo_hef"] = value
+    if value := os.environ.get("PI_CV_SESSION_HAILO_ARCH"):
+        session_config["hailo_arch"] = value
     if value := os.environ.get("PI_CV_SESSION_DEPTH_BACKEND"):
         session_config["depth_backend"] = value
     if value := os.environ.get("PI_CV_SESSION_DEPTH_MODEL_PATH"):

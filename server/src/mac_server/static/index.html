@@ -406,23 +406,26 @@
         "Freeze anchors" saves the furniture YOLO currently sees (couch, bed, chair,
         table, tv) as fixed reference points for this scene — click it once while the
         room is <strong>empty</strong> (no person/pet blocking the furniture), before or
-        during monitoring. Without frozen anchors, the "on furniture" event (e.g. "sitting
-        on the couch") never fires — everything else (entered/exited/stationary/moving)
-        works without it.
+        during monitoring. Without frozen anchors, "on"/"near furniture" relations never
+        fire — everything else (entered/left/moved) works without it.
       </p>
       <p class="meta-line" id="monitorStatusLine"></p>
+      <p class="meta-line" id="monitorNowLine" style="opacity:0.9"></p>
       <div id="eventFeed" class="event-feed"></div>
-      <div class="map-form-row" id="summaryRow" style="margin-top:10px">
-        <select id="summaryHours" style="flex:0 0 90px">
+      <div class="map-form-row" id="askRow" style="margin-top:10px">
+        <input id="askInput" type="text" style="flex:1"
+          placeholder="Ask about the scene… (e.g. where is the laptop?)">
+        <select id="askHours" style="flex:0 0 90px">
           <option value="1">1 h</option>
-          <option value="3">3 h</option>
+          <option value="3" selected>3 h</option>
           <option value="6">6 h</option>
           <option value="24">24 h</option>
         </select>
-        <button id="summaryBtn" class="ghost-btn" disabled
-          title="Ask the local AI (apfel) to summarize what happened">Summarize</button>
+        <button id="askBtn" class="ghost-btn" disabled
+          title="Ask the local AI (apfel) about what happened in the scene">Ask</button>
       </div>
-      <div id="summaryText" class="summary-text" style="display:none"></div>
+      <div id="askAnswer" class="summary-text" style="display:none"></div>
+      <div id="askMoments" style="display:none"></div>
       <p id="monitorError" style="color:var(--critical);font-size:12.5px;min-height:16px;margin:6px 0 0"></p>
     </div>
   </section>
@@ -1259,44 +1262,67 @@ function renderMonitorCard(monitor) {
       }
     }
     const stalledPart = monitor.stalled ? " · ⚠ stalled — is the Pi in yolo mode?" : "";
+    const entities = monitor.entities || [];
     line.textContent =
-      `active · ${monitor.scene_id} · ${(monitor.tracks || []).length} tracks · ` +
-      `${monitor.open_events} open · ${monitor.events_total} events` +
+      `active · ${monitor.scene_id} · ${entities.length} in view · ` +
+      `${monitor.open_edges || 0} open · ${monitor.events_total} events` +
       (monitor.tick_hz ? ` · ${monitor.tick_hz} Hz` : "") + agentPart + stalledPart;
+    const nowLine = document.getElementById("monitorNowLine");
+    nowLine.textContent = entities.length
+      ? "Now: " + entities.map((e) => {
+          const rels = (e.relations || []).join(", ");
+          const occ = e.state === "occluded" ? "~" : "";
+          return `${occ}${e.label}${rels ? " — " + rels : ""}`;
+        }).join(" · ")
+      : "";
   } else if (scene) {
     const anchors = (scene.anchors || []).map((a) => a.anchor_id).join(", ") || "none";
     line.textContent = `${scene.name}: anchors [${anchors}]`;
+    document.getElementById("monitorNowLine").textContent = "";
   } else {
     line.textContent = "";
+    document.getElementById("monitorNowLine").textContent = "";
   }
 
   const agentOk = monitor && monitor.agent && monitor.agent.enabled;
-  document.getElementById("summaryBtn").disabled = !(scene || active) || !agentOk;
+  document.getElementById("askBtn").disabled = !active || !agentOk;
 
   document.getElementById("eventFeed").classList.toggle("visible", active || state.eventRows.size > 0);
 }
 
 function eventText(ev) {
   const subject = `<strong>${ev.subject_label}</strong>`;
+  const object = ev.object_label ? `<strong>${ev.object_label}</strong>` : "";
   const details = ev.details || {};
-  const caption = details.caption ? `<div class="event-caption">"${details.caption}"</div>` : "";
+  const caption = (ev.caption || details.caption)
+    ? `<div class="event-caption">"${ev.caption || details.caption}"</div>` : "";
+  const star = ev.key_moment ? " ⭐" : "";
   let line;
   if (ev.type === "entered") {
-    line = `${subject} entered`;
+    line = `${subject} entered the frame`;
   } else if (ev.type === "exited") {
-    const v = details.visible_s ? ` (visible ${fmtDur(details.visible_s)})` : "";
-    line = `${subject} exited${v}`;
-  } else if (ev.type === "on_furniture") {
+    const v = details.visible_s ? ` (was visible ${fmtDur(details.visible_s)})` : "";
+    line = `${subject} left the frame${v}`;
+  } else if (ev.type === "on") {
     const posture = details.posture && details.posture !== "unclear" ? ` · ${details.posture}` : "";
     const dur = ev.t_end ? ` · ${fmtDur(details.duration_s)}` : " · ongoing";
-    line = `${subject} on <strong>${ev.object_label}</strong>${posture}${dur}`;
-  } else if (ev.type === "stationary" || ev.type === "moving") {
-    const dur = ev.t_end ? ` · ${fmtDur(details.duration_s)}` : " · ongoing";
-    line = `${subject} ${ev.type}${dur}`;
+    line = `${subject} on ${object}${posture}${dur}`;
+  } else if (ev.type === "near") {
+    const dist = details.distance_m != null ? ` (${details.distance_m}m)` : "";
+    if (ev.t_end) {
+      line = `${subject} moved away from ${object} · was near ${fmtDur(details.duration_s)}`;
+    } else {
+      line = `${subject} approached ${object}${dist} · still near`;
+    }
+  } else if (ev.type === "moved") {
+    const zones = details.from_zone && details.to_zone && details.from_zone !== details.to_zone
+      ? ` ${details.from_zone} → ${details.to_zone}` : "";
+    const anchor = details.nearest_anchor ? ` (near ${details.nearest_anchor})` : "";
+    line = `${subject} moved${zones}${anchor}`;
   } else {
-    line = `${subject} ${ev.type}`;
+    line = `${subject} ${ev.type}${object ? " " + object : ""}`;
   }
-  return line + caption;
+  return line + star + caption;
 }
 
 function fmtDur(seconds) {
@@ -1309,7 +1335,7 @@ function renderEvent(ev) {
   const feed = document.getElementById("eventFeed");
   const existing = state.eventRows.get(ev.id);
   const time = new Date(ev.t_start * 1000).toLocaleTimeString();
-  const cls = (ev.subject_label || "").split(/[# ]/)[0].toLowerCase();
+  const cls = (ev.subject_label || "").replace(/_\d+$/, "").toLowerCase();
   const snapLink = ev.snapshot
     ? ` <a href="/monitor/snapshot.jpg?id=${ev.id}" target="_blank" title="Snapshot">📷</a>` : "";
   const html =
@@ -1440,33 +1466,54 @@ document.getElementById("monitorBtn").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("summaryBtn").addEventListener("click", async () => {
-  const btn = document.getElementById("summaryBtn");
-  const out = document.getElementById("summaryText");
-  const hours = document.getElementById("summaryHours").value;
+async function askQuestion() {
+  const btn = document.getElementById("askBtn");
+  const input = document.getElementById("askInput");
+  const out = document.getElementById("askAnswer");
+  const moments = document.getElementById("askMoments");
+  const question = input.value.trim();
+  if (!question) return;
   btn.disabled = true;
-  btn.textContent = "Summarizing…";
+  btn.textContent = "Asking…";
   out.style.display = "";
   out.textContent = "Asking the local AI…";
+  moments.style.display = "none";
+  moments.innerHTML = "";
   try {
-    const res = await fetch(`/api/monitor/summary?hours=${hours}`);
+    const res = await fetch("/api/monitor/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, hours: Number(document.getElementById("askHours").value) }),
+    });
     const data = await res.json().catch(() => ({}));
-    if (data.summary) {
-      out.textContent = data.summary;
-    } else if (data.digests && data.digests.length) {
-      out.textContent = "Agent unavailable — raw digests:\n\n" +
-        data.digests.map((d) => d.text).join("\n");
+    if (!res.ok) {
+      out.textContent = (data.error || "HTTP " + res.status) +
+        "\n\nMake sure monitoring is active and apfel is reachable (it starts with the session).";
     } else {
-      out.textContent = (data.error || "No digests yet — the agent digests events every 5 minutes while monitoring is active.") +
-        (data.agent_healthy === false
-          ? "\n\nThe local AI (apfel) is not running. Start it in a terminal and keep it open:\n  apfel --serve --port 11500\nThen keep monitoring active — digests will start accumulating."
-          : "");
+      out.textContent = data.answer || "(no answer)";
+      const key = data.key_moments || [];
+      if (key.length) {
+        moments.style.display = "";
+        moments.innerHTML = "<p class=\"meta-line\" style=\"margin:8px 0 4px\">Key moments:</p>" +
+          key.map((m) => {
+            const time = new Date(m.t_start * 1000).toLocaleTimeString();
+            const snap = m.snapshot
+              ? ` <a href="/monitor/snapshot.jpg?id=${m.id}" target="_blank" title="Snapshot">📷</a>` : "";
+            const obj = m.object_label ? ` ${m.object_label}` : "";
+            return `<div class="event-row"><span class="time">${time}</span>` +
+              `<span class="txt">⭐ ${m.subject_label} ${m.relation}${obj}</span>${snap}</div>`;
+          }).join("");
+      }
     }
   } catch (err) {
     out.textContent = "Request failed: " + err;
   }
-  btn.textContent = "Summarize";
+  btn.textContent = "Ask";
   btn.disabled = false;
+}
+document.getElementById("askBtn").addEventListener("click", askQuestion);
+document.getElementById("askInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") askQuestion();
 });
 
 // MJPEG <img> stalls if the stream drops; nudge it periodically when broken.

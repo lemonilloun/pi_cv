@@ -1,5 +1,6 @@
 """Monitor controller: consumes the enriched objects stream and drives the
-tracker, event engine, entity resolution, snapshots, and persistence.
+v2 pipeline — tracker → presence → relations → scene graph — plus snapshots,
+the apfel digester (with key moments) and Q&A.
 
 One thread per active monitoring session (pattern: mapping.ScanController).
 Timestamps are Mac wall clock (`computed_at` from cv_worker); `pi_frame_index`
@@ -21,7 +22,13 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from mac_server.monitoring.events import EventEngine, EventRuleConfig, EventTransition
+from mac_server.monitoring.events import (
+    RelationConfig,
+    RelationEngine,
+    RelationTransition,
+)
+from mac_server.monitoring.graph import SceneGraph
+from mac_server.monitoring.presence import PresenceConfig, PresenceManager, PresentEntity
 from mac_server.monitoring.scenes import SceneStore
 from mac_server.monitoring.store import MonitoringStore
 from mac_server.monitoring.tracker import GreedyTracker, Track, TrackerConfig
@@ -130,15 +137,14 @@ class MonitorController:
         self.store = store
         self._config = config
         self._scan_controller = scan_controller
-        self.agent = agent  # ApfelClient | None (S3)
+        self.agent = agent  # ApfelClient | None
         self.vision = vision  # OllamaVisionClient | None
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._digester_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._session: dict[str, Any] | None = None
-        self._signature_provider = None  # set lazily (S2, needs cv2/numpy)
-        self._entity_resolver = None
+        self._signature_provider = None  # set lazily (needs cv2/numpy/torch)
         self._apfel_process: subprocess.Popen | None = None
         self._ollama_process: subprocess.Popen | None = None
 
@@ -147,10 +153,6 @@ class MonitorController:
     def status(self) -> dict[str, Any]:
         with self._lock:
             session = self._session
-            if session is None:
-                return {"active": False}
-            tracker: GreedyTracker = session["tracker"]
-            engine: EventEngine = session["engine"]
             agent_base_url = str(
                 self._config.get("agent", {}).get("base_url", "http://127.0.0.1:11500")
             )
@@ -164,14 +166,22 @@ class MonitorController:
                 agent_status = {"enabled": True, "healthy": False, "base_url": agent_base_url}
             else:
                 agent_status = {"enabled": False, "healthy": False, "base_url": agent_base_url}
+            if session is None:
+                return {"active": False, "agent": agent_status}
+            presence: PresenceManager = session["presence"]
+            relations: RelationEngine = session["relations"]
+            graph: SceneGraph = session["graph"]
+            labels = {e.entity_key: presence.label_of(e) for e in presence.alive_entities()}
             return {
                 "active": session["active"],
                 "scene_id": session["scene_id"],
                 "since": session["started_at"],
                 "stalled": session["stalled"],
                 "tick_hz": session["tick_hz"],
-                "tracks": [t.snapshot() for t in tracker.confirmed_tracks()],
-                "open_events": len(engine.open_events),
+                "entities": graph.now_state(
+                    presence.alive_entities(), labels, relations.open_relations
+                ),
+                "open_edges": len(relations.open_relations),
                 "events_total": session["events_total"],
                 "agent": agent_status,
             }
@@ -204,15 +214,27 @@ class MonitorController:
                 frame_width=frame_w,
                 frame_height=frame_h,
             )
-            rule_config = EventRuleConfig(
+            presence_cfg = self._config.get("presence", {})
+            presence_config = PresenceConfig(
+                exit_edge_frac=float(presence_cfg.get("exit_edge_frac", 0.10)),
+                exit_absent_s=float(presence_cfg.get("exit_absent_s", 25.0)),
+                presence_timeout_s=float(presence_cfg.get("presence_timeout_s", 300.0)),
+                frame_width=frame_w,
+                frame_height=frame_h,
+            )
+            relations_cfg = self._config.get("relations", {})
+            relation_config = RelationConfig(
                 open_hold_s=float(self._config.get("event_open_hold_s", 2.0)),
                 close_hold_s=float(self._config.get("event_close_hold_s", 3.0)),
                 overlap_on_ratio=float(self._config.get("overlap_on_ratio", 0.3)),
                 depth_agree_m=float(self._config.get("depth_agree_m", 0.7)),
-                stationary_window_s=float(self._config.get("stationary_window_s", 5.0)),
-                stationary_px_frac=float(self._config.get("stationary_px_frac", 0.02)),
-                frame_diag=tracker_config.frame_diag,
+                near_gap_frac=float(relations_cfg.get("near_gap_frac", 0.05)),
+                near_depth_agree_m=float(relations_cfg.get("near_depth_agree_m", 1.0)),
+                move_min_frac=float(relations_cfg.get("move_min_frac", 0.15)),
+                frame_width=frame_w,
+                frame_height=frame_h,
             )
+            provider = self._ensure_signature_provider()
             self._session = {
                 "active": True,
                 "scene_id": scene["scene_id"],
@@ -221,7 +243,12 @@ class MonitorController:
                     tracker_config,
                     excluded_classes=set(self._config.get("anchor_classes", [])),
                 ),
-                "engine": EventEngine(rule_config),
+                "presence": PresenceManager(
+                    presence_config,
+                    similarity=provider.similarity if provider is not None else None,
+                ),
+                "relations": RelationEngine(relation_config),
+                "graph": SceneGraph(self.store, scene["scene_id"]),
                 "started_at": time.time(),
                 "stalled": False,
                 "tick_hz": None,
@@ -229,6 +256,9 @@ class MonitorController:
                 "events_total": 0,
                 "last_sweep": time.monotonic(),
             }
+            self._session["graph"].ensure_anchor_nodes(
+                scene.get("anchors", []), time.time()
+            )
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run, daemon=True, name="monitor")
             self._thread.start()
@@ -289,17 +319,18 @@ class MonitorController:
             session["active"] = False
 
         now = time.time()
-        tracker: GreedyTracker = session["tracker"]
-        engine: EventEngine = session["engine"]
         closed = 0
         try:
-            for track in tracker.force_end_all(now):
-                for transition in engine.track_ended(track, now):
-                    self._persist_transition(session, transition)
-                    closed += 1
-            for transition in engine.force_close_all(now):
-                self._persist_transition(session, transition)
+            presence: PresenceManager = session["presence"]
+            for event in presence.force_leave_all(now):
+                self._persist_exit(session, event)
                 closed += 1
+            relations: RelationEngine = session["relations"]
+            graph: SceneGraph = session["graph"]
+            for transition in relations.force_close_all(now):
+                graph.record_transition(transition)
+                closed += 1
+            presence.prune_left()
         except Exception as exc:
             # A persistence failure here must never leave the controller
             # stuck (active=False but _session non-None, refusing new
@@ -339,7 +370,50 @@ class MonitorController:
         with self._lock:
             if self._session is not None and self._session["scene_id"] == target:
                 self._session["scene"]["anchors"] = anchors
+                self._session["graph"].ensure_anchor_nodes(anchors, time.time())
         return anchors
+
+    # ----------------------------------------------------------------- Q&A
+
+    def ask(self, question: str, hours: float = 3.0) -> dict[str, Any]:
+        """Answer a free-form question over the scene graph slice."""
+        if self.agent is None:
+            raise MonitorError("Agent is not configured")
+        with self._lock:
+            session = self._session
+            if session is None:
+                raise MonitorError("Monitoring is not active")
+            scene_id = session["scene_id"]
+            scene_name = session["scene"].get("name", scene_id)
+            presence: PresenceManager = session["presence"]
+            relations: RelationEngine = session["relations"]
+            graph: SceneGraph = session["graph"]
+            labels = {e.entity_key: presence.label_of(e) for e in presence.alive_entities()}
+            now_state = graph.now_state(
+                presence.alive_entities(), labels, relations.open_relations
+            )
+
+        from mac_server.monitoring.agent import format_now_state
+
+        now = time.time()
+        window_start = now - hours * 3600
+        edges = self.store.edges_between(scene_id, window_start, now, limit=400)
+        digests = self.store.digests_between(scene_id, window_start, now)
+        rolling = self.store.get_rolling_summary(scene_id)
+        answer = self.agent.ask(
+            scene_name,
+            question,
+            format_now_state(now_state),
+            edges,
+            digests,
+            rolling_summary=rolling["text"] if rolling else None,
+        )
+        if answer is None:
+            raise MonitorError("Agent is unavailable (is apfel running?)")
+        key_moments = self.store.edges_between(
+            scene_id, window_start, now, limit=20, key_only=True
+        )
+        return {"answer": answer, "key_moments": key_moments}
 
     # ------------------------------------------------------------- worker
 
@@ -347,7 +421,6 @@ class MonitorController:
         session = self._session
         assert session is not None
         tracker: GreedyTracker = session["tracker"]
-        engine: EventEngine = session["engine"]
         sequence = -1
         last_frame_index: Any = None
         last_data_at = time.monotonic()
@@ -366,24 +439,16 @@ class MonitorController:
                 tick_time = float(batch.get("computed_at", now))
                 session["tick_times"].append(time.monotonic())
             else:
-                # Timeout or duplicate: age tracks with an empty tick so
-                # exits still fire when the Pi stops sending (mode switch,
-                # disconnect) — the panel shows `stalled` to disambiguate.
+                # Timeout or duplicate: age tracks with an empty tick so the
+                # presence layer keeps its exit clocks running when the Pi
+                # stops sending — the panel shows `stalled` to disambiguate.
                 objects = []
                 tick_time = now
                 if time.monotonic() - last_data_at > STALLED_AFTER_S:
                     session["stalled"] = True
 
             try:
-                updates = tracker.update(objects, tick_time)
-                for track in updates.confirmed_new:
-                    self._on_track_confirmed(session, track, tick_time)
-                for track in updates.ended:
-                    self._on_track_ended(session, track, tick_time)
-
-                anchors = session["scene"].get("anchors", [])
-                for transition in engine.evaluate(tracker.confirmed_tracks(), anchors, tick_time):
-                    self._persist_transition(session, transition)
+                self._tick(session, tracker, objects, tick_time)
             except Exception as exc:
                 logger.error("Monitoring tick failed: %s", exc)
 
@@ -398,84 +463,88 @@ class MonitorController:
                         retention_days=float(self._config.get("retention_days", 14)),
                         max_snapshot_mb=float(self._config.get("max_snapshot_mb", 200)),
                         snapshots_root=self.store.data_dir,
+                        key_snapshot_retention_h=float(
+                            self._config.get("qa", {}).get("key_snapshot_retention_h", 24)
+                        ),
                     )
                 except Exception as exc:
                     logger.warning("Retention sweep failed: %s", exc)
 
         logger.info("Monitoring stopped: scene=%s", session["scene_id"])
 
-    # -------------------------------------------------- track transitions
+    def _tick(
+        self,
+        session: dict[str, Any],
+        tracker: GreedyTracker,
+        objects: list[dict[str, Any]],
+        tick_time: float,
+    ) -> None:
+        presence: PresenceManager = session["presence"]
+        relations: RelationEngine = session["relations"]
+        graph: SceneGraph = session["graph"]
 
-    def _on_track_confirmed(self, session: dict[str, Any], track: Track, now: float) -> None:
-        track.db_id = self.store.insert_track(session["scene_id"], track.class_name, track.first_seen)
-        track.entity_label = f"{track.class_name} track#{track.track_id}"
+        updates = tracker.update(objects, tick_time)
+        for track in updates.confirmed_new:
+            self._compute_signature(track, tick_time)
+            entered = presence.on_track_confirmed(track, tick_time)
+            if entered is not None:
+                node_id = graph.bind_entity(entered.entity, tick_time)
+                edge_id = graph.record_presence_event(entered, node_id)
+                session["events_total"] += 1
+                if "entered" in self._config.get("snapshot_events", []):
+                    path = self._save_crop(session["scene_id"], entered.entity.last_bbox)
+                    if path is not None:
+                        self.store.mark_edge_snapshot(edge_id, path)
+        for track in updates.ended:
+            presence.on_track_ended(track, tick_time)
 
-        self._resolve_entity(session, track, now)  # S2: may set entity_id/label
+        # Presence tick: sync positions, expire occluded -> exited.
+        live_tracks = tracker.confirmed_tracks()
+        for event in presence.update(live_tracks, tick_time):
+            self._persist_exit(session, event)
+        presence.prune_left()
 
-        engine: EventEngine = session["engine"]
-        transition = engine.track_confirmed(track, now)
-        event_id = self._persist_transition(session, transition)
-        if event_id is not None and "entered" in self._config.get("snapshot_events", []):
-            self._save_snapshot(session, track, event_id)
+        present = presence.present_entities()
+        alive = presence.alive_entities()
+        labels = {e.entity_key: presence.label_of(e) for e in alive}
+        occluded_keys = {e.entity_key for e in alive if e.state == "occluded"}
+        anchors = session["scene"].get("anchors", [])
+        for transition in relations.evaluate(
+            present, labels, anchors, tick_time, occluded_keys
+        ):
+            edge_id = graph.record_transition(transition)
+            if transition.action in {"open", "point"}:
+                session["events_total"] += 1
+            if transition.action == "open" and edge_id is not None:
+                if transition.relation in self._config.get("snapshot_events", []):
+                    subject = next(
+                        (e for e in present if e.entity_key == transition.subject_key), None
+                    )
+                    if subject is not None:
+                        path = self._save_crop(session["scene_id"], subject.last_bbox)
+                        if path is not None:
+                            self.store.mark_edge_snapshot(edge_id, path)
+                if transition.relation in self._config.get("vision", {}).get(
+                    "caption_events", []
+                ):
+                    self._request_caption(session, transition, edge_id)
 
-    def _on_track_ended(self, session: dict[str, Any], track: Track, now: float) -> None:
-        engine: EventEngine = session["engine"]
-        for transition in engine.track_ended(track, now):
-            self._persist_transition(session, transition)
-        if track.db_id is not None:
-            self.store.finish_track(
-                track.db_id,
-                t_end=track.last_seen,
-                frames=track.hits,
-                entity_id=track.entity_id,
-                meta={
-                    "depth_m": track.depth_m,
-                    "lateral_m": track.lateral_m,
-                    "forward_m": track.forward_m,
-                },
-            )
-        if track.entity_id is not None:
-            visible_s = max(0.0, track.last_seen - track.first_seen)
-            self.store.update_entity(track.entity_id, track.signature, track.last_seen, visible_s)
-
-    def _persist_transition(self, session: dict[str, Any], transition: EventTransition) -> int | None:
-        track = transition.track
-        subject = track.entity_label or f"{track.class_name} track#{track.track_id}"
-        if transition.action in {"point", "open"}:
-            event_id = self.store.insert_event(
-                session["scene_id"],
-                transition.event_type,
-                subject,
-                transition.t_start,
-                transition.t_end,
-                track_db_id=track.db_id,
-                entity_id=track.entity_id,
-                object_label=transition.object_label,
-                details=transition.details,
-            )
+    def _persist_exit(self, session: dict[str, Any], event: Any) -> None:
+        relations: RelationEngine = session["relations"]
+        graph: SceneGraph = session["graph"]
+        entity: PresentEntity = event.entity
+        for transition in relations.entity_left(entity.entity_key, event.t):
+            graph.record_transition(transition)
+        node_id = graph.node_of(entity.entity_key)
+        if node_id is not None:
+            graph.record_presence_event(event, node_id)
             session["events_total"] += 1
-            if transition.action == "open" and transition.active is not None:
-                transition.active.db_id = event_id
-                if "on_furniture" in self._config.get("snapshot_events", []) and transition.event_type == "on_furniture":
-                    self._save_snapshot(session, track, event_id)
-                if transition.event_type in self._config.get("vision", {}).get("caption_events", []):
-                    self._request_caption(session, track, transition, event_id)
-            return event_id
-        if transition.action == "close":
-            active = transition.active
-            if active is not None and active.db_id is not None:
-                self.store.close_event(active.db_id, transition.t_end or 0.0, transition.details)
-            return active.db_id if active else None
-        return None
+        graph.release_entity(entity, event.t, visible_s=entity.total_visible_s)
 
-    # ------------------------------------------------------ S2: identity
+    # ---------------------------------------------------------- signatures
 
-    def _resolve_entity(self, session: dict[str, Any], track: Track, now: float) -> None:
-        try:
-            provider, resolver = self._ensure_identity_stack()
-        except Exception as exc:
-            logger.debug("Identity stack unavailable: %s", exc)
-            return
+    def _compute_signature(self, track: Track, now: float) -> None:
+        provider = self._ensure_signature_provider()
         if provider is None:
             return
         try:
@@ -483,88 +552,103 @@ class MonitorController:
             if frame is None:
                 return
             signature = provider.compute_from_jpeg(frame.data, track.bbox)
-            if signature is None:
-                return
-            track.signature = signature
-            track.signature_updated_at = now
-            entity_id, label = resolver.resolve(
-                session["scene_id"], track.class_name, signature, now
-            )
-            track.entity_id = entity_id
-            track.entity_label = label
-            if track.db_id is not None:
-                self.store.update_event_labels(track.db_id, entity_id, label)
+            if signature is not None:
+                track.signature = signature
+                track.signature_updated_at = now
         except Exception as exc:
-            logger.debug("Entity resolution failed: %s", exc)
+            logger.debug("Signature computation failed: %s", exc)
 
-    def _ensure_identity_stack(self):
-        if self._entity_resolver is not None:
-            return self._signature_provider, self._entity_resolver
-        from mac_server.monitoring.signatures import EntityResolver, HistogramSignatureProvider
+    def _ensure_signature_provider(self):
+        if self._signature_provider is not None:
+            return self._signature_provider
+        embeddings_cfg = self._config.get("embeddings", {})
+        if embeddings_cfg.get("enabled", True):
+            try:
+                from mac_server.monitoring.embeddings import ClipSignatureProvider
 
-        self._signature_provider = HistogramSignatureProvider()
-        self._entity_resolver = EntityResolver(
-            store=self.store,
-            provider=self._signature_provider,
-            reacquire_window_h=float(self._config.get("reacquire_window_h", 24)),
-            match_threshold=float(self._config.get("match_threshold", 0.6)),
-            match_margin=float(self._config.get("match_margin", 0.1)),
-        )
-        return self._signature_provider, self._entity_resolver
+                self._signature_provider = ClipSignatureProvider(
+                    model_name=str(embeddings_cfg.get("model", "MobileCLIP-S1")),
+                    device=str(embeddings_cfg.get("device", "mps")),
+                )
+                logger.info("Signature provider: CLIP embeddings (%s)",
+                            embeddings_cfg.get("model", "MobileCLIP-S1"))
+                return self._signature_provider
+            except Exception as exc:
+                logger.warning("CLIP embeddings unavailable (%s); falling back to HSV", exc)
+        try:
+            from mac_server.monitoring.signatures import HistogramSignatureProvider
 
-    def _save_snapshot(self, session: dict[str, Any], track: Track, event_id: int) -> None:
+            self._signature_provider = HistogramSignatureProvider()
+        except Exception as exc:
+            logger.debug("No signature provider available: %s", exc)
+        return self._signature_provider
+
+    # ----------------------------------------------------------- snapshots
+
+    def _save_crop(
+        self,
+        scene_id: str,
+        bbox: tuple[float, float, float, float],
+        margin_frac: float = 0.15,
+    ) -> str | None:
+        """Crop the current Pi frame around a bbox and save it; returns the
+        path (or None). Used for entered/on snapshots and key moments."""
         try:
             import cv2
             import numpy as np
 
             _, frame = self._frame_hub.get("pi").latest()
             if frame is None:
-                return
+                return None
             image = cv2.imdecode(np.frombuffer(frame.data, dtype=np.uint8), cv2.IMREAD_COLOR)
             if image is None:
-                return
+                return None
             h, w = image.shape[:2]
-            x0, y0, x1, y1 = track.bbox
-            margin_x = (x1 - x0) * 0.15
-            margin_y = (y1 - y0) * 0.15
+            x0, y0, x1, y1 = bbox
+            margin_x = (x1 - x0) * margin_frac
+            margin_y = (y1 - y0) * margin_frac
             ix0 = max(0, int(x0 - margin_x))
             iy0 = max(0, int(y0 - margin_y))
             ix1 = min(w, int(x1 + margin_x))
             iy1 = min(h, int(y1 + margin_y))
             crop = image[iy0:iy1, ix0:ix1]
             if crop.size == 0:
-                return
-            snap_dir = self.store.data_dir / session["scene_id"] / "snapshots"
+                return None
+            snap_dir = self.store.data_dir / scene_id / "snapshots"
             snap_dir.mkdir(parents=True, exist_ok=True)
-            path = snap_dir / f"{event_id}_{int(time.time() * 1000)}.jpg"
+            path = snap_dir / f"{int(time.time() * 1000)}.jpg"
             ok, encoded = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 path.write_bytes(encoded.tobytes())
-                self.store.set_event_snapshot(event_id, str(path))
+                return str(path)
         except Exception as exc:
             logger.debug("Snapshot failed: %s", exc)
+        return None
 
     # --------------------------------------------------- vision captioning
 
     def _request_caption(
-        self, session: dict[str, Any], track: Track, transition: EventTransition, event_id: int
+        self, session: dict[str, Any], transition: RelationTransition, edge_id: int
     ) -> None:
-        """Fire-and-forget: caption this event's crop with the vision model
+        """Fire-and-forget: caption this edge's crop with the vision model
         on a short-lived thread. Never blocks the tick loop — with
         keep_alive=0 a call can take several seconds (full model load), and
-        the caption is expected to land in the event feed a moment after the
-        event itself, not synchronously with it."""
+        the caption is expected to land in the feed a moment after the edge
+        itself, not synchronously with it."""
         if self.vision is None:
+            return
+        presence: PresenceManager = session["presence"]
+        subject = presence.entities.get(transition.subject_key)
+        if subject is None:
             return
         anchor_bbox = None
         for anchor in session["scene"].get("anchors", []):
             if anchor.get("anchor_id") == transition.object_label:
                 anchor_bbox = anchor.get("bbox_xyxy")
                 break
-        subject_bbox = tuple(track.bbox)
         thread = threading.Thread(
             target=self._caption_worker,
-            args=(event_id, subject_bbox, anchor_bbox),
+            args=(edge_id, tuple(subject.last_bbox), anchor_bbox),
             daemon=True,
             name="monitor-caption",
         )
@@ -572,7 +656,7 @@ class MonitorController:
 
     def _caption_worker(
         self,
-        event_id: int,
+        edge_id: int,
         subject_bbox: tuple[float, float, float, float],
         anchor_bbox: list[float] | None,
     ) -> None:
@@ -600,11 +684,11 @@ class MonitorController:
                 return
             caption = self.vision.caption(encoded.tobytes())
             if caption:
-                self.store.set_event_caption(event_id, caption)
+                self.store.set_edge_caption(edge_id, caption)
         except Exception as exc:
             logger.debug("Vision caption failed: %s", exc)
 
-    # -------------------------------------------------------- S3: digester
+    # ------------------------------------------------------------ digester
 
     def _digester_run(self) -> None:
         agent = self.agent
@@ -612,6 +696,7 @@ class MonitorController:
         if agent is None or session is None:
             return
         interval = float(self._config.get("agent", {}).get("digest_interval_s", 300))
+        max_moments = int(self._config.get("qa", {}).get("key_moments_per_digest", 3))
         window_start = time.time()
         while not self._stop_event.wait(timeout=min(interval, 10.0)):
             if time.time() - window_start < interval:
@@ -620,22 +705,47 @@ class MonitorController:
             scene_id = session["scene_id"]
             scene_name = session["scene"].get("name", scene_id)
             try:
-                events = self.store.events_between(scene_id, window_start, window_end)
-                if events:
-                    text = agent.digest(scene_name, events)
+                edges = self.store.edges_between(scene_id, window_start, window_end)
+                if edges:
+                    text = agent.digest(scene_name, edges)
                     if text:
                         self.store.insert_digest(scene_id, window_start, window_end, text, agent.model)
 
+                    # Key moments: let the model flag the notable edges of
+                    # this cycle; they get participant snapshots (kept 24h).
+                    for moment in agent.pick_key_moments(edges, max_moments=max_moments):
+                        self._mark_key_moment(session, moment)
+
                     # Efficient context: fold this window into one running
-                    # summary instead of re-merging a growing pile of digests
-                    # on every /api/monitor/summary request.
+                    # summary instead of re-merging a growing pile of
+                    # digests on every question.
                     previous = self.store.get_rolling_summary(scene_id)
                     updated_text = agent.update_rolling_summary(
-                        scene_name, previous["text"] if previous else None, events
+                        scene_name, previous["text"] if previous else None, edges
                     )
                     if updated_text:
-                        total_events = (previous["event_count"] if previous else 0) + len(events)
-                        self.store.upsert_rolling_summary(scene_id, updated_text, total_events, window_end)
+                        total = (previous["event_count"] if previous else 0) + len(edges)
+                        self.store.upsert_rolling_summary(scene_id, updated_text, total, window_end)
             except Exception as exc:
                 logger.warning("Digest cycle failed: %s", exc)
             window_start = window_end
+
+    def _mark_key_moment(self, session: dict[str, Any], edge: dict[str, Any]) -> None:
+        """Flag an edge as a key moment; if it has no snapshot yet and its
+        subject is still around, grab one now (best effort — for a subject
+        that already left, the mark still lands, just without a photo)."""
+        snapshot_path = edge.get("snapshot_path")
+        if snapshot_path is None:
+            presence: PresenceManager = session["presence"]
+            subject = next(
+                (
+                    e
+                    for e in presence.alive_entities()
+                    if presence.label_of(e) == edge.get("subject_label")
+                    or e.class_name == edge.get("subject_label")
+                ),
+                None,
+            )
+            if subject is not None:
+                snapshot_path = self._save_crop(session["scene_id"], subject.last_bbox)
+        self.store.mark_edge_key_moment(edge["id"], snapshot_path)

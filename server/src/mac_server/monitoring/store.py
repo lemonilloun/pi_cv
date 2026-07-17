@@ -74,9 +74,36 @@ CREATE TABLE IF NOT EXISTS rolling_summaries (
   event_count INTEGER NOT NULL DEFAULT 0,
   updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS graph_nodes (
+  id INTEGER PRIMARY KEY,
+  scene_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  class TEXT NOT NULL,
+  label TEXT NOT NULL,
+  embedding TEXT,
+  first_seen REAL NOT NULL,
+  last_seen REAL NOT NULL,
+  total_visible_s REAL NOT NULL DEFAULT 0,
+  best_snapshot_path TEXT
+);
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id INTEGER PRIMARY KEY,
+  scene_id TEXT NOT NULL,
+  src_node INTEGER NOT NULL REFERENCES graph_nodes(id),
+  dst_node INTEGER REFERENCES graph_nodes(id),
+  relation TEXT NOT NULL,
+  t_start REAL NOT NULL,
+  t_end REAL,
+  details TEXT,
+  caption TEXT,
+  key_moment INTEGER NOT NULL DEFAULT 0,
+  snapshot_path TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_events_scene_t ON events(scene_id, t_start);
 CREATE INDEX IF NOT EXISTS idx_digests_scene_t ON digests(scene_id, t_start);
 CREATE INDEX IF NOT EXISTS idx_entities_scene ON entities(scene_id, class, last_seen);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_scene_t ON graph_edges(scene_id, t_start);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_scene ON graph_nodes(scene_id, kind, class);
 """
 
 
@@ -345,20 +372,245 @@ class MonitoringStore:
             )
             self._conn.commit()
 
+    # -------------------------------------------------------- graph nodes
+
+    def nodes_for_scene(self, scene_id: str, kind: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT id, kind, class, label, embedding, first_seen, last_seen,"
+            " total_visible_s, best_snapshot_path FROM graph_nodes WHERE scene_id = ?"
+        )
+        params: list[Any] = [scene_id]
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [
+            {
+                "id": row[0],
+                "kind": row[1],
+                "class": row[2],
+                "label": row[3],
+                "embedding": json.loads(row[4]) if row[4] else None,
+                "first_seen": row[5],
+                "last_seen": row[6],
+                "total_visible_s": row[7],
+                "best_snapshot_path": row[8],
+            }
+            for row in rows
+        ]
+
+    def insert_node(
+        self,
+        scene_id: str,
+        kind: str,
+        class_name: str,
+        label: str,
+        now: float,
+        embedding: dict[str, Any] | None = None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO graph_nodes (scene_id, kind, class, label, embedding,"
+                " first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    scene_id,
+                    kind,
+                    class_name,
+                    label,
+                    json.dumps(embedding) if embedding else None,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def touch_node(
+        self,
+        node_id: int,
+        last_seen: float,
+        visible_s: float = 0.0,
+        embedding: dict[str, Any] | None = None,
+        best_snapshot_path: str | None = None,
+    ) -> None:
+        sets = ["last_seen = ?", "total_visible_s = total_visible_s + ?"]
+        params: list[Any] = [last_seen, visible_s]
+        if embedding is not None:
+            sets.append("embedding = ?")
+            params.append(json.dumps(embedding))
+        if best_snapshot_path is not None:
+            sets.append("best_snapshot_path = ?")
+            params.append(best_snapshot_path)
+        params.append(node_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE graph_nodes SET {', '.join(sets)} WHERE id = ?", params
+            )
+            self._conn.commit()
+
+    # -------------------------------------------------------- graph edges
+
+    def insert_edge(
+        self,
+        scene_id: str,
+        src_node: int,
+        dst_node: int | None,
+        relation: str,
+        t_start: float,
+        t_end: float | None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO graph_edges (scene_id, src_node, dst_node, relation,"
+                " t_start, t_end, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    scene_id,
+                    src_node,
+                    dst_node,
+                    relation,
+                    t_start,
+                    t_end,
+                    json.dumps(details or {}),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def close_edge(self, edge_id: int, t_end: float, details: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE graph_edges SET t_end = ?, details = ? WHERE id = ?",
+                (t_end, json.dumps(details), edge_id),
+            )
+            self._conn.commit()
+
+    def close_stale_open_edges(self, scene_id: str, t_end: float) -> None:
+        """Close edges left open by a crashed/killed session."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE graph_edges SET t_end = ? WHERE scene_id = ? AND t_end IS NULL",
+                (t_end, scene_id),
+            )
+            self._conn.commit()
+
+    def set_edge_caption(self, edge_id: int, caption: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE graph_edges SET caption = ? WHERE id = ?", (caption, edge_id)
+            )
+            self._conn.commit()
+
+    def mark_edge_snapshot(self, edge_id: int, snapshot_path: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE graph_edges SET snapshot_path = ? WHERE id = ?",
+                (snapshot_path, edge_id),
+            )
+            self._conn.commit()
+
+    def mark_edge_key_moment(self, edge_id: int, snapshot_path: str | None = None) -> None:
+        with self._lock:
+            if snapshot_path is not None:
+                self._conn.execute(
+                    "UPDATE graph_edges SET key_moment = 1, snapshot_path = ? WHERE id = ?",
+                    (snapshot_path, edge_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE graph_edges SET key_moment = 1 WHERE id = ?", (edge_id,)
+                )
+            self._conn.commit()
+
+    def edges_between(
+        self,
+        scene_id: str,
+        t_start: float,
+        t_end: float,
+        limit: int = 500,
+        key_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Edges overlapping the window (open edges included), with node
+        labels joined in — the feed/digest/Q&A source of truth."""
+        query = (
+            "SELECT e.id, e.relation, s.label, d.label, e.t_start, e.t_end,"
+            " e.details, e.caption, e.key_moment, e.snapshot_path"
+            " FROM graph_edges e"
+            " JOIN graph_nodes s ON s.id = e.src_node"
+            " LEFT JOIN graph_nodes d ON d.id = e.dst_node"
+            " WHERE e.scene_id = ? AND (e.t_end IS NULL OR e.t_end >= ?) AND e.t_start < ?"
+        )
+        params: list[Any] = [scene_id, t_start, t_end]
+        if key_only:
+            query += " AND e.key_moment = 1"
+        query += " ORDER BY e.t_start LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [
+            {
+                "id": row[0],
+                "relation": row[1],
+                "subject_label": row[2],
+                "object_label": row[3],
+                "t_start": row[4],
+                "t_end": row[5],
+                "details": json.loads(row[6]) if row[6] else {},
+                "caption": row[7],
+                "key_moment": bool(row[8]),
+                "snapshot_path": row[9],
+            }
+            for row in rows
+        ]
+
     # --------------------------------------------------------- retention
 
-    def sweep(self, retention_days: float, max_snapshot_mb: float, snapshots_root: Path) -> None:
-        cutoff = time.time() - retention_days * 86400
+    def sweep(
+        self,
+        retention_days: float,
+        max_snapshot_mb: float,
+        snapshots_root: Path,
+        key_snapshot_retention_h: float = 24.0,
+    ) -> None:
+        now = time.time()
+        cutoff = now - retention_days * 86400
+        key_cutoff = now - key_snapshot_retention_h * 3600
         with self._lock:
             old_snapshots = self._conn.execute(
                 "SELECT snapshot_path FROM events WHERE t_start < ? AND snapshot_path IS NOT NULL",
                 (cutoff,),
             ).fetchall()
+            old_snapshots += self._conn.execute(
+                "SELECT snapshot_path FROM graph_edges"
+                " WHERE t_start < ? AND snapshot_path IS NOT NULL",
+                (cutoff,),
+            ).fetchall()
+            # Key-moment photos only live key_snapshot_retention_h (the
+            # key_moment mark itself stays); graph nodes are never deleted —
+            # they are the scene's long-term memory and are tiny.
+            key_snapshots = self._conn.execute(
+                "SELECT id, snapshot_path FROM graph_edges"
+                " WHERE key_moment = 1 AND snapshot_path IS NOT NULL AND t_start < ?",
+                (key_cutoff,),
+            ).fetchall()
             self._conn.execute("DELETE FROM events WHERE t_start < ?", (cutoff,))
             self._conn.execute("DELETE FROM tracks WHERE t_start < ?", (cutoff,))
             self._conn.execute("DELETE FROM digests WHERE t_start < ?", (cutoff,))
+            self._conn.execute(
+                "DELETE FROM graph_edges WHERE t_end IS NOT NULL AND t_start < ?", (cutoff,)
+            )
+            for edge_id, _ in key_snapshots:
+                self._conn.execute(
+                    "UPDATE graph_edges SET snapshot_path = NULL WHERE id = ?", (edge_id,)
+                )
             self._conn.commit()
         for (path_str,) in old_snapshots:
+            try:
+                Path(path_str).unlink(missing_ok=True)
+            except OSError:
+                pass
+        for _, path_str in key_snapshots:
             try:
                 Path(path_str).unlink(missing_ok=True)
             except OSError:

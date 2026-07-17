@@ -1,10 +1,17 @@
 """Local AI agent layer over apfel (Apple Intelligence, on-device).
 
-apfel runs an OpenAI-compatible HTTP server (default 127.0.0.1:11434). The
+apfel runs an OpenAI-compatible HTTP server (default 127.0.0.1:11500). The
 on-device model has a 4096-token context and is text-only, so this module is
-strict about prompt budgets: events are compressed into one-line strings,
-digests are the compression layer for summaries, and oversized summary
-requests fall back to hierarchical chunk-merge.
+strict about prompt budgets: graph edges are compressed into one-line
+strings, digests are the compression layer for longer windows, and the
+rolling summary keeps a constant-size running narrative.
+
+v2 semantics: no persistent numbering — subjects are plain class labels
+("person", "laptop", "person_2" only during concurrency). Digests speak in
+aggregates ("A person spent 25 minutes on the couch; a laptop sat nearby"),
+the model also picks 0-3 key moments per digest cycle (they get participant
+snapshots), and free-form questions are answered over the graph slice
+(`ask`) instead of the old one-button summary.
 
 Everything degrades gracefully: when apfel is down, `healthy` flips false
 (with a cooldown before retrying) and monitoring continues without digests.
@@ -14,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
@@ -24,67 +32,90 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DIGEST_SYSTEM_PROMPT = (
-    "You are a home-monitoring narrator. You receive a log of events from a "
-    "fixed camera. Names like Person#1 and Cat#1 are persistent identities; "
-    "labels like couch_1 are furniture. Write 1-3 plain factual sentences "
-    "about what happened. Refer to identities by their names. No speculation, "
-    "no preamble."
+    "You are a home-monitoring narrator. You receive a log of observations "
+    "from a fixed camera: subjects are object classes (person, laptop, cat; "
+    "person_2 only means a second person was in view at the same time), and "
+    "labels like couch_1 are furniture. Write 1-3 compact factual sentences "
+    "in aggregate style: total time spent where, what was nearby, what "
+    "moved. Example tone: 'A person spent 25 minutes sitting on the couch; "
+    "a laptop sat nearby and was moved twice.' No numbering of objects, no "
+    "speculation, no preamble."
+)
+
+KEY_MOMENTS_SYSTEM_PROMPT = (
+    "You review a numbered log of observations from a fixed home camera and "
+    "pick the few genuinely notable moments — arrivals, departures, real "
+    "movements or interactions. Ignore routine continuations. Answer with "
+    "ONLY the numbers of at most {max_moments} notable lines, comma-"
+    "separated (e.g. '2,5'). If nothing is notable, answer 'none'."
 )
 
 ROLLING_SUMMARY_SYSTEM_PROMPT = (
     "You maintain a running summary of what has happened in a room, based on "
-    "events from a fixed camera. You will be given the CURRENT summary (may "
-    "be empty, if this is the first update) and NEW events observed since "
+    "observations from a fixed camera. You will be given the CURRENT summary "
+    "(may be empty, if this is the first update) and NEW observations since "
     "that summary was last updated. Produce an UPDATED summary that "
-    "incorporates the new events. Do not just append — actually merge and "
-    "compress: keep older details only if still relevant, drop stale ones "
-    "(e.g. someone who left long ago and hasn't returned). Identities "
-    "(Person#1, Cat#1) persist across updates — refer to them by name. Keep "
-    "the whole summary to at most a short paragraph. Factual, chronological, "
-    "no preamble, no speculation."
+    "incorporates the new observations. Do not just append — actually merge "
+    "and compress: keep older details only if still relevant, drop stale "
+    "ones. Subjects are plain object classes (person, laptop); do not invent "
+    "numbering. Keep the whole summary to at most a short paragraph. "
+    "Factual, chronological, no preamble, no speculation."
 )
 
-SUMMARY_SYSTEM_PROMPT = (
-    "You summarize home-monitoring digests. Identities (Person#1, Cat#1) "
-    "persist across digests. Answer: who was present, when, and what they "
-    "did. 3-6 sentences, chronological, factual. No preamble."
+ASK_SYSTEM_PROMPT = (
+    "You answer questions about what happened in a room watched by a fixed "
+    "camera. You are given: the CURRENT state of the scene (where every "
+    "object is right now), a log of notable observations, and periodic "
+    "digests. Subjects are plain object classes (person, laptop, cat); "
+    "labels like couch_1 are furniture. Answer the question directly and "
+    "factually from this data, mention times when relevant, and say plainly "
+    "when the data does not contain the answer. No speculation, no preamble."
 )
 
 
-def format_event_line(event: dict[str, Any]) -> str:
-    """One compact line per event (~12-18 tokens)."""
+def format_edge_line(edge: dict[str, Any]) -> str:
+    """One compact line per graph edge (~12-20 tokens), geometry included
+    so the model can describe interactions concretely."""
 
     def hhmm(ts: float | None) -> str:
         if ts is None:
             return "?"
         return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
-    subject = event.get("subject_label", "?")
-    etype = event.get("type", "?")
-    details = event.get("details") or {}
-    t_start, t_end = event.get("t_start"), event.get("t_end")
+    subject = edge.get("subject_label", "?")
+    relation = edge.get("relation", "?")
+    obj = edge.get("object_label")
+    details = edge.get("details") or {}
+    t_start, t_end = edge.get("t_start"), edge.get("t_end")
 
-    if etype == "entered":
-        return f"{hhmm(t_start)} {subject} entered"
-    if etype == "exited":
+    if relation == "entered":
+        return f"{hhmm(t_start)} {subject} entered the frame"
+    if relation == "exited":
         visible = details.get("visible_s")
-        extra = f" (visible {_fmt_duration(visible)})" if visible else ""
-        return f"{hhmm(t_start)} {subject} exited{extra}"
-    if etype == "on_furniture":
-        posture = details.get("posture", "")
-        posture_part = f", {posture}" if posture and posture != "unclear" else ""
-        duration = details.get("duration_s")
-        if t_end is not None and duration:
-            return (
-                f"{hhmm(t_start)}→{hhmm(t_end)} {subject} on "
-                f"{event.get('object_label', '?')}{posture_part} ({_fmt_duration(duration)})"
-            )
-        return f"{hhmm(t_start)} {subject} on {event.get('object_label', '?')}{posture_part} (ongoing)"
-    if etype in {"stationary", "moving"}:
-        if t_end is not None:
-            return f"{hhmm(t_start)}→{hhmm(t_end)} {subject} {etype}"
-        return f"{hhmm(t_start)} {subject} {etype} (ongoing)"
-    return f"{hhmm(t_start)} {subject} {etype}"
+        extra = f" (was visible {_fmt_duration(visible)})" if visible else ""
+        return f"{hhmm(t_start)} {subject} left the frame{extra}"
+    if relation == "moved":
+        parts = [f"{hhmm(t_start)} {subject} moved"]
+        if details.get("from_zone") and details.get("to_zone"):
+            parts.append(f"from {details['from_zone']} to {details['to_zone']}")
+        if details.get("nearest_anchor"):
+            parts.append(f"(now near {details['nearest_anchor']})")
+        return " ".join(parts)
+
+    geo = []
+    if details.get("posture") and details["posture"] != "unclear":
+        geo.append(details["posture"])
+    if details.get("distance_m") is not None:
+        geo.append(f"{details['distance_m']}m apart")
+    if details.get("arrangement") and details.get("arrangement") != "overlapping":
+        geo.append(str(details["arrangement"]))
+    if t_end is not None and details.get("duration_s"):
+        geo.append(_fmt_duration(details["duration_s"]))
+    geo_part = f" ({', '.join(geo)})" if geo else ""
+
+    span = f"{hhmm(t_start)}→{hhmm(t_end)}" if t_end is not None else f"{hhmm(t_start)}"
+    ongoing = "" if t_end is not None else " (ongoing)"
+    return f"{span} {subject} {relation} {obj or '?'}{geo_part}{ongoing}"
 
 
 def _fmt_duration(seconds: Any) -> str:
@@ -92,6 +123,17 @@ def _fmt_duration(seconds: Any) -> str:
     if seconds < 90:
         return f"{int(seconds)}s"
     return f"{int(round(seconds / 60))}m"
+
+
+def format_now_state(state: list[dict[str, Any]]) -> list[str]:
+    """Current-state lines for Q&A prompts: `person: on couch_1 (2.9m)`."""
+    lines = []
+    for item in state:
+        relations = ", ".join(item.get("relations") or []) or "in view"
+        depth = f" ({item['depth_m']}m away)" if item.get("depth_m") is not None else ""
+        marker = " [occluded]" if item.get("state") == "occluded" else ""
+        lines.append(f"{item.get('label', '?')}: {relations}{depth}{marker}")
+    return lines
 
 
 def budget_lines(lines: list[str], max_chars: int) -> list[str]:
@@ -124,10 +166,26 @@ def chunk_lines(lines: list[str], max_chars: int) -> list[list[str]]:
     return chunks
 
 
+def parse_key_moment_indices(answer: str | None, count: int, max_moments: int) -> list[int]:
+    """Parse the model's '2,5' style answer into valid 0-based indices."""
+    if not answer:
+        return []
+    if "none" in answer.lower():
+        return []
+    indices: list[int] = []
+    for token in re.findall(r"\d+", answer):
+        idx = int(token) - 1  # the prompt numbers lines from 1
+        if 0 <= idx < count and idx not in indices:
+            indices.append(idx)
+        if len(indices) >= max_moments:
+            break
+    return indices
+
+
 class ApfelClient:
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:11434",
+        base_url: str = "http://127.0.0.1:11500",
         model: str = "apple-foundationmodel",
         timeout_s: float = 20.0,
         max_input_tokens: int = 2500,
@@ -183,14 +241,34 @@ class ApfelClient:
 
     # ------------------------------------------------------------- digest
 
-    def digest(self, scene_name: str, events: list[dict[str, Any]]) -> str | None:
-        lines = budget_lines([format_event_line(e) for e in events], self.max_input_chars)
+    def digest(self, scene_name: str, edges: list[dict[str, Any]]) -> str | None:
+        lines = budget_lines([format_edge_line(e) for e in edges], self.max_input_chars)
         if not lines:
             return None
-        t0 = datetime.fromtimestamp(events[0]["t_start"]).strftime("%H:%M")
-        t1 = datetime.fromtimestamp(events[-1]["t_start"]).strftime("%H:%M")
+        t0 = datetime.fromtimestamp(edges[0]["t_start"]).strftime("%H:%M")
+        t1 = datetime.fromtimestamp(edges[-1]["t_start"]).strftime("%H:%M")
         user = f"Scene: {scene_name}. Window {t0}-{t1}.\n" + "\n".join(lines)
         return self.chat(DIGEST_SYSTEM_PROMPT, user, max_tokens=160)
+
+    # -------------------------------------------------------- key moments
+
+    def pick_key_moments(
+        self, edges: list[dict[str, Any]], max_moments: int = 3
+    ) -> list[dict[str, Any]]:
+        """Ask the model which edges of the cycle are notable; returns the
+        chosen edge dicts (possibly empty). Fail-safe: on any model trouble
+        the answer is just 'no key moments'."""
+        if not edges:
+            return []
+        lines = [f"{i + 1}. {format_edge_line(e)}" for i, e in enumerate(edges)]
+        lines = budget_lines(lines, self.max_input_chars)
+        answer = self.chat(
+            KEY_MOMENTS_SYSTEM_PROMPT.format(max_moments=max_moments),
+            "\n".join(lines),
+            max_tokens=30,
+        )
+        indices = parse_key_moment_indices(answer, len(edges), max_moments)
+        return [edges[i] for i in indices]
 
     # -------------------------------------------------- rolling summary
 
@@ -198,51 +276,54 @@ class ApfelClient:
         self,
         scene_name: str,
         previous_summary: str | None,
-        new_events: list[dict[str, Any]],
+        new_edges: list[dict[str, Any]],
     ) -> str | None:
-        """Fold new_events into previous_summary via one incremental call —
-        the summary itself stays roughly constant-sized over an arbitrarily
-        long session, since each update explicitly asks the model to compress
-        rather than append. This is the efficient alternative to re-merging
-        a growing pile of independent digests on every summary request."""
-        lines = budget_lines([format_event_line(e) for e in new_events], self.max_input_chars // 2)
+        """Fold new edges into the running summary via one incremental call —
+        the summary stays roughly constant-sized over an arbitrarily long
+        session. Kept as internal context for `ask` (no UI button)."""
+        lines = budget_lines([format_edge_line(e) for e in new_edges], self.max_input_chars // 2)
         if not lines:
             return previous_summary
 
         current = previous_summary.strip() if previous_summary else "(none yet — first update)"
-        user = f"Scene: {scene_name}.\nCurrent summary:\n{current}\n\nNew events:\n" + "\n".join(lines)
+        user = f"Scene: {scene_name}.\nCurrent summary:\n{current}\n\nNew observations:\n" + "\n".join(lines)
         updated = self.chat(ROLLING_SUMMARY_SYSTEM_PROMPT, user, max_tokens=220)
         return updated if updated else previous_summary
 
-    # ------------------------------------------------------------ summary
+    # ---------------------------------------------------------------- ask
 
-    def summarize(
-        self, scene_name: str, period_label: str, digests: list[dict[str, Any]]
+    def ask(
+        self,
+        scene_name: str,
+        question: str,
+        now_lines: list[str],
+        edges: list[dict[str, Any]],
+        digests: list[dict[str, Any]],
+        rolling_summary: str | None = None,
     ) -> str | None:
-        lines = []
-        for digest in digests:
-            t0 = datetime.fromtimestamp(digest["t_start"]).strftime("%H:%M")
-            t1 = datetime.fromtimestamp(digest["t_end"]).strftime("%H:%M")
-            lines.append(f"[{t0}-{t1}] {digest['text']}")
-        if not lines:
-            return None
+        """Answer a free-form question over the graph slice. Budget order:
+        the question and current state always fit; recent edges get half the
+        remaining budget, digests (older, already compressed) the rest."""
+        sections = [f"Scene: {scene_name}.", f"Question: {question}", ""]
+        sections.append("Current state:")
+        sections.extend(now_lines or ["(nothing in view)"])
 
-        def merge_call(chunk: list[str]) -> str | None:
-            user = f"Scene: {scene_name}. Period: {period_label}.\nDigests:\n" + "\n".join(chunk)
-            return self.chat(SUMMARY_SYSTEM_PROMPT, user)
-
-        total_chars = sum(len(line) + 1 for line in lines)
-        if total_chars <= self.max_input_chars:
-            return merge_call(lines)
-
-        # Hierarchical: merge chunks, then merge the chunk summaries.
-        chunk_summaries: list[str] = []
-        for chunk in chunk_lines(lines, self.max_input_chars):
-            summary = merge_call(chunk)
-            if summary:
-                chunk_summaries.append(summary)
-        if not chunk_summaries:
-            return None
-        if len(chunk_summaries) == 1:
-            return chunk_summaries[0]
-        return merge_call(budget_lines(chunk_summaries, self.max_input_chars))
+        remaining = self.max_input_chars - sum(len(s) + 1 for s in sections)
+        edge_lines = budget_lines(
+            [format_edge_line(e) for e in edges], max(0, remaining // 2)
+        )
+        digest_lines = budget_lines(
+            [
+                f"[{datetime.fromtimestamp(d['t_start']).strftime('%H:%M')}-"
+                f"{datetime.fromtimestamp(d['t_end']).strftime('%H:%M')}] {d['text']}"
+                for d in digests
+            ],
+            max(0, remaining - sum(len(line) + 1 for line in edge_lines)),
+        )
+        if rolling_summary:
+            sections += ["", "Session summary so far:", rolling_summary]
+        if digest_lines:
+            sections += ["", "Digests:"] + digest_lines
+        if edge_lines:
+            sections += ["", "Observations:"] + edge_lines
+        return self.chat(ASK_SYSTEM_PROMPT, "\n".join(sections))

@@ -65,12 +65,13 @@ class SessionSettings:
     connect_timeout_seconds: float = 5.0
     reconnect_min_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
-    yolo_backend: str = "hailo"
+    yolo_backend: str = "ncnn"
     yolo_model: str | None = None
     yolo_task: str = "detect"
     yolo_confidence: float = 0.5
     yolo_fps: float = 25.0
     hailo_hef: str = "/usr/share/hailo-models/yolov8s_h8l.hef"
+    hailo_arch: str = "yolov8"
     hailo_labels: str | None = None
     depth_backend: str = "depth-anything-v2"
     depth_model_path: str | None = None
@@ -260,9 +261,11 @@ class SessionRuntime:
                 self._switch_mode("idle", command_id=None)
 
     def _mode_fps(self) -> float:
-        """CV modes tick rate: yolo runs fast on the AI HAT, depth/pipeline
-        stay at the (CPU-bound) cv_fps."""
-        if self._mode == "yolo" and self.settings.yolo_backend == "hailo":
+        """CV modes tick rate: yolo ticks at yolo_fps regardless of backend —
+        on Hailo the NPU sustains it, on ncnn the CPU becomes the effective
+        cap (the tick loop never queues past real inference time). depth and
+        pipeline stay at the CPU-bound cv_fps."""
+        if self._mode == "yolo":
             return self.settings.yolo_fps
         return self.settings.cv_fps
 
@@ -373,18 +376,27 @@ class SessionRuntime:
             return
 
         if self.settings.yolo_backend == "hailo":
-            from pi_client.cv_models import WarmHailoYolo
-
-            logger.info("Loading Hailo YOLO model %s ...", self.settings.hailo_hef)
-            self._warm_yolo = WarmHailoYolo(
-                hef_path=self.settings.hailo_hef,
-                labels_path=self.settings.hailo_labels,
-            )
             logger.info(
-                "Hailo YOLO ready (input %sx%s)",
-                self._warm_yolo.input_w,
-                self._warm_yolo.input_h,
+                "Loading Hailo YOLO model %s (arch=%s)...",
+                self.settings.hailo_hef,
+                self.settings.hailo_arch,
             )
+            if self.settings.hailo_arch == "yolo26":
+                from pi_client.cv_models import WarmHailoYolo26
+
+                # Custom-compiled yolo26 hef: raw outputs, host-side decode.
+                self._warm_yolo = WarmHailoYolo26(
+                    hef_path=self.settings.hailo_hef,
+                    labels_path=self.settings.hailo_labels,
+                )
+            else:
+                from pi_client.cv_models import WarmHailoYolo
+
+                self._warm_yolo = WarmHailoYolo(
+                    hef_path=self.settings.hailo_hef,
+                    labels_path=self.settings.hailo_labels,
+                )
+            logger.info("Hailo YOLO ready")
             return
 
         if not self.settings.yolo_model:
