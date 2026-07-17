@@ -105,7 +105,7 @@
       "max_output_tokens": 400
     },
     "vision": {
-      "enabled": true,
+      "enabled": false,
       "auto_start": true,
       "base_url": "http://127.0.0.1:11434",
       "model": "gemma4:e4b-it-qat",
