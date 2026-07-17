@@ -96,6 +96,7 @@
     "max_snapshot_mb": 200,
     "agent": {
       "enabled": true,
+      "auto_start": true,
       "base_url": "http://127.0.0.1:11500",
       "model": "apple-foundationmodel",
       "digest_interval_s": 300,
@@ -105,6 +106,7 @@
     },
     "vision": {
       "enabled": true,
+      "auto_start": true,
       "base_url": "http://127.0.0.1:11434",
       "model": "gemma4:e4b-it-qat",
       "keep_alive": "0s",

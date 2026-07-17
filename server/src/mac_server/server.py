@@ -183,9 +183,9 @@ class MacServer:
             self.preview_server.start()
         if self.cv_worker is not None:
             self.cv_worker.start()
-        # apfel/Ollama are never auto-started (deliberate — they sit idle in
-        # RAM otherwise): run `apfel --serve` / `ollama serve` yourself
-        # before using monitoring digests/summaries/vision captions.
+        # apfel/Ollama lifecycle is tied to monitoring sessions, not the
+        # server: MonitorController starts them on monitor start and stops
+        # them (only the copies it spawned) on monitor stop.
 
     def serve_forever(self, once: bool = False) -> None:
         self.start()

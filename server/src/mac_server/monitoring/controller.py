@@ -8,12 +8,18 @@ is used only for deduplication.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import shutil
+import socket
+import subprocess
 import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 from mac_server.monitoring.events import EventEngine, EventRuleConfig, EventTransition
 from mac_server.monitoring.scenes import SceneStore
@@ -25,6 +31,79 @@ logger = logging.getLogger(__name__)
 
 STALLED_AFTER_S = 5.0
 SWEEP_INTERVAL_S = 3600.0
+
+
+def _maybe_start_service(
+    service_config: dict[str, Any],
+    binary_name: str,
+    build_args: Callable[[str, int], list[str]],
+    log_path: Path,
+    default_port: int,
+    build_env: Callable[[str, int], dict[str, str]] | None = None,
+) -> subprocess.Popen | None:
+    """Launch a local AI helper SERVICE (apfel / Ollama) if it isn't already
+    listening on its configured port.
+
+    The service processes are tiny at idle (apfel ~8 MB, ollama similar) —
+    the heavy MODELS are never held resident: gemma loads per caption call
+    and unloads (vision keep_alive="0s"), apfel's model is managed by macOS.
+    A process that was already listening (started by the user) is left alone
+    and never terminated by us — only copies we spawned are ours to stop."""
+    if not service_config.get("enabled", False):
+        return None
+    if not service_config.get("auto_start", True):
+        return None
+
+    base_url = str(service_config.get("base_url", f"http://127.0.0.1:{default_port}"))
+    parsed = urlparse(base_url)
+    host, port = parsed.hostname or "127.0.0.1", parsed.port or default_port
+
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+        probe.settimeout(0.5)
+        if probe.connect_ex((host, port)) == 0:
+            logger.info("%s already listening on %s:%s — leaving it as is", binary_name, host, port)
+            return None
+
+    if shutil.which(binary_name) is None:
+        logger.warning(
+            "%s binary not found in PATH; this monitoring feature stays unavailable",
+            binary_name,
+        )
+        return None
+
+    env = None
+    if build_env is not None:
+        env = dict(os.environ)
+        env.update(build_env(host, port))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "ab")
+        process = subprocess.Popen(
+            build_args(host, port),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+        logger.info(
+            "Started %s (pid=%s) on %s:%s, logging to %s",
+            binary_name, process.pid, host, port, log_path,
+        )
+        return process
+    except OSError as exc:
+        logger.warning("Failed to start %s: %s", binary_name, exc)
+        return None
+
+
+def _terminate_service(process: subprocess.Popen | None, name: str) -> None:
+    if process is None:
+        return
+    logger.info("Stopping %s (pid=%s) — monitoring session ended", name, process.pid)
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
 
 
 class MonitorError(RuntimeError):
@@ -60,6 +139,8 @@ class MonitorController:
         self._session: dict[str, Any] | None = None
         self._signature_provider = None  # set lazily (S2, needs cv2/numpy)
         self._entity_resolver = None
+        self._apfel_process: subprocess.Popen | None = None
+        self._ollama_process: subprocess.Popen | None = None
 
     # ---------------------------------------------------------------- API
 
@@ -70,13 +151,19 @@ class MonitorController:
                 return {"active": False}
             tracker: GreedyTracker = session["tracker"]
             engine: EventEngine = session["engine"]
-            agent_status = None
+            agent_base_url = str(
+                self._config.get("agent", {}).get("base_url", "http://127.0.0.1:11500")
+            )
             if self.agent is not None:
-                agent_status = {"enabled": True, "healthy": self.agent.healthy}
+                agent_status = {
+                    "enabled": True,
+                    "healthy": self.agent.healthy,
+                    "base_url": self.agent.base_url,
+                }
             elif self._config.get("agent", {}).get("enabled"):
-                agent_status = {"enabled": True, "healthy": False}
+                agent_status = {"enabled": True, "healthy": False, "base_url": agent_base_url}
             else:
-                agent_status = {"enabled": False, "healthy": False}
+                agent_status = {"enabled": False, "healthy": False, "base_url": agent_base_url}
             return {
                 "active": session["active"],
                 "scene_id": session["scene_id"],
@@ -157,7 +244,35 @@ class MonitorController:
         except Exception as exc:
             logger.info("Could not auto-switch Pi to yolo mode: %s", exc)
 
+        # AI helper services live exactly as long as the monitoring session:
+        # started here, stopped in stop()/shutdown().
+        self._start_ai_services()
+
         return {"scene_id": scene["scene_id"]}
+
+    def _start_ai_services(self) -> None:
+        self._apfel_process = _maybe_start_service(
+            self._config.get("agent", {}),
+            binary_name="apfel",
+            build_args=lambda host, port: ["apfel", "--serve", "--host", host, "--port", str(port)],
+            log_path=self.store.data_dir / "apfel.log",
+            default_port=11500,
+        )
+        # Ollama takes no host/port CLI flags — it reads OLLAMA_HOST from env.
+        self._ollama_process = _maybe_start_service(
+            self._config.get("vision", {}),
+            binary_name="ollama",
+            build_args=lambda host, port: ["ollama", "serve"],
+            build_env=lambda host, port: {"OLLAMA_HOST": f"{host}:{port}"},
+            log_path=self.store.data_dir / "ollama.log",
+            default_port=11434,
+        )
+
+    def _stop_ai_services(self) -> None:
+        _terminate_service(self._apfel_process, "apfel")
+        self._apfel_process = None
+        _terminate_service(self._ollama_process, "ollama")
+        self._ollama_process = None
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
@@ -193,6 +308,7 @@ class MonitorController:
         finally:
             with self._lock:
                 self._session = None
+            self._stop_ai_services()
         return {"scene_id": session["scene_id"], "events_closed": closed}
 
     def shutdown(self) -> None:
@@ -200,6 +316,7 @@ class MonitorController:
         for thread in (self._thread, self._digester_thread):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=2)
+        self._stop_ai_services()
         self.store.close()
 
     def freeze_anchors(self, scene_id: str | None) -> list[dict[str, Any]]:

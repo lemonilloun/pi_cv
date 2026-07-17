@@ -17,14 +17,24 @@ data/monitoring/
       <event_id>_<unix_ms>.jpg   # bbox crop saved for some event types (see below)
 ```
 
-**Neither `apfel --serve` nor `ollama serve` is started automatically** —
-deliberately, so the Mac server never spends RAM on a resident LLM you're not
-using. Start whichever you want before using digests/summaries/captions:
+**`apfel --serve` and `ollama serve` are tied to the monitoring session**:
+`POST /api/monitor/start` (the panel's Start monitoring button) launches
+them, `stop` terminates them (`monitoring.agent.auto_start` /
+`monitoring.vision.auto_start`, default true). You never launch them by hand
+— and they don't linger when monitoring is off. Key distinction that makes
+this safe on 8 GB: what gets auto-started are the tiny **service** processes
+(apfel idles at ~8 MB, ollama idle is similarly small) — the heavy
+**models** are never held resident: gemma (6.1 GB) loads only for the
+duration of a caption call (`keep_alive: "0s"`), and apfel's model is
+managed by macOS itself. If a service is already listening on its port (you
+started it yourself), monitoring uses it, leaves it alone, and won't
+terminate it on stop — it only stops copies it spawned. Logs:
+`data/monitoring/apfel.log`, `.../ollama.log`.
 
-```bash
-apfel --serve --port 11500       # digests + summaries (text-only)
-ollama serve                     # vision captions (needs gemma4:e4b-it-qat pulled)
-```
+One timing note: the first vision caption can fire seconds after monitoring
+starts, while `ollama serve` is still booting — that one caption is skipped
+(the client backs off 60s) and the next attempt works. Digests are
+unaffected (first call comes 5 minutes in).
 
 `data/monitoring/` is gitignored — it never leaves your Mac.
 
@@ -171,10 +181,9 @@ you having to reconfigure anything.
 
 ## The apfel agent (digests + summaries)
 
-**Neither apfel nor Ollama is started automatically** — run `apfel --serve`
-and/or `ollama serve` yourself before you need digests/summaries/captions;
-this keeps the Mac server from ever holding a multi-GB model resident when
-you're not actively using monitoring's AI features.
+Both services start automatically with `POST /api/monitor/start` and stop
+with monitoring (see the top of this document) — no manual launching, and
+nothing AI-related runs while monitoring is off.
 
 Every 5 minutes (`monitoring.agent.digest_interval_s`) with events in the
 window, the controller asks apfel (on-device, 4096-token context, text-only)

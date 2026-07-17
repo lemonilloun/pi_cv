@@ -1247,7 +1247,17 @@ function renderMonitorCard(monitor) {
   const line = document.getElementById("monitorStatusLine");
   if (monitor && monitor.active) {
     const agent = monitor.agent || {};
-    const agentPart = agent.enabled ? (agent.healthy ? " · agent ok" : " · agent down") : "";
+    let agentPart = "";
+    if (agent.enabled) {
+      if (agent.healthy) {
+        agentPart = " · agent ok";
+      } else {
+        // Actionable, not just a state: apfel is never auto-started (by
+        // design), so tell the user the exact command with the right port.
+        const port = (agent.base_url || "").match(/:(\d+)/)?.[1] || "11500";
+        agentPart = ` · ⚠ agent down — run in a terminal: apfel --serve --port ${port}`;
+      }
+    }
     const stalledPart = monitor.stalled ? " · ⚠ stalled — is the Pi in yolo mode?" : "";
     line.textContent =
       `active · ${monitor.scene_id} · ${(monitor.tracks || []).length} tracks · ` +
@@ -1447,7 +1457,10 @@ document.getElementById("summaryBtn").addEventListener("click", async () => {
       out.textContent = "Agent unavailable — raw digests:\n\n" +
         data.digests.map((d) => d.text).join("\n");
     } else {
-      out.textContent = data.error || "No digests yet — the agent digests events every 5 minutes while monitoring is active.";
+      out.textContent = (data.error || "No digests yet — the agent digests events every 5 minutes while monitoring is active.") +
+        (data.agent_healthy === false
+          ? "\n\nThe local AI (apfel) is not running. Start it in a terminal and keep it open:\n  apfel --serve --port 11500\nThen keep monitoring active — digests will start accumulating."
+          : "");
     }
   } catch (err) {
     out.textContent = "Request failed: " + err;
