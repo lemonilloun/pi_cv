@@ -311,16 +311,44 @@
     border-radius: 6px;
   }
   .radar-legend .swatch { width: 8px; height: 8px; border-radius: 50%; }
+  .tabs { display: inline-flex; gap: 4px; margin-left: 16px; }
+  .tabs button {
+    background: transparent; color: var(--ink-2);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 14px; font-size: 13px; cursor: pointer;
+  }
+  .tabs button.active { background: var(--surface-2); color: var(--ink); border-color: var(--accent); }
+  .scene-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .scene-table th, .scene-table td {
+    text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid);
+  }
+  .scene-table tr.selected { background: var(--surface-2); }
+  .scene-table tbody tr { cursor: pointer; }
+  .step-chip {
+    display: inline-block; padding: 1px 8px; border-radius: 6px;
+    font-size: 11.5px; margin-right: 4px; background: var(--surface-2);
+    color: var(--muted); border: 1px solid var(--border);
+  }
+  .step-chip.done { color: var(--good); border-color: var(--good); }
+  .step-chip.failed { color: var(--critical); border-color: var(--critical); }
+  .step-chip.running { color: var(--accent); border-color: var(--accent); }
+  #meshViewer { width: 100%; height: 420px; background: #111; border-radius: 10px; display: none; }
+  #scenePlanImg { max-width: 100%; border-radius: 10px; display: none; }
+  .scene-objects td { font-size: 12.5px; }
 </style>
 </head>
 <body>
 <header>
   <h1>pi_cv Control Panel</h1>
+  <nav class="tabs" id="tabs">
+    <button data-tab="live" class="active">Live</button>
+    <button data-tab="scene">Scene</button>
+  </nav>
   <span class="conn offline" id="conn"><span class="dot"></span><span id="connText">connecting…</span></span>
   <span class="conn" id="deviceInfo" style="margin-left:auto"></span>
 </header>
 
-<main>
+<main id="tabLive">
   <section>
     <div class="card video-card">
       <img id="stream" src="/stream.mjpg?view=pi" alt="Live stream from Raspberry Pi">
@@ -465,6 +493,54 @@
         <canvas id="memChart"></canvas>
         <div class="tooltip" id="memTip"></div>
       </div>
+    </div>
+  </section>
+</main>
+
+<main id="tabScene" style="display:none; grid-template-columns: minmax(380px, 1fr) minmax(420px, 1.4fr);">
+  <section>
+    <div class="card">
+      <p class="section-title">Scene sessions</p>
+      <p class="meta-line" style="opacity:0.75">
+        Record on the Pi: <code>./scripts/run_scene_recorder.sh</code> (calibrate once with
+        <code>run_scene_calibrate.sh</code>), then transfer:
+        <code>rsync -avP data/scene_sessions/session_* vedro.local:&lt;repo&gt;/data/scene_sessions/</code>
+      </p>
+      <table class="scene-table">
+        <thead><tr><th>Session</th><th>KF</th><th>Calib</th><th>Steps</th></tr></thead>
+        <tbody id="sceneSessionRows"><tr><td colspan="4" style="color:var(--muted)">loading…</td></tr></tbody>
+      </table>
+      <div class="map-form-row" style="margin-top:12px">
+        <button id="sceneRunBtn" class="scan-btn" disabled>Run pipeline</button>
+        <button id="sceneRefreshBtn" class="ghost-btn">Refresh</button>
+        <label style="font-size:12.5px;color:var(--ink-2);display:flex;align-items:center;gap:5px">
+          <input type="checkbox" id="sceneForce"> re-run done steps
+        </label>
+      </div>
+      <div id="sceneSteps" style="margin-top:10px"></div>
+      <p class="meta-line" id="sceneProgress"></p>
+      <p id="sceneError" style="color:var(--critical);font-size:12.5px;min-height:16px;margin:6px 0 0"></p>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <p class="section-title">Results</p>
+      <div class="view-pills" style="position:static;margin-bottom:10px" id="sceneResultPills">
+        <button data-result="plan" class="active">Floor plan</button>
+        <button data-result="mesh">3D mesh</button>
+        <button data-result="objects">Objects</button>
+      </div>
+      <img id="scenePlanImg" alt="Floor plan">
+      <div id="meshViewer"></div>
+      <div id="sceneObjects" style="display:none">
+        <table class="scene-table scene-objects">
+          <thead><tr><th>#</th><th>Label</th><th>Top-3 (CLIP)</th><th>COCO</th><th>Obs</th><th>Centroid, m</th></tr></thead>
+          <tbody id="sceneObjectRows"></tbody>
+        </table>
+        <p class="meta-line" id="sceneEdges"></p>
+      </div>
+      <p class="meta-line" id="sceneResultHint" style="opacity:0.75"></p>
     </div>
   </section>
 </main>
@@ -1523,6 +1599,235 @@ streamImg.addEventListener("error", () => {
 });
 
 window.addEventListener("resize", drawCharts);
+
+// ------------------------------------------------------------- Scene tab
+
+const SCENE_STEPS = ["depth", "poses", "tsdf", "objects", "graph"];
+const sceneState = { selected: null, sessions: [], pollTimer: null, meshLoadedFor: null };
+
+document.querySelectorAll("#tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b === btn));
+    const scene = btn.dataset.tab === "scene";
+    document.getElementById("tabLive").style.display = scene ? "none" : "";
+    document.getElementById("tabScene").style.display = scene ? "grid" : "none";
+    if (scene) refreshSceneSessions();
+  });
+});
+
+async function refreshSceneSessions() {
+  try {
+    const res = await fetch("/api/scene3d/sessions");
+    if (!res.ok) {
+      document.getElementById("sceneSessionRows").innerHTML =
+        `<tr><td colspan="4" style="color:var(--muted)">scene3d unavailable</td></tr>`;
+      return;
+    }
+    const data = await res.json();
+    sceneState.sessions = data.sessions || [];
+    if (!sceneState.selected && sceneState.sessions.length) {
+      sceneState.selected = sceneState.sessions[0].session_id;
+    }
+    renderSceneSessions();
+    renderSceneStatus(data.status || {});
+    if (data.status && data.status.running) startScenePolling();
+  } catch (err) { /* transient */ }
+}
+
+function renderSceneSessions() {
+  const rows = document.getElementById("sceneSessionRows");
+  if (!sceneState.sessions.length) {
+    rows.innerHTML = `<tr><td colspan="4" style="color:var(--muted)">no sessions yet — record one on the Pi</td></tr>`;
+    document.getElementById("sceneRunBtn").disabled = true;
+    return;
+  }
+  rows.innerHTML = sceneState.sessions.map((s) => {
+    const chips = SCENE_STEPS.map((step) => {
+      const st = (s.steps || {})[step];
+      const cls = st ? st.status : "";
+      return `<span class="step-chip ${cls}">${step}</span>`;
+    }).join("");
+    const sel = s.session_id === sceneState.selected ? "selected" : "";
+    return `<tr class="${sel}" data-session="${s.session_id}">` +
+      `<td>${s.session_id.replace("session_", "")}</td><td>${s.keyframes}</td>` +
+      `<td>${s.calibrated ? "✓" : "—"}</td><td>${chips}</td></tr>`;
+  }).join("");
+  rows.querySelectorAll("tr[data-session]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      sceneState.selected = tr.dataset.session;
+      sceneState.meshLoadedFor = null;
+      renderSceneSessions();
+      loadSceneResults();
+    });
+  });
+  document.getElementById("sceneRunBtn").disabled = false;
+  loadSceneResults();
+}
+
+function renderSceneStatus(status) {
+  const stepsDiv = document.getElementById("sceneSteps");
+  const session = sceneState.sessions.find((s) => s.session_id === (status.session_id || sceneState.selected));
+  const steps = (status.steps && Object.keys(status.steps).length ? status.steps : (session || {}).steps) || {};
+  stepsDiv.innerHTML = SCENE_STEPS.map((step) => {
+    const st = steps[step] || {};
+    const cls = status.current_step === step ? "running" : (st.status || "");
+    const extra = st.status === "failed" ? ` — ${st.error}` :
+      (st.report && st.report.warning ? " ⚠" : "");
+    return `<div><span class="step-chip ${cls}">${step}</span>` +
+      `<span style="font-size:12px;color:var(--muted)">${st.seconds ? st.seconds + "s" : ""}${extra}</span></div>`;
+  }).join("");
+  const progress = document.getElementById("sceneProgress");
+  progress.textContent = status.running
+    ? `running: ${status.current_step || ""} · ${status.progress || ""}`
+    : (status.error ? "" : "");
+  document.getElementById("sceneError").textContent = status.error || "";
+  document.getElementById("sceneRunBtn").disabled = !!status.running || !sceneState.selected;
+}
+
+function startScenePolling() {
+  if (sceneState.pollTimer !== null) return;
+  sceneState.pollTimer = setInterval(async () => {
+    try {
+      const res = await fetch("/api/scene3d/status");
+      const status = await res.json();
+      renderSceneStatus(status);
+      if (!status.running) {
+        clearInterval(sceneState.pollTimer);
+        sceneState.pollTimer = null;
+        sceneState.meshLoadedFor = null;
+        refreshSceneSessions();
+      }
+    } catch (err) { /* transient */ }
+  }, 2000);
+}
+
+document.getElementById("sceneRunBtn").addEventListener("click", async () => {
+  if (!sceneState.selected) return;
+  document.getElementById("sceneError").textContent = "";
+  try {
+    const res = await fetch("/api/scene3d/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sceneState.selected,
+        force: document.getElementById("sceneForce").checked,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      document.getElementById("sceneError").textContent = data.error || ("HTTP " + res.status);
+      return;
+    }
+    startScenePolling();
+    document.getElementById("sceneRunBtn").disabled = true;
+  } catch (err) {
+    document.getElementById("sceneError").textContent = "Request failed: " + err;
+  }
+});
+document.getElementById("sceneRefreshBtn").addEventListener("click", refreshSceneSessions);
+
+// -------------------------------------------------------- Scene results
+
+document.querySelectorAll("#sceneResultPills button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#sceneResultPills button").forEach((b) => b.classList.toggle("active", b === btn));
+    showSceneResult(btn.dataset.result);
+  });
+});
+
+function showSceneResult(kind) {
+  document.getElementById("scenePlanImg").style.display = kind === "plan" ? "" : "none";
+  document.getElementById("meshViewer").style.display = kind === "mesh" ? "" : "none";
+  document.getElementById("sceneObjects").style.display = kind === "objects" ? "" : "none";
+  if (kind === "mesh") loadMeshViewer();
+}
+
+async function loadSceneResults() {
+  if (!sceneState.selected) return;
+  const hint = document.getElementById("sceneResultHint");
+  const img = document.getElementById("scenePlanImg");
+  const base = `/scene3d/artifact?session_id=${sceneState.selected}`;
+  // Prefer the labeled plan, fall back to the raw one.
+  img.onerror = () => { img.onerror = null; img.src = `${base}&name=floor_plan.png&t=${Date.now()}`; };
+  img.src = `${base}&name=floor_plan_labeled.png&t=${Date.now()}`;
+  img.onload = () => { img.style.display = document.querySelector("#sceneResultPills .active").dataset.result === "plan" ? "" : "none"; };
+
+  try {
+    const res = await fetch(`${base}&name=scene_graph.json`);
+    if (!res.ok) {
+      document.getElementById("sceneObjectRows").innerHTML = "";
+      document.getElementById("sceneEdges").textContent = "";
+      hint.textContent = "No results yet — run the pipeline.";
+      return;
+    }
+    hint.textContent = "";
+    const graph = await res.json();
+    document.getElementById("sceneObjectRows").innerHTML = (graph.nodes || []).map((n) =>
+      `<tr><td>${n.object_id}</td><td><strong>${n.label}</strong></td>` +
+      `<td>${(n.labels || []).map((l) => l.score !== null ? `${l.label} ${l.score.toFixed(2)}` : l.label).join(", ")}</td>` +
+      `<td>${n.class_coco || ""}</td><td>${n.n_observations}</td>` +
+      `<td>${(n.centroid || []).map((v) => v.toFixed(2)).join(", ")}</td></tr>`
+    ).join("");
+    const rel = (graph.edges || []).filter((e) => e.relation !== "in_room");
+    document.getElementById("sceneEdges").textContent = rel.length
+      ? "Relations: " + rel.map((e) => `${e.src} ${e.relation} ${e.dst}${e.distance_m ? ` (${e.distance_m}m)` : ""}`).join(" · ")
+      : "No near/on relations detected.";
+  } catch (err) { /* transient */ }
+}
+
+async function loadMeshViewer() {
+  const container = document.getElementById("meshViewer");
+  if (!sceneState.selected || sceneState.meshLoadedFor === sceneState.selected) return;
+  container.textContent = "Loading mesh…";
+  try {
+    const three = await import("/vendor/three.module.min.js");
+    const { OrbitControls } = await import("/vendor/OrbitControls.js");
+    const { PLYLoader } = await import("/vendor/PLYLoader.js");
+
+    const loader = new PLYLoader();
+    const geometry = await loader.loadAsync(
+      `/scene3d/artifact?session_id=${sceneState.selected}&name=room_mesh.ply`
+    );
+    geometry.computeVertexNormals();
+
+    container.textContent = "";
+    container.innerHTML = "";
+    const width = container.clientWidth, height = container.clientHeight;
+    const renderer = new three.WebGLRenderer({ antialias: true });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(renderer.domElement);
+
+    const sceneObj = new three.Scene();
+    sceneObj.background = new three.Color(0x111111);
+    const camera = new three.PerspectiveCamera(60, width / height, 0.05, 100);
+    const material = geometry.hasAttribute("color")
+      ? new three.MeshBasicMaterial({ vertexColors: true })
+      : new three.MeshNormalMaterial();
+    const mesh = new three.Mesh(geometry, material);
+    sceneObj.add(mesh);
+
+    geometry.computeBoundingBox();
+    const bb = geometry.boundingBox;
+    const center = bb.getCenter(new three.Vector3());
+    const size = bb.getSize(new three.Vector3()).length();
+    camera.position.set(center.x + size * 0.5, center.y - size * 0.4, center.z - size * 0.5);
+    camera.lookAt(center);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.copy(center);
+    controls.update();
+
+    (function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(sceneObj, camera);
+    })();
+    sceneState.meshLoadedFor = sceneState.selected;
+  } catch (err) {
+    container.textContent = "Mesh not available yet (run the tsdf step). " + err;
+  }
+}
 
 backfill().then(poll);
 loadRooms();

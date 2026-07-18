@@ -89,6 +89,7 @@ class MjpegPreviewServer:
         scan_controller: Any | None = None,
         room_store: Any | None = None,
         monitor_controller: Any | None = None,
+        scene_pipeline: Any | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -103,6 +104,7 @@ class MjpegPreviewServer:
                 scan_controller,
                 room_store,
                 monitor_controller,
+                scene_pipeline,
             ),
         )
         self._thread: threading.Thread | None = None
@@ -136,6 +138,7 @@ def _make_handler(
     scan_controller: Any | None = None,
     room_store: Any | None = None,
     monitor_controller: Any | None = None,
+    scene_pipeline: Any | None = None,
 ) -> type[server.BaseHTTPRequestHandler]:
     class StreamingHandler(server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -185,6 +188,18 @@ def _make_handler(
             if parsed.path == "/monitor/snapshot.jpg":
                 self._serve_monitor_snapshot(parsed.query)
                 return
+            if parsed.path == "/api/scene3d/sessions":
+                self._serve_scene_sessions()
+                return
+            if parsed.path == "/api/scene3d/status":
+                self._serve_scene_status()
+                return
+            if parsed.path == "/scene3d/artifact":
+                self._serve_scene_artifact(parsed.query)
+                return
+            if parsed.path.startswith("/vendor/"):
+                self._serve_vendor(parsed.path)
+                return
             self.send_error(404)
 
         def do_POST(self) -> None:
@@ -215,6 +230,9 @@ def _make_handler(
                 return
             if parsed.path == "/api/monitor/anchors/freeze":
                 self._handle_anchors_freeze()
+                return
+            if parsed.path == "/api/scene3d/run":
+                self._handle_scene_run()
                 return
             self._send_json({"error": "not found"}, status=404)
 
@@ -681,6 +699,107 @@ def _make_handler(
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        # -------------------------------------------------------- scene3d
+
+        def _scene_unavailable(self) -> bool:
+            if scene_pipeline is None:
+                self._send_json({"error": "scene3d is not enabled"}, status=503)
+                return True
+            return False
+
+        def _serve_scene_sessions(self) -> None:
+            if self._scene_unavailable():
+                return
+            self._send_json(
+                {
+                    "sessions": scene_pipeline.sessions(),
+                    "status": scene_pipeline.status(),
+                }
+            )
+
+        def _serve_scene_status(self) -> None:
+            if self._scene_unavailable():
+                return
+            self._send_json(scene_pipeline.status())
+
+        def _handle_scene_run(self) -> None:
+            if self._scene_unavailable():
+                return
+            body = self._read_json_body()
+            if body is None or not body.get("session_id"):
+                self._send_json({"error": "session_id is required"}, status=400)
+                return
+            try:
+                result = scene_pipeline.run(
+                    str(body["session_id"]),
+                    steps=body.get("steps") or None,
+                    force=bool(body.get("force", False)),
+                )
+            except (ValueError, RuntimeError) as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._send_json(result)
+
+        _SCENE_ARTIFACTS = {
+            "floor_plan.png": "image/png",
+            "floor_plan_labeled.png": "image/png",
+            "room_mesh.ply": "application/octet-stream",
+            "scene_graph.json": "application/json",
+            "objects.json": "application/json",
+            "scale_report.json": "application/json",
+            "pipeline_state.json": "application/json",
+        }
+
+        def _serve_scene_artifact(self, query: str) -> None:
+            if self._scene_unavailable():
+                return
+            params = parse_qs(query)
+            session_id = params.get("session_id", [""])[0]
+            name = params.get("name", [""])[0]
+            if not session_id.replace("_", "").isalnum():
+                self.send_error(400)
+                return
+            content_type = self._SCENE_ARTIFACTS.get(name)
+            if content_type is None and not (
+                name.startswith("object_") and name.endswith(".ply") and "/" not in name
+            ):
+                self.send_error(404, "Unknown artifact")
+                return
+            derived = scene_pipeline.sessions_dir / session_id / "derived"
+            path = (
+                derived / "objects_pcd" / name
+                if name.startswith("object_")
+                else derived / name
+            )
+            try:
+                data = path.read_bytes()
+            except OSError:
+                self.send_error(404, "Artifact not produced yet")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _serve_vendor(self, path: str) -> None:
+            name = path.rsplit("/", 1)[-1]
+            if "/" in name or ".." in name or not name.endswith(".js"):
+                self.send_error(404)
+                return
+            file_path = STATIC_DIR / "vendor" / name
+            try:
+                data = file_path.read_bytes()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
             self.end_headers()
             self.wfile.write(data)
 

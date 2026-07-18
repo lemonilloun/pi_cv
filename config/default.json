@@ -72,6 +72,44 @@
     "min_wall_height_m": 1.6,
     "depth_scale_correction": 1.0
   },
+  "scene3d": {
+    "sessions_dir": "data/scene_sessions",
+    "fallback_hfov_deg": 102.0,
+    "depth": {
+      "model_path": "models/depth_anything_v2_metric_hypersim_vits.pth",
+      "encoder": "vits",
+      "input_size": 518,
+      "max_depth_m": 20.0,
+      "device": "mps"
+    },
+    "poses": {
+      "sequential_overlap": 10,
+      "min_registered_frac": 0.5
+    },
+    "tsdf": {
+      "voxel_m": 0.02,
+      "sdf_trunc_m": 0.08,
+      "depth_trunc_m": 5.0,
+      "mask_edge_erode_px": 6,
+      "plan_resolution_m": 0.03,
+      "plan_height_band_m": [0.15, 1.9]
+    },
+    "objects": {
+      "device": "mps",
+      "dino_cos_min": 0.6,
+      "centroid_max_m": 0.5,
+      "min_observations": 3,
+      "dbscan_eps_m": 0.05,
+      "dbscan_min_points": 20,
+      "point_stride": 4
+    },
+    "graph": {
+      "clip_text_model": "RN50x4",
+      "clip_text_pretrained": "openai",
+      "near_max_m": 0.5,
+      "on_gap_m": 0.08
+    }
+  },
   "monitoring": {
     "enabled": true,
     "data_dir": "data/monitoring",

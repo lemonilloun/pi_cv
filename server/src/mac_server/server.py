@@ -42,6 +42,7 @@ class MacServer:
         server_cv_config: dict[str, Any] | None = None,
         mapping_config: dict[str, Any] | None = None,
         monitoring_config: dict[str, Any] | None = None,
+        scene3d_config: dict[str, Any] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -54,6 +55,7 @@ class MacServer:
         self.cv_worker = self._build_cv_worker(server_cv_config or {})
         self.room_store, self.scan_controller = self._build_mapping(mapping_config or {})
         self.monitor_controller = self._build_monitoring(monitoring_config or {})
+        self.scene_pipeline = self._build_scene3d(scene3d_config or {})
         self.preview_server = (
             MjpegPreviewServer(
                 preview_host,
@@ -65,6 +67,7 @@ class MacServer:
                 scan_controller=self.scan_controller,
                 room_store=self.room_store,
                 monitor_controller=self.monitor_controller,
+                scene_pipeline=self.scene_pipeline,
             )
             if preview_enabled
             else None
@@ -167,6 +170,19 @@ class MacServer:
             scan_controller=self.scan_controller,
             agent=agent,
         )
+
+    def _build_scene3d(self, scene3d_config: dict[str, Any]):
+        if not scene3d_config:
+            return None
+        try:
+            from mac_server.scene3d.pipeline import ScenePipeline
+        except ImportError as exc:
+            logger.warning("Scene3D disabled (import failed): %s", exc)
+            return None
+        sessions_dir = Path(scene3d_config.get("sessions_dir", "data/scene_sessions"))
+        if not sessions_dir.is_absolute():
+            sessions_dir = REPO_ROOT / sessions_dir
+        return ScenePipeline(sessions_dir, scene3d_config, REPO_ROOT)
 
     def start(self) -> None:
         if self._socket is not None:
@@ -337,6 +353,7 @@ def main() -> int:
     server_cv_config = dict(config.get("server_cv", {}))
     mapping_config = dict(config.get("mapping", {}))
     monitoring_config = dict(config.get("monitoring", {}))
+    scene3d_config = dict(config.get("scene3d", {}))
     if args.no_cv:
         server_cv_config["enabled"] = False
         mapping_config = {}
@@ -353,6 +370,7 @@ def main() -> int:
         server_cv_config=server_cv_config,
         mapping_config=mapping_config,
         monitoring_config=monitoring_config,
+        scene3d_config=scene3d_config,
     )
     try:
         server.serve_forever(once=args.once)

@@ -21,6 +21,7 @@ data/camera_local/
 data/cv_runs/
 data/rooms/
 data/monitoring/
+data/scene_sessions/
 
 research/
 models/
@@ -30,3 +31,5 @@ external/
 *_ncnn_model/
 
 CLAUDE.md
+
+plan.md
