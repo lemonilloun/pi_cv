@@ -186,3 +186,63 @@ def make_telemetry_message(device_id: str) -> Message:
             "monotonic_seconds": round(time.monotonic(), 3),
         },
     )
+
+
+# ------------------------------------------------------------- scene3d
+# Online transfer of scene-recording keyframes (docs/scene3d.md): the
+# recorder streams each keyframe to the Mac as it is captured, so nothing
+# accumulates on the Pi's microSD. The binary payload of a scene_keyframe
+# is rgb.jpg and masks.png concatenated; the header carries both lengths.
+
+
+def make_scene_session_start_message(
+    device_id: str,
+    scene_session: str,
+    intrinsics: dict[str, object] | None,
+    settings: dict[str, object],
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="scene_session_start",
+        payload={
+            "scene_session": scene_session,
+            "intrinsics": intrinsics,
+            "settings": settings,
+        },
+    )
+
+
+def make_scene_keyframe_message(
+    device_id: str,
+    scene_session: str,
+    frame_idx: int,
+    meta: dict[str, object],
+    rgb_bytes: int,
+    masks_bytes: int,
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="scene_keyframe",
+        payload={
+            "scene_session": scene_session,
+            "frame_idx": frame_idx,
+            "meta": meta,
+            "rgb_bytes": rgb_bytes,
+            "masks_bytes": masks_bytes,
+        },
+    )
+
+
+def make_scene_session_end_message(
+    device_id: str,
+    scene_session: str,
+    session_meta: dict[str, object],
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="scene_session_end",
+        payload={
+            "scene_session": scene_session,
+            "session_meta": session_meta,
+        },
+    )

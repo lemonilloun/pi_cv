@@ -312,6 +312,7 @@
   }
   .radar-legend .swatch { width: 8px; height: 8px; border-radius: 50%; }
   .tabs { display: inline-flex; gap: 4px; margin-left: 16px; }
+
   .tabs button {
     background: transparent; color: var(--ink-2);
     border: 1px solid var(--border); border-radius: 8px;
@@ -332,10 +333,13 @@
   .step-chip.done { color: var(--good); border-color: var(--good); }
   .step-chip.failed { color: var(--critical); border-color: var(--critical); }
   .step-chip.running { color: var(--accent); border-color: var(--accent); }
-  #meshViewer { width: 100%; height: 420px; background: #111; border-radius: 10px; display: none; }
-  #scenePlanImg { max-width: 100%; border-radius: 10px; display: none; }
+  #meshViewer { width: 100%; height: 420px; background: #111; border-radius: 10px; }
+  #scenePlanImg { max-width: 100%; border-radius: 10px; }
   .scene-objects td { font-size: 12.5px; }
 </style>
+<script type="importmap">
+  {"imports": {"three": "/vendor/three.module.min.js"}}
+</script>
 </head>
 <body>
 <header>
@@ -531,8 +535,8 @@
         <button data-result="mesh">3D mesh</button>
         <button data-result="objects">Objects</button>
       </div>
-      <img id="scenePlanImg" alt="Floor plan">
-      <div id="meshViewer"></div>
+      <img id="scenePlanImg" alt="Floor plan" style="display:none">
+      <div id="meshViewer" style="display:none"></div>
       <div id="sceneObjects" style="display:none">
         <table class="scene-table scene-objects">
           <thead><tr><th>#</th><th>Label</th><th>Top-3 (CLIP)</th><th>COCO</th><th>Obs</th><th>Centroid, m</th></tr></thead>
@@ -1780,7 +1784,9 @@ async function loadMeshViewer() {
   if (!sceneState.selected || sceneState.meshLoadedFor === sceneState.selected) return;
   container.textContent = "Loading mesh…";
   try {
-    const three = await import("/vendor/three.module.min.js");
+    // The import map (in <head>) resolves the bare "three" specifier that
+    // OrbitControls/PLYLoader import internally.
+    const three = await import("three");
     const { OrbitControls } = await import("/vendor/OrbitControls.js");
     const { PLYLoader } = await import("/vendor/PLYLoader.js");
 

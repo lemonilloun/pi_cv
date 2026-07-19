@@ -147,7 +147,12 @@ def run_poses_step(
     world_from_cam_unscaled: dict[int, np.ndarray] = {}
     for image in rec.images.values():
         kf_index = int(Path(image.name).stem)
-        cam_from_world = image.cam_from_world.matrix()  # 3x4
+        # pycolmap API drift: cam_from_world is a property (Rigid3d) in some
+        # versions and an instance method in others.
+        pose = image.cam_from_world
+        if callable(pose):
+            pose = pose()
+        cam_from_world = pose.matrix()  # 3x4
         R, t = cam_from_world[:, :3], cam_from_world[:, 3]
 
         wfc = np.eye(4)

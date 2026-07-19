@@ -174,6 +174,126 @@ class SessionIoTest(unittest.TestCase):
             self.assertFalse(sessions[0]["calibrated"])
 
 
+class SceneUplinkHandlerTest(unittest.TestCase):
+    """The online-transfer server path materializes the exact session
+    layout the pipeline reads (start -> keyframes -> end)."""
+
+    def test_stream_roundtrip(self) -> None:
+        from mac_server.handlers import handle_message
+        from pi_client.protocol import (
+            make_scene_keyframe_message,
+            make_scene_session_end_message,
+            make_scene_session_start_message,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / "received"
+            storage_dir.mkdir()
+
+            start = make_scene_session_start_message(
+                "pi", "session_test1", {"fx": 600.0}, {"fps_target": 3.0}
+            )
+            response = handle_message(start, b"", storage_dir)
+            self.assertEqual(response.type, "ack")
+
+            rgb, masks = b"\xff\xd8jpegdata", b"\x89PNGdata"
+            kf = make_scene_keyframe_message(
+                "pi", "session_test1", 1,
+                {"frame_idx": 1, "detections": [{"instance_id": 1}]},
+                rgb_bytes=len(rgb), masks_bytes=len(masks),
+            )
+            response = handle_message(kf, rgb + masks, storage_dir)
+            self.assertEqual(response.type, "ack")
+
+            end = make_scene_session_end_message("pi", "session_test1", {"keyframes": 1})
+            handle_message(end, b"", storage_dir)
+
+            root = Path(tmp) / "scene_sessions" / "session_test1"
+            self.assertEqual((root / "keyframes/000001/rgb.jpg").read_bytes(), rgb)
+            self.assertEqual((root / "keyframes/000001/masks.png").read_bytes(), masks)
+            meta = json.loads((root / "keyframes/000001/meta.json").read_text())
+            self.assertEqual(meta["detections"][0]["instance_id"], 1)
+            self.assertEqual(json.loads((root / "intrinsics.json").read_text())["fx"], 600.0)
+            self.assertEqual(
+                json.loads((root / "session_meta.json").read_text())["keyframes"], 1
+            )
+            sessions = list_sessions(Path(tmp) / "scene_sessions")
+            self.assertEqual(sessions[0]["session_id"], "session_test1")
+
+    def test_payload_length_mismatch_rejected(self) -> None:
+        from mac_server.handlers import handle_message
+        from pi_client.protocol import make_scene_keyframe_message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / "received"
+            storage_dir.mkdir()
+            kf = make_scene_keyframe_message("pi", "s1", 1, {}, rgb_bytes=100, masks_bytes=5)
+            with self.assertRaises(ValueError):
+                handle_message(kf, b"short", storage_dir)
+
+    def test_session_name_sanitized(self) -> None:
+        from mac_server.handlers import handle_message
+        from pi_client.protocol import make_scene_session_start_message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / "received"
+            storage_dir.mkdir()
+            evil = make_scene_session_start_message("pi", "../../etc", None, {})
+            handle_message(evil, b"", storage_dir)
+            self.assertTrue((Path(tmp) / "scene_sessions" / "etc").exists())
+            self.assertFalse((Path(tmp) / "etc").exists())
+
+
+class SceneUplinkTcpTest(unittest.TestCase):
+    """End-to-end over real TCP: SceneUplink -> ephemeral in-process
+    MacServer -> session directory on disk."""
+
+    def test_uplink_streams_session(self) -> None:
+        import threading
+
+        from mac_server.server import MacServer
+        from pi_client.scene_recorder import SceneUplink
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / "received"
+            storage_dir.mkdir()
+            server = MacServer(
+                host="127.0.0.1", port=0, storage_dir=storage_dir,
+                preview_enabled=False,
+            )
+            server.start()
+            port = server._socket.getsockname()[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                uplink = SceneUplink(
+                    "127.0.0.1", port, "pi_test", "session_tcp1",
+                    intrinsics={"fx": 622.0}, settings={"fps_target": 3.0},
+                )
+                rgb, masks = b"\xff\xd8jpeg", b"\x89PNGmask"
+                self.assertTrue(uplink.send_keyframe(1, {"frame_idx": 1, "detections": []}, rgb, masks))
+                self.assertTrue(uplink.send_keyframe(2, {"frame_idx": 2, "detections": []}, rgb, masks))
+                self.assertTrue(uplink.send_end({"keyframes": 2}))
+                uplink.close()
+
+                root = Path(tmp) / "scene_sessions" / "session_tcp1"
+                self.assertEqual((root / "keyframes/000002/rgb.jpg").read_bytes(), rgb)
+                self.assertEqual((root / "keyframes/000001/masks.png").read_bytes(), masks)
+                self.assertTrue((root / "intrinsics.json").exists())
+                self.assertEqual(
+                    json.loads((root / "session_meta.json").read_text())["keyframes"], 2
+                )
+            finally:
+                server.stop()
+
+    def test_uplink_unreachable_degrades(self) -> None:
+        from pi_client.scene_recorder import SceneUplink
+
+        uplink = SceneUplink("127.0.0.1", 1, "pi", "s", None, {}, retry_s=0.0)
+        self.assertFalse(uplink.send_keyframe(1, {}, b"x", b"y"))
+        self.assertFalse(uplink.healthy)
+
+
 class SegDecodeTest(unittest.TestCase):
     def test_numpy_nms_suppresses_overlap(self) -> None:
         boxes = np.array([[0, 0, 10, 10], [1, 1, 11, 11], [50, 50, 60, 60]], dtype=float)

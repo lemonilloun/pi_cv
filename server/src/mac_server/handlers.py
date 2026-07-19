@@ -76,6 +76,70 @@ def handle_message(
     if message.type == "command_result" and session_context is not None:
         return _handle_command_result_message(message, session_context)
 
+    if message.type in {"scene_session_start", "scene_keyframe", "scene_session_end"}:
+        if storage_dir is None:
+            raise ValueError("storage_dir is required for scene messages")
+        return _handle_scene_message(message, binary_payload, storage_dir)
+
+    return make_ack_response(message)
+
+
+# ------------------------------------------------------------- scene3d
+# The scene recorder streams keyframes online (docs/scene3d.md) so nothing
+# accumulates on the Pi's microSD; the server materializes the exact same
+# session directory layout the offline/rsync path would produce.
+
+
+def _scene_session_dir(storage_dir: Path, scene_session: str) -> Path:
+    safe = "".join(c for c in scene_session if c.isalnum() or c == "_")
+    if not safe:
+        raise ValueError(f"Invalid scene session name: {scene_session!r}")
+    # storage_dir is data/received; sessions live next to it in data/.
+    return storage_dir.parent / "scene_sessions" / safe
+
+
+def _handle_scene_message(message: Message, binary_payload: bytes, storage_dir: Path) -> Message:
+    import json
+
+    payload = message.payload
+    session_dir = _scene_session_dir(storage_dir, str(payload.get("scene_session", "")))
+
+    if message.type == "scene_session_start":
+        (session_dir / "keyframes").mkdir(parents=True, exist_ok=True)
+        intrinsics = payload.get("intrinsics")
+        if intrinsics:
+            (session_dir / "intrinsics.json").write_text(
+                json.dumps(intrinsics, indent=2), encoding="utf-8"
+            )
+        logger.info("Scene session started: %s (intrinsics: %s)",
+                    session_dir.name, "yes" if intrinsics else "no")
+        return make_ack_response(message)
+
+    if message.type == "scene_keyframe":
+        rgb_bytes = int(payload.get("rgb_bytes", 0))
+        masks_bytes = int(payload.get("masks_bytes", 0))
+        if rgb_bytes <= 0 or rgb_bytes + masks_bytes != len(binary_payload):
+            raise ValueError(
+                f"scene_keyframe payload mismatch: rgb={rgb_bytes} masks={masks_bytes} "
+                f"actual={len(binary_payload)}"
+            )
+        frame_idx = int(payload.get("frame_idx", 0))
+        kf_dir = session_dir / "keyframes" / f"{frame_idx:06d}"
+        kf_dir.mkdir(parents=True, exist_ok=True)
+        (kf_dir / "rgb.jpg").write_bytes(binary_payload[:rgb_bytes])
+        if masks_bytes > 0:
+            (kf_dir / "masks.png").write_bytes(binary_payload[rgb_bytes:])
+        (kf_dir / "meta.json").write_text(
+            json.dumps(payload.get("meta", {}), indent=1), encoding="utf-8"
+        )
+        return make_ack_response(message)
+
+    # scene_session_end
+    (session_dir).mkdir(parents=True, exist_ok=True)
+    (session_dir / "session_meta.json").write_text(
+        json.dumps(payload.get("session_meta", {}), indent=2), encoding="utf-8"
+    )
+    logger.info("Scene session finished: %s", session_dir.name)
     return make_ack_response(message)
 
 

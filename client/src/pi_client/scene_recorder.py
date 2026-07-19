@@ -1,24 +1,26 @@
-"""Scene recording client for the Pi: walk the camera around a room and
-write a session directory the Mac reconstruction pipeline consumes.
+"""Scene recording client for the Pi: walk the camera around a room; every
+keyframe is STREAMED to the Mac server over the project TCP protocol as it
+is captured (scene_session_start / scene_keyframe / scene_session_end), so
+nothing accumulates on the Pi's microSD. The Mac materializes the exact
+session layout the pipeline consumes (docs/scene3d.md).
 
-Per frame (~2-3 fps target, CPU stays light — NPU does the work):
+The local disk is only a FALLBACK: if the server is unreachable a keyframe
+is written under data/scene_sessions/ instead (and the uplink keeps
+retrying), so a Wi-Fi hiccup never loses data — merge leftovers later with
+rsync if that happens.
+
+A live preview (annotated with detections) is also pushed for the panel's
+Live tab, so you can see framing/blur/detections while walking.
+
+Per frame (~2-3 fps target, CPU stays light — the NPU does the work):
   camera -> yolov8-seg hef (Hailo-8, host decode) -> greedy tracker
          -> keyframe selector (min interval + blur gate)
-         -> keyframe saved: rgb.jpg (full res) + masks.png (uint16
-            instance map) + meta.json (detections with track_id and,
-            optionally, a CLIP embedding per detection from the CLIP hef
-            running on the same NPU via the model scheduler).
-
-Session layout (the Pi<->Mac data contract, docs/scene3d.md):
-
-    session_YYYYMMDD_HHMMSS/
-      intrinsics.json      # copied from calibration (scene_calibrate.py)
-      session_meta.json    # written on stop
-      keyframes/000001/{rgb.jpg, masks.png, meta.json}
+         -> keyframe: rgb.jpg + masks.png (uint16) + meta.json with
+            track_id and a CLIP embedding per detection (CLIP hef on the
+            same NPU via the model scheduler) -> uplink to the Mac
 
 Camera controls are FIXED for the whole session (manual focus at the
-calibrated LensPosition, AE/AWB locked after warmup) — drifting intrinsics
-or color would hurt both COLMAP and the embedding association.
+calibrated LensPosition) — drifting intrinsics would hurt COLMAP.
 """
 
 from __future__ import annotations
@@ -40,14 +42,18 @@ for _entry in (str(REPO_ROOT), str(REPO_ROOT / "client/src"), str(REPO_ROOT / "s
 
 import numpy as np
 
-from pi_client.camera import CameraFocusOptions
+from pi_client.camera import CameraFocusOptions, CameraFrame
 from pi_client.camera_session import CaptureSettings, make_capture_source
+from pi_client.cv_models import COCO80_CLASS_NAMES
 from pi_client.hailo_infer import HailoMultiModel
 from pi_client.network import ClientConnectionError, PiClient
-from pi_client.protocol import make_camera_stream_frame_message
+from pi_client.protocol import (
+    make_camera_stream_frame_message,
+    make_scene_keyframe_message,
+    make_scene_session_end_message,
+    make_scene_session_start_message,
+)
 from pi_client.seg_postprocess import yolov8_seg_postprocess
-from pi_client.cv_models import COCO80_CLASS_NAMES
-from pi_client.camera import CameraFrame
 from shared.config import load_config
 
 # Pure-python tracker shared with the Mac monitoring stack (no server
@@ -60,7 +66,8 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record a scene session (Pi + Hailo)")
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data/scene_sessions")
+    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data/scene_sessions",
+                        help="Local FALLBACK dir (used only when the uplink is down)")
     parser.add_argument("--intrinsics", type=Path, default=REPO_ROOT / "config/scene_intrinsics.json")
     parser.add_argument("--seg-hef", type=Path, default=REPO_ROOT / "models/yolov8s_seg_h8.hef")
     parser.add_argument("--clip-hef", type=Path, default=REPO_ROOT / "models/clip_resnet_50x4_h8.hef")
@@ -77,11 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lens-position", type=float, default=None,
                         help="Manual focus (1/m); default: from intrinsics.json")
     parser.add_argument("--max-keyframes", type=int, default=2000)
-    parser.add_argument("--no-preview", action="store_true",
-                        help="Don't stream a live preview to the Mac panel")
-    parser.add_argument("--host", default=None,
-                        help="Mac server host for the preview (default: from .env/config)")
+    parser.add_argument("--host", default=None, help="Mac server host (default: from .env/config)")
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--offline", action="store_true",
+                        help="No uplink: write everything locally (old behavior)")
+    parser.add_argument("--no-preview", action="store_true",
+                        help="Uplink keyframes but skip the live preview stream")
     return parser.parse_args()
 
 
@@ -101,25 +109,159 @@ def variance_of_laplacian(gray: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+class SceneUplink:
+    """Best-effort TCP uplink to the Mac server. Reconnects with a retry
+    window; on every (re)connect the session-start message is resent (the
+    server's handling is idempotent) so a mid-walk Wi-Fi drop just resumes."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        device_id: str,
+        scene_session: str,
+        intrinsics: dict[str, Any] | None,
+        settings: dict[str, Any],
+        retry_s: float = 5.0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.device_id = device_id
+        self.scene_session = scene_session
+        self.intrinsics = intrinsics
+        self.settings = settings
+        self.retry_s = retry_s
+        self.healthy = False
+        self.sent_keyframes = 0
+        self._client: PiClient | None = None
+        self._last_attempt = 0.0
+
+    def _ensure(self) -> bool:
+        if self.healthy and self._client is not None:
+            return True
+        if time.monotonic() - self._last_attempt < self.retry_s:
+            return False
+        self._last_attempt = time.monotonic()
+        try:
+            client = PiClient(self.host, self.port, timeout_seconds=4.0)
+            client.connect()
+            self._client = client
+            self._request(
+                make_scene_session_start_message(
+                    self.device_id, self.scene_session, self.intrinsics, self.settings
+                ),
+                b"",
+            )
+            self.healthy = True
+            logger.info("Uplink connected to %s:%s", self.host, self.port)
+            return True
+        except (ClientConnectionError, OSError) as exc:
+            logger.warning("Uplink unavailable (%s) — falling back to local disk", exc)
+            self._drop()
+            return False
+
+    def _request(self, message: Any, payload: bytes) -> None:
+        assert self._client is not None
+        response, _ = self._client.request(message, payload)
+        if response.type == "error":
+            raise ClientConnectionError(f"Server error: {response.payload.get('error')}")
+
+    def _drop(self) -> None:
+        self.healthy = False
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
+    def send_keyframe(
+        self, frame_idx: int, meta: dict[str, Any], rgb_jpg: bytes, masks_png: bytes
+    ) -> bool:
+        if not self._ensure():
+            return False
+        try:
+            self._request(
+                make_scene_keyframe_message(
+                    self.device_id, self.scene_session, frame_idx, meta,
+                    rgb_bytes=len(rgb_jpg), masks_bytes=len(masks_png),
+                ),
+                rgb_jpg + masks_png,
+            )
+            self.sent_keyframes += 1
+            return True
+        except (ClientConnectionError, OSError) as exc:
+            logger.warning("Uplink lost mid-keyframe (%s) — saving locally", exc)
+            self._drop()
+            return False
+
+    def send_preview(self, jpeg: bytes, width: int, height: int, fps: float) -> None:
+        if not self.healthy or self._client is None:
+            return
+        try:
+            frame = CameraFrame(
+                frame_id=str(time.monotonic_ns()), width=width, height=height,
+                image_format="jpeg", content_type="image/jpeg", data=jpeg,
+            )
+            self._request(
+                make_camera_stream_frame_message(
+                    device_id=self.device_id, frame=frame,
+                    session_id=self.scene_session, frame_index=0, fps=fps,
+                    jpeg_quality=70, save_frame=False, view="camera", mode="scene_rec",
+                ),
+                jpeg,
+            )
+        except (ClientConnectionError, OSError) as exc:
+            logger.debug("Preview send failed: %s", exc)
+            self._drop()
+
+    def send_end(self, session_meta: dict[str, Any]) -> bool:
+        if not self._ensure():
+            return False
+        try:
+            self._request(
+                make_scene_session_end_message(self.device_id, self.scene_session, session_meta),
+                b"",
+            )
+            return True
+        except (ClientConnectionError, OSError):
+            self._drop()
+            return False
+
+    def close(self) -> None:
+        self._drop()
+
+
 class SceneRecorder:
     def __init__(self, args: argparse.Namespace) -> None:
         import cv2
 
         self._cv2 = cv2
         self.args = args
-        self.session_dir = args.output_dir / datetime.now().strftime("session_%Y%m%d_%H%M%S")
-        self.keyframes_dir = self.session_dir / "keyframes"
-        self.keyframes_dir.mkdir(parents=True, exist_ok=True)
-
+        self.session_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
+        self.session_dir = args.output_dir / self.session_name  # fallback only
         self.intrinsics = load_intrinsics(args.intrinsics)
-        if self.intrinsics is not None:
-            (self.session_dir / "intrinsics.json").write_text(
-                json.dumps(self.intrinsics, indent=2), encoding="utf-8"
-            )
-        else:
+        if self.intrinsics is None:
             logger.warning(
                 "No intrinsics at %s — record anyway, but run scene_calibrate.py "
                 "for metric-quality reconstruction", args.intrinsics
+            )
+
+        config = load_config(REPO_ROOT / "config/default.json", REPO_ROOT / ".env")
+        host = args.host or config.get("client", {}).get("server_host", "127.0.0.1")
+        port = args.port or int(config.get("server", {}).get("port", 8765))
+        device_id = str(config.get("client", {}).get("device_id", "raspberry_pi_01"))
+
+        self.uplink: SceneUplink | None = None
+        if not args.offline:
+            self.uplink = SceneUplink(
+                host, port, device_id, self.session_name, self.intrinsics,
+                settings={
+                    "record_size": [args.width, args.height],
+                    "fps_target": args.fps,
+                    "seg_model": args.seg_hef.name,
+                    "confidence": args.confidence,
+                },
             )
 
         lens_position = args.lens_position
@@ -164,6 +306,7 @@ class SceneRecorder:
             excluded_classes=set(),
         )
         self._keyframe_index = 0
+        self._local_keyframes = 0
         self._last_keyframe_at = 0.0
         self._frame_index = 0
         self._started_at = time.time()
@@ -174,7 +317,12 @@ class SceneRecorder:
     def run(self) -> int:
         self.source.start()
         interval = 1.0 / max(self.args.fps, 0.2)
-        logger.info("Recording to %s (Ctrl+C to stop)", self.session_dir)
+        target = (
+            f"streaming to {self.uplink.host}:{self.uplink.port}"
+            if self.uplink is not None
+            else f"local dir {self.session_dir}"
+        )
+        logger.info("Recording session %s — %s (Ctrl+C to stop)", self.session_name, target)
         try:
             while not self._stop:
                 tick = time.monotonic()
@@ -236,9 +384,11 @@ class SceneRecorder:
             for t in self.tracker.tracks.values()
         }
 
-        if not self._is_keyframe(bgr, now):
-            return
-        self._save_keyframe(bgr, detections, masks_640, track_by_bbox, now)
+        if self._is_keyframe(bgr, now):
+            self._emit_keyframe(bgr, detections, masks_640, track_by_bbox, now)
+
+        if self.uplink is not None and not self.args.no_preview:
+            self._send_preview(bgr, detections)
 
     def _is_keyframe(self, bgr: np.ndarray, now: float) -> bool:
         if now - self._last_keyframe_at < self.args.keyframe_interval:
@@ -253,7 +403,7 @@ class SceneRecorder:
 
     # ------------------------------------------------------------- output
 
-    def _save_keyframe(
+    def _emit_keyframe(
         self,
         bgr: np.ndarray,
         detections: list[dict[str, Any]],
@@ -264,11 +414,7 @@ class SceneRecorder:
         cv2 = self._cv2
         self._keyframe_index += 1
         self._last_keyframe_at = now
-        kf_dir = self.keyframes_dir / f"{self._keyframe_index:06d}"
-        kf_dir.mkdir(parents=True, exist_ok=True)
         h, w = bgr.shape[:2]
-
-        cv2.imwrite(str(kf_dir / "rgb.jpg"), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
         instance_map = np.zeros((h, w), dtype=np.uint16)
         meta_dets: list[dict[str, Any]] = []
@@ -296,19 +442,68 @@ class SceneRecorder:
                     entry["clip_emb"] = emb
             meta_dets.append(entry)
 
-        cv2.imwrite(str(kf_dir / "masks.png"), instance_map)
+        ok_rgb, rgb_encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        ok_masks, masks_encoded = cv2.imencode(".png", instance_map)
+        if not ok_rgb or not ok_masks:
+            logger.error("Keyframe %06d encode failed — dropped", self._keyframe_index)
+            return
         meta = {
             "frame_idx": self._keyframe_index,
             "source_frame": self._frame_index,
             "timestamp_ns": int(now * 1e9),
             "detections": meta_dets,
         }
-        (kf_dir / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+
+        sent = False
+        if self.uplink is not None:
+            sent = self.uplink.send_keyframe(
+                self._keyframe_index, meta, rgb_encoded.tobytes(), masks_encoded.tobytes()
+            )
+        if not sent:
+            self._save_keyframe_locally(meta, rgb_encoded.tobytes(), masks_encoded.tobytes())
         logger.info(
-            "keyframe %06d: %d detections%s",
+            "keyframe %06d: %d detections%s -> %s",
             self._keyframe_index, len(meta_dets),
             " +clip" if self.clip is not None else "",
+            "mac" if sent else "LOCAL",
         )
+
+    def _save_keyframe_locally(self, meta: dict[str, Any], rgb: bytes, masks: bytes) -> None:
+        kf_dir = self.session_dir / "keyframes" / f"{self._keyframe_index:06d}"
+        kf_dir.mkdir(parents=True, exist_ok=True)
+        if self.intrinsics is not None and not (self.session_dir / "intrinsics.json").exists():
+            (self.session_dir / "intrinsics.json").write_text(
+                json.dumps(self.intrinsics, indent=2), encoding="utf-8"
+            )
+        (kf_dir / "rgb.jpg").write_bytes(rgb)
+        (kf_dir / "masks.png").write_bytes(masks)
+        (kf_dir / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+        self._local_keyframes += 1
+
+    def _send_preview(self, bgr: np.ndarray, detections: list[dict[str, Any]]) -> None:
+        cv2 = self._cv2
+        try:
+            scale = 960 / bgr.shape[1]
+            preview = cv2.resize(bgr, (960, int(bgr.shape[0] * scale)))
+            for det in detections:
+                x0, y0, x1, y1 = (int(v * scale) for v in det["bbox_xyxy"])
+                cv2.rectangle(preview, (x0, y0), (x1, y1), (30, 220, 30), 2)
+                cv2.putText(
+                    preview, f"{det['class']} {det['confidence']:.2f}",
+                    (x0, max(16, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (30, 220, 30), 1, cv2.LINE_AA,
+                )
+            cv2.putText(
+                preview, f"REC {self.session_name}  kf {self._keyframe_index:06d}",
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2, cv2.LINE_AA,
+            )
+            ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            if ok:
+                self.uplink.send_preview(
+                    encoded.tobytes(), preview.shape[1], preview.shape[0], self.args.fps
+                )
+        except Exception as exc:
+            logger.debug("Preview failed: %s", exc)
 
     def _clip_embedding(self, bgr: np.ndarray, bbox: list[float]) -> list[float] | None:
         cv2 = self._cv2
@@ -339,7 +534,7 @@ class SceneRecorder:
             pass
         if self.hailo is not None:
             self.hailo.close()
-        meta = {
+        session_meta = {
             "created_at": self._started_at,
             "duration_s": round(time.time() - self._started_at, 1),
             "keyframes": self._keyframe_index,
@@ -349,17 +544,31 @@ class SceneRecorder:
             "clip_model": str(self.args.clip_hef.name) if self.clip is not None else None,
             "confidence": self.args.confidence,
             "fps_target": self.args.fps,
+            "keyframes_local_fallback": self._local_keyframes,
         }
-        (self.session_dir / "session_meta.json").write_text(
-            json.dumps(meta, indent=2), encoding="utf-8"
-        )
+        sent_end = False
+        if self.uplink is not None:
+            sent_end = self.uplink.send_end(session_meta)
+            self.uplink.close()
+        if self._local_keyframes > 0 or (self.uplink is None):
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            (self.session_dir / "session_meta.json").write_text(
+                json.dumps(session_meta, indent=2), encoding="utf-8"
+            )
+
         logger.info(
-            "Session done: %s (%d keyframes, %.0fs)",
-            self.session_dir, self._keyframe_index, meta["duration_s"],
+            "Session done: %s — %d keyframes (%d streamed, %d local), %.0fs",
+            self.session_name, self._keyframe_index,
+            self.uplink.sent_keyframes if self.uplink else 0,
+            self._local_keyframes, session_meta["duration_s"],
         )
-        print(f"\nSession: {self.session_dir}")
-        print("Transfer to the Mac with:")
-        print(f"  rsync -avP {self.session_dir} <mac>:pi_cv/data/scene_sessions/")
+        print(f"\nSession: {self.session_name}")
+        if self.uplink is not None and sent_end and self._local_keyframes == 0:
+            print("All keyframes are already on the Mac — open the Scene tab and run the pipeline.")
+        elif self._local_keyframes > 0:
+            print(f"{self._local_keyframes} keyframes stayed LOCAL in {self.session_dir}")
+            print("Merge them into the Mac copy (run from the Mac):")
+            print(f"  rsync -avP cv-pi.local:{self.session_dir}/ <repo>/data/scene_sessions/{self.session_name}/")
 
 
 def main() -> int:

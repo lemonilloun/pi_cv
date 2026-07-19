@@ -71,18 +71,22 @@ recording. Without calibration the pipeline still runs (FOV-estimated K,
 `estimated: true`) but metric quality suffers.
 
 **Record on the Pi** (walk slowly, lots of view overlap, come back to
-where you started — loop closure helps COLMAP):
+where you started — loop closure helps COLMAP). Start the Mac server
+first — keyframes are **streamed to the Mac live** (nothing accumulates on
+the microSD), and the panel's Live tab shows an annotated preview of what
+the recorder sees while you walk:
 
 ```bash
 ./scripts/run_scene_recorder.sh          # Ctrl+C to stop
-# useful flags: --fps 3 --keyframe-interval 0.5 --no-clip
+# useful flags: --fps 3 --keyframe-interval 0.5 --no-clip --no-preview
+# --offline reverts to local-disk recording (old behavior)
 ```
 
-**Transfer to the Mac:**
-
-```bash
-rsync -avP data/scene_sessions/session_* vedro.local:~/Desktop/works/cv_pojects/pi_cv/data/scene_sessions/
-```
+The server host comes from `.env` (`PI_CV_SERVER_HOST=vedro.local`). If
+Wi-Fi drops mid-walk, affected keyframes are written locally under
+`data/scene_sessions/<id>/` and the recorder prints the exact rsync command
+to merge them afterwards (run it **from the Mac** — the Mac has no SSH
+server, so Pi→Mac rsync needs Remote Login enabled; Mac→Pi always works).
 
 **Process** — panel `Scene` tab (select session → Run pipeline) or CLI:
 
