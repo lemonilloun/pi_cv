@@ -107,6 +107,42 @@ API: `GET /api/scene3d/sessions`, `POST /api/scene3d/run
 {session_id, steps?, force?}`, `GET /api/scene3d/status`,
 `GET /scene3d/artifact?session_id=&name=` (whitelisted names).
 
+## Localization (pi_navigation)
+
+After a session is reconstructed, the pipeline's 6th step (`navindex`)
+builds a **place index**: a full-frame CLIP embedding + camera pose for
+every registered keyframe. The live client then answers "which room am I
+in and which way am I looking":
+
+```bash
+./scripts/run_pi_navigation.sh        # Pi; Mac server must be running
+```
+
+Per query (~1.5 Hz): frame -> CLIP RN50x4 on the NPU (the same model
+family the index was built with) -> `nav_query` over TCP -> the Mac
+matches against every session's index and returns room (session name),
+nearest recorded viewpoint, similarity, floor-plan position + heading.
+`fast_depth` (also on the NPU) adds the free-space distance ahead. The
+Scene tab shows the live fix (📍 line) and draws an oriented arrow on the
+floor plan when the located room is selected. This is retrieval-based
+place recognition — a coarse prior for the future navigation stack, not
+SLAM.
+
+## Session management
+
+Sessions can be renamed (display name, stored in session_meta.json — the
+directory stays stable) and deleted from the Scene tab (✎ / 🗑 buttons),
+or via `POST /api/scene3d/rename|delete`.
+
+## Model choices
+
+- Pi segmentation: `yolov8m_seg` (40.1 mask mAP) is the recorder default;
+  pass `--seg-hef models/yolov8s_seg_h8.hef` if you ever need more fps.
+- Mac depth: DAv2 metric **vitb** (scene3d.depth in config); the live
+  stream keeps vits for real-time.
+- CLIP: `RN50x4-quickgelu`/openai on the Mac — the quickgelu variant is
+  the exact match for the Pi hef's weights.
+
 ## Known constraints
 
 - **SfM needs parallax**: a static-tripod session fails `poses` with

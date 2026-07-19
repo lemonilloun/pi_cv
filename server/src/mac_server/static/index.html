@@ -511,7 +511,7 @@
         <code>rsync -avP data/scene_sessions/session_* vedro.local:&lt;repo&gt;/data/scene_sessions/</code>
       </p>
       <table class="scene-table">
-        <thead><tr><th>Session</th><th>KF</th><th>Calib</th><th>Steps</th></tr></thead>
+        <thead><tr><th>Session</th><th>KF</th><th>Calib</th><th>Steps</th><th></th></tr></thead>
         <tbody id="sceneSessionRows"><tr><td colspan="4" style="color:var(--muted)">loading…</td></tr></tbody>
       </table>
       <div class="map-form-row" style="margin-top:12px">
@@ -535,7 +535,11 @@
         <button data-result="mesh">3D mesh</button>
         <button data-result="objects">Objects</button>
       </div>
-      <img id="scenePlanImg" alt="Floor plan" style="display:none">
+      <p class="meta-line" id="navLine"></p>
+      <div id="planWrap" style="position:relative; display:none">
+        <img id="scenePlanImg" alt="Floor plan" style="display:block">
+        <div id="navDot" style="position:absolute; display:none; transform:translate(-50%,-50%); color:#ff5533; font-size:20px; text-shadow:0 0 6px #000; pointer-events:none">➤</div>
+      </div>
       <div id="meshViewer" style="display:none"></div>
       <div id="sceneObjects" style="display:none">
         <table class="scene-table scene-objects">
@@ -1606,7 +1610,7 @@ window.addEventListener("resize", drawCharts);
 
 // ------------------------------------------------------------- Scene tab
 
-const SCENE_STEPS = ["depth", "poses", "tsdf", "objects", "graph"];
+const SCENE_STEPS = ["depth", "poses", "tsdf", "objects", "graph", "navindex"];
 const sceneState = { selected: null, sessions: [], pollTimer: null, meshLoadedFor: null };
 
 document.querySelectorAll("#tabs button").forEach((btn) => {
@@ -1615,9 +1619,63 @@ document.querySelectorAll("#tabs button").forEach((btn) => {
     const scene = btn.dataset.tab === "scene";
     document.getElementById("tabLive").style.display = scene ? "none" : "";
     document.getElementById("tabScene").style.display = scene ? "grid" : "none";
-    if (scene) refreshSceneSessions();
+    if (scene) { refreshSceneSessions(); startNavPolling(); }
   });
 });
+
+// Live localization fix from pi_navigation (drawn on the floor plan).
+let navPollTimer = null;
+function startNavPolling() {
+  if (navPollTimer !== null) return;
+  pollNav();
+  navPollTimer = setInterval(pollNav, 2000);
+}
+async function pollNav() {
+  if (document.getElementById("tabScene").style.display === "none") return;
+  const line = document.getElementById("navLine");
+  const dot = document.getElementById("navDot");
+  try {
+    const res = await fetch("/api/nav/last");
+    const data = await res.json();
+    const last = data.last;
+    if (!last || !last.located) { line.textContent = ""; dot.style.display = "none"; return; }
+    const best = last.best;
+    const age = Math.max(0, Math.round(Date.now() / 1000 - last.at));
+    if (age > 30) { line.textContent = ""; dot.style.display = "none"; return; }
+    const room = best.name || best.session_id.replace("session_", "");
+    const heading = best.heading_deg !== undefined ? ` · heading ${best.heading_deg}°` : "";
+    const depth = last.depth_center_m !== undefined ? ` · ahead ${last.depth_center_m}m` : "";
+    line.textContent = `📍 ${room} · sim ${best.similarity}${heading}${depth} · ${age}s ago`;
+    if (best.session_id === sceneState.selected && best.plan_frac) {
+      dot.style.left = (best.plan_frac[0] * 100) + "%";
+      dot.style.top = (best.plan_frac[1] * 100) + "%";
+      dot.style.transform =
+        `translate(-50%,-50%) rotate(${best.heading_deg !== undefined ? best.heading_deg : 0}deg)`;
+      dot.style.display = "";
+    } else {
+      dot.style.display = "none";
+    }
+  } catch (err) { /* transient */ }
+}
+
+async function sceneAction(url, body) {
+  document.getElementById("sceneError").textContent = "";
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      document.getElementById("sceneError").textContent = data.error || ("HTTP " + res.status);
+    }
+    return data;
+  } catch (err) {
+    document.getElementById("sceneError").textContent = "Request failed: " + err;
+    return {};
+  }
+}
 
 async function refreshSceneSessions() {
   try {
@@ -1652,13 +1710,36 @@ function renderSceneSessions() {
       return `<span class="step-chip ${cls}">${step}</span>`;
     }).join("");
     const sel = s.session_id === sceneState.selected ? "selected" : "";
+    const name = (s.meta && s.meta.name)
+      ? `<strong>${s.meta.name}</strong><br><span style="color:var(--muted);font-size:11px">${s.session_id.replace("session_", "")}</span>`
+      : s.session_id.replace("session_", "");
     return `<tr class="${sel}" data-session="${s.session_id}">` +
-      `<td>${s.session_id.replace("session_", "")}</td><td>${s.keyframes}</td>` +
-      `<td>${s.calibrated ? "✓" : "—"}</td><td>${chips}</td></tr>`;
+      `<td>${name}</td><td>${s.keyframes}</td>` +
+      `<td>${s.calibrated ? "✓" : "—"}</td><td>${chips}</td>` +
+      `<td style="white-space:nowrap">` +
+      `<button class="ghost-btn" data-act="rename" title="Rename room">✎</button> ` +
+      `<button class="ghost-btn" data-act="delete" title="Delete session">🗑</button></td></tr>`;
   }).join("");
   rows.querySelectorAll("tr[data-session]").forEach((tr) => {
-    tr.addEventListener("click", () => {
-      sceneState.selected = tr.dataset.session;
+    tr.addEventListener("click", async (ev) => {
+      const act = ev.target.dataset && ev.target.dataset.act;
+      const sid = tr.dataset.session;
+      if (act === "delete") {
+        if (!confirm(`Delete ${sid} with all its artifacts?`)) return;
+        await sceneAction("/api/scene3d/delete", { session_id: sid });
+        if (sceneState.selected === sid) sceneState.selected = null;
+        refreshSceneSessions();
+        return;
+      }
+      if (act === "rename") {
+        const current = (sceneState.sessions.find((x) => x.session_id === sid) || {}).meta || {};
+        const name = prompt("Room name:", current.name || "");
+        if (name === null) return;
+        await sceneAction("/api/scene3d/rename", { session_id: sid, name });
+        refreshSceneSessions();
+        return;
+      }
+      sceneState.selected = sid;
       sceneState.meshLoadedFor = null;
       renderSceneSessions();
       loadSceneResults();
@@ -1740,7 +1821,7 @@ document.querySelectorAll("#sceneResultPills button").forEach((btn) => {
 });
 
 function showSceneResult(kind) {
-  document.getElementById("scenePlanImg").style.display = kind === "plan" ? "" : "none";
+  document.getElementById("planWrap").style.display = kind === "plan" ? "" : "none";
   document.getElementById("meshViewer").style.display = kind === "mesh" ? "" : "none";
   document.getElementById("sceneObjects").style.display = kind === "objects" ? "" : "none";
   if (kind === "mesh") loadMeshViewer();
@@ -1754,7 +1835,10 @@ async function loadSceneResults() {
   // Prefer the labeled plan, fall back to the raw one.
   img.onerror = () => { img.onerror = null; img.src = `${base}&name=floor_plan.png&t=${Date.now()}`; };
   img.src = `${base}&name=floor_plan_labeled.png&t=${Date.now()}`;
-  img.onload = () => { img.style.display = document.querySelector("#sceneResultPills .active").dataset.result === "plan" ? "" : "none"; };
+  img.onload = () => {
+    document.getElementById("planWrap").style.display =
+      document.querySelector("#sceneResultPills .active").dataset.result === "plan" ? "" : "none";
+  };
 
   try {
     const res = await fetch(`${base}&name=scene_graph.json`);
@@ -1811,13 +1895,34 @@ async function loadMeshViewer() {
       ? new three.MeshBasicMaterial({ vertexColors: true })
       : new three.MeshNormalMaterial();
     const mesh = new three.Mesh(geometry, material);
+
+    // COLMAP's world frame has arbitrary orientation — re-base the mesh so
+    // the estimated room "up" (plan_frame.json, from mean camera-down)
+    // becomes three.js +Y. Fallback: flip upside-down meshes with rotateX.
+    try {
+      const res = await fetch(`/scene3d/artifact?session_id=${sceneState.selected}&name=plan_frame.json`);
+      if (res.ok) {
+        const pf = await res.json();
+        const [a, up, b] = [pf.axis_a, pf.up, pf.axis_b];
+        mesh.applyMatrix4(new three.Matrix4().set(
+          a[0], a[1], a[2], 0,
+          up[0], up[1], up[2], 0,
+          b[0], b[1], b[2], 0,
+          0, 0, 0, 1,
+        ));
+      } else {
+        mesh.rotateX(Math.PI);
+      }
+    } catch (err) {
+      mesh.rotateX(Math.PI);
+    }
+    mesh.updateMatrixWorld(true);
     sceneObj.add(mesh);
 
-    geometry.computeBoundingBox();
-    const bb = geometry.boundingBox;
+    const bb = new three.Box3().setFromObject(mesh);
     const center = bb.getCenter(new three.Vector3());
     const size = bb.getSize(new three.Vector3()).length();
-    camera.position.set(center.x + size * 0.5, center.y - size * 0.4, center.z - size * 0.5);
+    camera.position.set(center.x + size * 0.45, center.y + size * 0.5, center.z + size * 0.45);
     camera.lookAt(center);
 
     const controls = new OrbitControls(camera, renderer.domElement);

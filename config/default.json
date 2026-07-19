@@ -57,7 +57,10 @@
   "mapping": {
     "rooms_dir": "data/rooms",
     "grid_resolution_m": 0.05,
-    "height_band_m": [0.1, 2.0],
+    "height_band_m": [
+      0.1,
+      2.0
+    ],
     "camera_height_m": 0.3,
     "hfov_deg": 102.0,
     "vfov_deg": 67.0,
@@ -76,8 +79,8 @@
     "sessions_dir": "data/scene_sessions",
     "fallback_hfov_deg": 102.0,
     "depth": {
-      "model_path": "models/depth_anything_v2_metric_hypersim_vits.pth",
-      "encoder": "vits",
+      "model_path": "models/depth_anything_v2_metric_hypersim_vitb.pth",
+      "encoder": "vitb",
       "input_size": 518,
       "max_depth_m": 20.0,
       "device": "mps"
@@ -92,7 +95,10 @@
       "depth_trunc_m": 5.0,
       "mask_edge_erode_px": 6,
       "plan_resolution_m": 0.03,
-      "plan_height_band_m": [0.15, 1.9]
+      "plan_height_band_m": [
+        0.15,
+        1.9
+      ]
     },
     "objects": {
       "device": "mps",
@@ -104,7 +110,7 @@
       "point_stride": 4
     },
     "graph": {
-      "clip_text_model": "RN50x4",
+      "clip_text_model": "RN50x4-quickgelu",
       "clip_text_pretrained": "openai",
       "near_max_m": 0.5,
       "on_gap_m": 0.08
@@ -114,7 +120,13 @@
     "enabled": true,
     "data_dir": "data/monitoring",
     "min_confidence": 0.35,
-    "anchor_classes": ["couch", "bed", "chair", "dining table", "tv"],
+    "anchor_classes": [
+      "couch",
+      "bed",
+      "chair",
+      "dining table",
+      "tv"
+    ],
     "iou_gate": 0.1,
     "centroid_gate_frac": 0.15,
     "confirm_hits": 3,
@@ -125,7 +137,7 @@
     "overlap_on_ratio": 0.3,
     "depth_agree_m": 0.7,
     "presence": {
-      "exit_edge_frac": 0.10,
+      "exit_edge_frac": 0.1,
       "exit_absent_s": 25.0,
       "presence_timeout_s": 300.0
     },
@@ -143,7 +155,10 @@
       "key_moments_per_digest": 3,
       "key_snapshot_retention_h": 24
     },
-    "snapshot_events": ["entered", "on"],
+    "snapshot_events": [
+      "entered",
+      "on"
+    ],
     "retention_days": 14,
     "max_snapshot_mb": 200,
     "agent": {
@@ -164,7 +179,9 @@
       "keep_alive": "0s",
       "timeout_s": 120,
       "crop_margin_frac": 0.15,
-      "caption_events": ["on"]
+      "caption_events": [
+        "on"
+      ]
     }
   },
   "logging": {

@@ -246,3 +246,18 @@ def make_scene_session_end_message(
             "session_meta": session_meta,
         },
     )
+
+
+def make_nav_query_message(
+    device_id: str,
+    clip_emb: list[float],
+    depth_center_m: float | None = None,
+) -> Message:
+    payload: dict[str, object] = {"clip_emb": clip_emb}
+    if depth_center_m is not None:
+        payload["depth_center_m"] = round(depth_center_m, 2)
+    return make_message(
+        device_id=device_id,
+        message_type="nav_query",
+        payload=payload,
+    )

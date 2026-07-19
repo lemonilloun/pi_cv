@@ -22,7 +22,7 @@ from mac_server.scene3d.session_io import SceneSession, list_sessions
 
 logger = logging.getLogger(__name__)
 
-STEP_ORDER = ["depth", "poses", "tsdf", "objects", "graph"]
+STEP_ORDER = ["depth", "poses", "tsdf", "objects", "graph", "navindex"]
 
 
 def _step_functions() -> dict[str, Callable]:
@@ -32,6 +32,7 @@ def _step_functions() -> dict[str, Callable]:
     from mac_server.scene3d.tsdf_step import run_tsdf_step
     from mac_server.scene3d.objects_step import run_objects_step
     from mac_server.scene3d.graph_step import run_graph_step
+    from mac_server.scene3d.navindex_step import run_navindex_step
 
     return {
         "depth": run_depth_step,
@@ -39,6 +40,7 @@ def _step_functions() -> dict[str, Callable]:
         "tsdf": run_tsdf_step,
         "objects": run_objects_step,
         "graph": run_graph_step,
+        "navindex": run_navindex_step,
     }
 
 
@@ -69,6 +71,42 @@ class ScenePipeline:
                 "error": self._job.get("error"),
                 "started_at": self._job.get("started_at"),
             }
+
+    def _resolve(self, session_id: str) -> SceneSession:
+        safe = "".join(c for c in session_id if c.isalnum() or c == "_")
+        session = SceneSession(self.sessions_dir / safe)
+        if not safe or not session.exists():
+            raise ValueError(f"Unknown session: {session_id}")
+        return session
+
+    def delete(self, session_id: str) -> dict[str, Any]:
+        import shutil
+
+        session = self._resolve(session_id)
+        with self._lock:
+            if (
+                self._thread is not None
+                and self._thread.is_alive()
+                and self._job is not None
+                and self._job.get("session_id") == session.session_id
+            ):
+                raise RuntimeError("A pipeline run is active on this session")
+        shutil.rmtree(session.root)
+        logger.info("Deleted scene session %s", session.session_id)
+        return {"deleted": session.session_id}
+
+    def rename(self, session_id: str, name: str) -> dict[str, Any]:
+        """Set the display name (kept in session_meta.json — the directory
+        name stays stable so artifacts and running jobs never break)."""
+        session = self._resolve(session_id)
+        name = name.strip()
+        if not name:
+            raise ValueError("Name must not be empty")
+        meta_path = session.root / "session_meta.json"
+        meta = session.session_meta()
+        meta["name"] = name
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return {"session_id": session.session_id, "name": name}
 
     def run(self, session_id: str, steps: list[str] | None = None, force: bool = False) -> dict[str, Any]:
         session = SceneSession(self.sessions_dir / session_id)

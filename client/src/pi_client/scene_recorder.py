@@ -69,7 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data/scene_sessions",
                         help="Local FALLBACK dir (used only when the uplink is down)")
     parser.add_argument("--intrinsics", type=Path, default=REPO_ROOT / "config/scene_intrinsics.json")
-    parser.add_argument("--seg-hef", type=Path, default=REPO_ROOT / "models/yolov8s_seg_h8.hef")
+    parser.add_argument("--seg-hef", type=Path, default=REPO_ROOT / "models/yolov8m_seg_h8.hef",
+                        help="yolov8m_seg (40.1 mask mAP); pass models/yolov8s_seg_h8.hef for speed")
     parser.add_argument("--clip-hef", type=Path, default=REPO_ROOT / "models/clip_resnet_50x4_h8.hef")
     parser.add_argument("--no-clip", action="store_true", help="Skip CLIP embeddings")
     parser.add_argument("--source", choices=["camera", "synthetic"], default="camera")

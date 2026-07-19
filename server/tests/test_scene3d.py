@@ -294,6 +294,79 @@ class SceneUplinkTcpTest(unittest.TestCase):
         self.assertFalse(uplink.healthy)
 
 
+class NavIndexTest(unittest.TestCase):
+    def _make_index(self, root: Path, session: str, embs, positions=None) -> None:
+        import numpy as np
+
+        derived = root / session / "derived"
+        derived.mkdir(parents=True, exist_ok=True)
+        n = len(embs)
+        np.savez_compressed(
+            derived / "place_index.npz",
+            kf=np.arange(1, n + 1, dtype=np.int32),
+            embs=np.asarray(embs, dtype=np.float16),
+            positions=np.asarray(positions if positions is not None else np.zeros((n, 3)), dtype=np.float32),
+            forwards=np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32),
+        )
+        (derived / "plan_frame.json").write_text(json.dumps({
+            "axis_a": [1, 0, 0], "up": [0, -1, 0], "axis_b": [0, 0, 1],
+            "origin": [-2.0, -2.0], "resolution_m": 0.1,
+            "grid_w": 40, "grid_h": 40,
+        }))
+        (root / session / "keyframes").mkdir(exist_ok=True)
+
+    def test_query_picks_right_room(self) -> None:
+        import numpy as np
+
+        from mac_server.scene3d import navindex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            e1 = np.eye(3, 8)[0]  # room A looks like [1,0,0,...]
+            e2 = np.eye(3, 8)[1]
+            self._make_index(root, "session_a", [e1, e1], positions=[[0, 0, 0], [1, 0, 1]])
+            self._make_index(root, "session_b", [e2])
+
+            result = navindex.query(root, list(e1 * 0.9 + e2 * 0.1))
+            self.assertTrue(result["located"])
+            self.assertEqual(result["best"]["session_id"], "session_a")
+            self.assertGreater(result["best"]["similarity"], 0.9)
+            self.assertIn("plan_frac", result["best"])
+            self.assertIn("heading_deg", result["best"])
+            # position (0/1,0,0/1) with origin -2, res 0.1, grid 40:
+            # frac = (x + 2) / 0.1 / 40
+            self.assertAlmostEqual(result["best"]["plan_frac"][0], 0.5, places=2)
+            self.assertEqual(navindex.get_last()["best"]["session_id"], "session_a")
+
+    def test_nav_query_handler_roundtrip(self) -> None:
+        import numpy as np
+
+        from mac_server.handlers import handle_message
+        from mac_server.scene3d import navindex
+        from pi_client.protocol import make_nav_query_message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / "received"
+            storage_dir.mkdir()
+            sessions = Path(tmp) / "scene_sessions"
+            emb = list(np.eye(1, 16)[0])
+            self._make_index(sessions, "session_x", [emb])
+
+            message = make_nav_query_message("pi", emb, depth_center_m=2.4)
+            response = handle_message(message, b"", storage_dir)
+            self.assertEqual(response.type, "nav_result")
+            self.assertTrue(response.payload["located"])
+            self.assertEqual(response.payload["best"]["session_id"], "session_x")
+            self.assertEqual(response.payload["depth_center_m"], 2.4)
+
+    def test_no_index_answer(self) -> None:
+        from mac_server.scene3d import navindex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = navindex.query(Path(tmp), [1.0] * 16)
+            self.assertFalse(result["located"])
+
+
 class SegDecodeTest(unittest.TestCase):
     def test_numpy_nms_suppresses_overlap(self) -> None:
         boxes = np.array([[0, 0, 10, 10], [1, 1, 11, 11], [50, 50, 60, 60]], dtype=float)

@@ -194,6 +194,9 @@ def _make_handler(
             if parsed.path == "/api/scene3d/status":
                 self._serve_scene_status()
                 return
+            if parsed.path == "/api/nav/last":
+                self._serve_nav_last()
+                return
             if parsed.path == "/scene3d/artifact":
                 self._serve_scene_artifact(parsed.query)
                 return
@@ -233,6 +236,12 @@ def _make_handler(
                 return
             if parsed.path == "/api/scene3d/run":
                 self._handle_scene_run()
+                return
+            if parsed.path == "/api/scene3d/delete":
+                self._handle_scene_delete()
+                return
+            if parsed.path == "/api/scene3d/rename":
+                self._handle_scene_rename()
                 return
             self._send_json({"error": "not found"}, status=404)
 
@@ -743,6 +752,44 @@ def _make_handler(
                 return
             self._send_json(result)
 
+        def _serve_nav_last(self) -> None:
+            try:
+                from mac_server.scene3d import navindex
+
+                self._send_json({"last": navindex.get_last()})
+            except Exception as exc:
+                self._send_json({"last": None, "error": str(exc)})
+
+        def _handle_scene_delete(self) -> None:
+            if self._scene_unavailable():
+                return
+            body = self._read_json_body()
+            if body is None or not body.get("session_id"):
+                self._send_json({"error": "session_id is required"}, status=400)
+                return
+            try:
+                result = scene_pipeline.delete(str(body["session_id"]))
+            except (ValueError, RuntimeError) as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._send_json(result)
+
+        def _handle_scene_rename(self) -> None:
+            if self._scene_unavailable():
+                return
+            body = self._read_json_body()
+            if body is None or not body.get("session_id"):
+                self._send_json({"error": "session_id is required"}, status=400)
+                return
+            try:
+                result = scene_pipeline.rename(
+                    str(body["session_id"]), str(body.get("name", ""))
+                )
+            except (ValueError, RuntimeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(result)
+
         _SCENE_ARTIFACTS = {
             "floor_plan.png": "image/png",
             "floor_plan_labeled.png": "image/png",
@@ -751,6 +798,7 @@ def _make_handler(
             "objects.json": "application/json",
             "scale_report.json": "application/json",
             "pipeline_state.json": "application/json",
+            "plan_frame.json": "application/json",
         }
 
         def _serve_scene_artifact(self, query: str) -> None:

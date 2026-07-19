@@ -161,6 +161,8 @@ def run_tsdf_step(
                 "axis_b": b.tolist(),
                 "origin": list(origin),
                 "resolution_m": resolution,
+                "grid_w": int(grid.shape[1]),
+                "grid_h": int(grid.shape[0]),
                 "floor_offset": float(np.percentile(np.asarray(mesh.vertices) @ up, 2)),
             }
         ),

@@ -19,7 +19,7 @@ from shared.messages import Message
 
 logger = logging.getLogger(__name__)
 
-QUIET_MESSAGE_TYPES = {"camera_stream_frame", "system_telemetry"}
+QUIET_MESSAGE_TYPES = {"camera_stream_frame", "system_telemetry", "nav_query", "scene_keyframe"}
 
 
 @dataclass
@@ -81,7 +81,31 @@ def handle_message(
             raise ValueError("storage_dir is required for scene messages")
         return _handle_scene_message(message, binary_payload, storage_dir)
 
+    if message.type == "nav_query":
+        if storage_dir is None:
+            raise ValueError("storage_dir is required for nav queries")
+        return _handle_nav_query(message, storage_dir)
+
     return make_ack_response(message)
+
+
+def _handle_nav_query(message: Message, storage_dir: Path) -> Message:
+    """Localize the Pi: match its live CLIP embedding against the place
+    indexes of all reconstructed sessions (scene3d/navindex)."""
+    from mac_server.scene3d import navindex
+
+    embedding = message.payload.get("clip_emb")
+    if not isinstance(embedding, list) or len(embedding) < 8:
+        raise ValueError("nav_query needs a clip_emb list")
+    result = navindex.query(storage_dir.parent / "scene_sessions", embedding)
+    depth = message.payload.get("depth_center_m")
+    if depth is not None:
+        result["depth_center_m"] = depth
+    return Message(
+        device_id="mac_server",
+        type="nav_result",
+        payload=result,
+    )
 
 
 # ------------------------------------------------------------- scene3d
