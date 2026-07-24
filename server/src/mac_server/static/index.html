@@ -1643,7 +1643,8 @@ async function pollNav() {
     const age = Math.max(0, Math.round(Date.now() / 1000 - last.at));
     if (age > 30) { line.textContent = ""; dot.style.display = "none"; return; }
     const room = best.name || best.session_id.replace("session_", "");
-    const heading = best.heading_deg !== undefined ? ` · heading ${best.heading_deg}°` : "";
+    const spread = best.heading_spread_deg !== undefined ? ` ±${best.heading_spread_deg}°` : "";
+    const heading = best.heading_deg !== undefined ? ` · heading ${best.heading_deg}°${spread}` : "";
     const depth = last.depth_center_m !== undefined ? ` · ahead ${last.depth_center_m}m` : "";
     line.textContent = `📍 ${room} · sim ${best.similarity}${heading}${depth} · ${age}s ago`;
     if (best.session_id === sceneState.selected && best.plan_frac) {

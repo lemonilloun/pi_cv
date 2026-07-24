@@ -158,7 +158,9 @@ def main() -> int:
                         f"sim {best['similarity']:.2f}",
                     ]
                     if heading is not None:
-                        parts.append(f"heading {heading:+.0f}°")
+                        spread = best.get("heading_spread_deg")
+                        trust = f" ±{spread:.0f}°" if spread is not None else ""
+                        parts.append(f"heading {heading:+.0f}°{trust}")
                     if depth_center is not None:
                         parts.append(f"ahead {depth_center:.1f}m")
                     logger.info("  ".join(parts))

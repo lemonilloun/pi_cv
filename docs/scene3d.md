@@ -28,7 +28,14 @@ processes it — no real-time constraint (2-3 fps recording is the target).
    top-down `floor_plan.png` (gravity ≈ mean camera-down)
 4. `objects` — per keyframe: mask + depth + pose → world points → DBSCAN;
    association into an object bank: Pi `track_id` prior, then DINOv2
-   cosine > 0.6 AND centroid < 0.5 m → `objects.json` + per-object `.ply`
+   cosine > 0.6 AND centroid < 0.5 m → `objects.json` + per-object `.ply`.
+   Two safety caps keep one bad detection from stalling the whole step for
+   minutes: a mask covering more than `max_mask_area_frac` (0.35) of the
+   frame is skipped outright (almost always a mis-segmented wall/floor,
+   not a bounded object), and any point cloud is randomly subsampled to
+   `dbscan_max_points` (8000) before clustering — DBSCAN's cost isn't
+   linear, so an oversized cloud can otherwise turn one detection into a
+   multi-minute stall that looks identical to a hang from the outside.
 5. `graph` — CLIP text encoder (**RN50x4/openai — must match the Pi hef**)
    vs ~70-word indoor vocabulary on the averaged Pi CLIP embeddings, COCO
    vote as prior; `near`/`on` edges from OBB geometry →
@@ -127,6 +134,30 @@ Scene tab shows the live fix (📍 line) and draws an oriented arrow on the
 floor plan when the located room is selected. This is retrieval-based
 place recognition — a coarse prior for the future navigation stack, not
 SLAM.
+
+**Why heading is the weak link, and what calibrated `scene_intrinsics.json`
+does and doesn't fix for it**: intrinsics feed pycolmap during the
+`poses` step, so a real calibration makes the *stored* pose of every
+keyframe in the index more accurate — but `pi_navigation` never computes a
+pose from the live frame at all. It's pure retrieval: the reported
+heading is borrowed from whichever indexed keyframe(s) had the most
+similar CLIP embedding. CLIP is deliberately somewhat viewpoint-invariant
+(good for "which room", bad for "which way") — the single-nearest-neighbor
+version of this borrowed the heading of just one match, so it could easily
+be wrong even in a well-calibrated, well-reconstructed session.
+`navindex.query()` now averages the top `intra_k` (default 7) most similar
+keyframes *within the winning session* with a proper circular mean
+(weighted by similarity), and reports `heading_spread_deg` — how much
+those neighbors actually agree. Low spread (a few degrees) means trust the
+heading; high spread (tens of degrees) means the match is genuinely
+ambiguous (e.g. a symmetric-looking spot, or the walkthrough never
+recorded that facing direction from nearby) and no amount of averaging
+fixes that — the real fix is recording with more angular variety (glance
+around while walking, not just straight ahead) so the index has more
+headings to draw from at every position. A true fix (feature-matching +
+PnP against the COLMAP sparse model, i.e. visual relocalization) would
+compute pose from the live frame directly instead of borrowing it, but
+that's a separate, heavier feature — not implemented yet.
 
 ## Session management
 

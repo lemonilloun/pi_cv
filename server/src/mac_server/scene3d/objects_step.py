@@ -198,13 +198,33 @@ def mask_to_world_points(
     return pts_cam @ R.T + t
 
 
-def largest_dbscan_cluster(points, eps: float = 0.05, min_points: int = 20):
-    """Keep the biggest DBSCAN cluster (drops depth-bleed outliers)."""
+def is_oversized_mask(mask_area: int, frame_area: int, max_frac: float) -> bool:
+    """A mask covering more than `max_frac` of the frame is almost
+    certainly a mis-segmented wall/floor/ceiling, not a bounded object."""
+    return frame_area > 0 and mask_area > max_frac * frame_area
+
+
+def largest_dbscan_cluster(
+    points, eps: float = 0.05, min_points: int = 20, max_points: int = 8000, rng=None
+):
+    """Keep the biggest DBSCAN cluster (drops depth-bleed outliers).
+
+    open3d's DBSCAN is CPU-only and its cost grows badly with point count —
+    a single mis-segmented mask (a wall/floor mistaken for one giant
+    "object") can produce tens of thousands of points and turn one
+    detection into a multi-minute stall that looks indistinguishable from a
+    hang from the outside. `max_points` bounds worst-case cost unconditionally:
+    a random subsample is enough to find the dominant cluster and estimate
+    its extent, we don't need every point."""
     import numpy as np
     import open3d as o3d
 
     if len(points) < min_points:
         return points
+    if len(points) > max_points:
+        rng = rng or np.random.default_rng(0)
+        idx = rng.choice(len(points), size=max_points, replace=False)
+        points = points[idx]
     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
     labels = np.asarray(pcd.cluster_dbscan(eps=eps, min_points=min_points))
     if labels.max() < 0:
@@ -219,6 +239,8 @@ def run_objects_step(
     repo_root: Path,
     progress: Callable[[str], None] = lambda msg: None,
 ) -> dict[str, Any]:
+    import time
+
     import cv2
     import numpy as np
     import open3d as o3d
@@ -226,6 +248,7 @@ def run_objects_step(
     obj_cfg = config.get("objects", {})
     intr = session.intrinsics(float(config.get("fallback_hfov_deg", 102.0)))
     poses = session.load_poses()
+    progress("loading DINOv2 (first run downloads it, cached after)")
     embedder = DinoEmbedder(device=str(obj_cfg.get("device", "mps")))
     bank = ObjectBank(
         dino_cos_min=float(obj_cfg.get("dino_cos_min", 0.6)),
@@ -234,8 +257,14 @@ def run_objects_step(
     stride = int(obj_cfg.get("point_stride", 4))
     eps = float(obj_cfg.get("dbscan_eps_m", 0.05))
     min_points = int(obj_cfg.get("dbscan_min_points", 20))
+    dbscan_max_points = int(obj_cfg.get("dbscan_max_points", 8000))
+    max_mask_area_frac = float(obj_cfg.get("max_mask_area_frac", 0.35))
+    rng = np.random.default_rng(0)
 
     frames = [kf for kf in session.keyframes() if kf.index in poses]
+    started = time.monotonic()
+    oversized_skipped = 0
+    detections_processed = 0
     for done, kf in enumerate(frames, 1):
         depth_path = session.depth_path(kf.index)
         if not depth_path.exists():
@@ -245,14 +274,26 @@ def run_objects_step(
         bgr = kf.rgb_bgr()
         meta = kf.meta()
         wfc = poses[kf.index]
+        frame_area = masks.shape[0] * masks.shape[1]
 
         for det in meta.get("detections", []):
             instance_id = det.get("instance_id")
             mask = masks == instance_id
-            if mask.sum() < 200:
+            mask_area = int(mask.sum())
+            if mask_area < 200:
+                continue
+            if is_oversized_mask(mask_area, frame_area, max_mask_area_frac):
+                # A mask covering a huge chunk of the frame is almost always
+                # a mis-segmented wall/floor/ceiling, not a bounded object —
+                # skip it outright rather than feeding a massive point cloud
+                # into DBSCAN (see largest_dbscan_cluster's max_points cap
+                # for the belt-and-suspenders version of this guard).
+                oversized_skipped += 1
                 continue
             points = mask_to_world_points(depth, mask, intr, wfc, stride=stride)
-            points = largest_dbscan_cluster(points, eps=eps, min_points=min_points)
+            points = largest_dbscan_cluster(
+                points, eps=eps, min_points=min_points, max_points=dbscan_max_points, rng=rng
+            )
             if len(points) < min_points:
                 continue
 
@@ -278,8 +319,15 @@ def run_objects_step(
                     "keyframe": kf.index,
                 }
             )
-        if done % 10 == 0 or done == len(frames):
-            progress(f"objects {done}/{len(frames)}")
+            detections_processed += 1
+        elapsed = time.monotonic() - started
+        rate = done / elapsed if elapsed > 0 else 0
+        eta_s = (len(frames) - done) / rate if rate > 0 else None
+        progress(
+            f"objects {done}/{len(frames)} keyframes "
+            f"({detections_processed} objects, {oversized_skipped} oversized masks skipped)"
+            + (f", ~{eta_s:.0f}s left" if eta_s is not None else "")
+        )
 
     objects = bank.finalize(min_observations=int(obj_cfg.get("min_observations", 3)))
 
@@ -308,6 +356,8 @@ def run_objects_step(
     report = {
         "objects": len(export),
         "classes": sorted({o["class_top"] for o in export}),
+        "detections_processed": detections_processed,
+        "oversized_masks_skipped": oversized_skipped,
     }
     logger.info("Objects step done: %s", report)
     return report
