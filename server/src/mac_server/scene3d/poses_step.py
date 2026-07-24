@@ -26,6 +26,72 @@ from mac_server.scene3d.session_io import SceneSession
 logger = logging.getLogger(__name__)
 
 
+def resolve_matching_mode(requested: str, num_frames: int, max_exhaustive: int) -> str:
+    """Resolve 'auto' to a concrete mode. Exhaustive matching closes loops
+    for free but is O(N^2), so 'auto' uses it up to max_exhaustive frames and
+    falls back to sequential+loop above that. Any explicit mode passes through."""
+    mode = str(requested or "auto").lower()
+    if mode != "auto":
+        return mode
+    return "exhaustive" if num_frames <= max_exhaustive else "sequential+loop"
+
+
+def _run_matching(
+    database: Path,
+    poses_cfg: dict[str, Any],
+    num_frames: int,
+    progress: Callable[[str], None],
+) -> str:
+    """Feature matching. Sequential-only matching never compares two
+    temporally-distant frames, so a loop (walk around the room and come
+    back) is never closed and the two ends of the trajectory drift apart
+    into separate sub-reconstructions. Exhaustive matching compares every
+    pair, so any revisit is found — affordable for a few hundred frames and
+    the single biggest lever on reconstruction quality here.
+
+    Returns the mode actually used (for the report)."""
+    import pycolmap
+
+    mode = resolve_matching_mode(
+        poses_cfg.get("matching_mode", "auto"),
+        num_frames,
+        int(poses_cfg.get("max_exhaustive_frames", 600)),
+    )
+
+    if mode == "exhaustive":
+        progress(f"colmap: exhaustive matching ({num_frames} frames, all pairs)")
+        pycolmap.match_exhaustive(database)
+        return "exhaustive"
+
+    # sequential, optionally with vocab-tree loop detection
+    progress("colmap: sequential matching")
+    pairing_options = pycolmap.SequentialPairingOptions()
+    pairing_options.overlap = int(poses_cfg.get("sequential_overlap", 10))
+
+    used = "sequential"
+    if mode == "sequential+loop":
+        vocab_tree = poses_cfg.get("vocab_tree_path")
+        have_tree = bool(vocab_tree) and Path(vocab_tree).expanduser().exists()
+        # loop_detection / vocab_tree_path exist only on pycolmap builds that
+        # support it; guard with hasattr so this degrades on older versions.
+        if have_tree and hasattr(pairing_options, "loop_detection"):
+            pairing_options.loop_detection = True
+            if hasattr(pairing_options, "vocab_tree_path"):
+                pairing_options.vocab_tree_path = str(Path(vocab_tree).expanduser())
+            used = "sequential+loop"
+            progress("colmap: sequential matching + vocab-tree loop detection")
+        else:
+            logger.warning(
+                "sequential+loop requested but no usable vocab tree "
+                "(poses.vocab_tree_path=%r) — falling back to plain sequential; "
+                "consider matching_mode=exhaustive for loop closure.",
+                vocab_tree,
+            )
+
+    pycolmap.match_sequential(database, pairing_options=pairing_options)
+    return used
+
+
 def median_scale(per_frame_scales: dict[int, float]) -> tuple[float, float, list[int]]:
     """Global scale from per-frame scales with MAD outlier rejection.
     Returns (scale, iqr_over_median, rejected_frames)."""
@@ -119,10 +185,7 @@ def run_poses_step(
         reader_options=reader_options,
     )
 
-    progress("colmap: sequential matching")
-    pairing_options = pycolmap.SequentialPairingOptions()
-    pairing_options.overlap = int(poses_cfg.get("sequential_overlap", 10))
-    pycolmap.match_sequential(database, pairing_options=pairing_options)
+    matching_used = _run_matching(database, poses_cfg, len(frames), progress)
 
     progress("colmap: incremental mapping")
     sparse_dir = colmap_dir / "sparse"
@@ -137,9 +200,20 @@ def run_poses_step(
             "COLMAP registered nothing — too little texture/overlap. "
             "Record slower with more overlap between views."
         )
+
+    # COLMAP returns one sub-reconstruction per connected component of the
+    # match graph. When a loop doesn't close, "before the turn" and "after
+    # the turn" land in separate components — we keep the largest and must
+    # NOT pretend the rest never existed (that's the "other side of the room
+    # vanished" symptom). Surface fragmentation loudly so it's actionable.
+    frags = sorted(
+        (r.num_reg_images() for r in reconstructions.values()), reverse=True
+    )
     rec = max(reconstructions.values(), key=lambda r: r.num_reg_images())
-    logger.info("COLMAP: %d/%d images registered, %d points",
-                rec.num_reg_images(), len(frames), rec.num_points3D())
+    logger.info(
+        "COLMAP: %d/%d images registered, %d points, %d sub-reconstruction(s) %s",
+        rec.num_reg_images(), len(frames), rec.num_points3D(), len(frags), frags,
+    )
 
     # ------------------------------------------------- scale alignment
     progress("aligning metric scale")
@@ -225,11 +299,25 @@ def run_poses_step(
         "registered_frac": round(registered_frac, 3),
         "scale": round(scale, 4),
         "scale_iqr_over_median": round(iqr_over_median, 3),
+        "matching": matching_used,
+        "sub_reconstructions": frags,
     }
+    warnings = []
     min_frac = float(poses_cfg.get("min_registered_frac", 0.5))
     if registered_frac < min_frac:
-        report["warning"] = (
+        warnings.append(
             f"Only {registered_frac:.0%} of keyframes registered (target ≥ {min_frac:.0%}) "
             "— bare walls/fast motion; the mesh will have holes."
         )
+    if len(frags) > 1:
+        dropped = sum(frags[1:])
+        warnings.append(
+            f"COLMAP split into {len(frags)} sub-reconstructions {frags}; kept the "
+            f"largest ({frags[0]} frames), dropped {dropped} frames in other pieces. "
+            "The loop didn't close — the dropped frames are a part of the room that "
+            "never stitched. Try matching_mode=exhaustive and re-record with a clear "
+            "return to the starting viewpoint."
+        )
+    if warnings:
+        report["warning"] = " ".join(warnings)
     return report

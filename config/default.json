@@ -86,6 +86,9 @@
       "device": "mps"
     },
     "poses": {
+      "matching_mode": "auto",
+      "max_exhaustive_frames": 600,
+      "vocab_tree_path": null,
       "sequential_overlap": 10,
       "min_registered_frac": 0.5
     },

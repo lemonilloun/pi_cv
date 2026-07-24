@@ -20,10 +20,25 @@ processes it — no real-time constraint (2-3 fps recording is the target).
 **Mac M2 (offline pipeline, `server/src/mac_server/scene3d/`):**
 1. `depth` — Depth Anything V2 **metric** (hypersim, vits) on MPS →
    `depth/<kf>.npy` in meters (~250 ms/frame)
-2. `poses` — pycolmap: SIFT → sequential matching → incremental mapping
-   (OPENCV camera model with the calibrated K + distortion), then **scale
-   alignment**: per-frame median(DAv2 depth / COLMAP sparse depth) →
-   global median with MAD rejection → metric `poses.json`
+2. `poses` — pycolmap: SIFT → matching → incremental mapping (OPENCV camera
+   model with the calibrated K + distortion), then **scale alignment**:
+   per-frame median(DAv2 depth / COLMAP sparse depth) → global median with
+   MAD rejection → metric `poses.json`.
+   **Matching mode** (`poses.matching_mode`, default `auto`) is the single
+   biggest quality lever. Sequential matching only compares frames that are
+   close *in time*, so walking a loop and returning never gets matched
+   across the loop — the trajectory drifts and splits into separate
+   sub-reconstructions (the classic "one side of the room reconstructs
+   great, the other side smears into the far wall or vanishes"). Exhaustive
+   matching compares every pair, so any revisit closes the loop; it's O(N²)
+   but cheap for a few hundred frames. `auto` = exhaustive up to
+   `max_exhaustive_frames` (600), else `sequential+loop`. Options:
+   `exhaustive` | `sequential` | `sequential+loop` (needs a COLMAP vocab
+   tree at `poses.vocab_tree_path`; falls back to plain sequential with a
+   warning if absent). COLMAP can still return >1 sub-reconstruction — the
+   step keeps the largest but reports all sizes in `sub_reconstructions` and
+   **warns loudly** when frames were dropped, instead of silently hiding the
+   unstitched part of the room.
 3. `tsdf` — Open3D ScalableTSDFVolume (voxel 2 cm) → `room_mesh.ply` +
    top-down `floor_plan.png` (gravity ≈ mean camera-down)
 4. `objects` — per keyframe: mask + depth + pose → world points → DBSCAN;
@@ -91,9 +106,51 @@ the recorder sees while you walk:
 
 The server host comes from `.env` (`PI_CV_SERVER_HOST=vedro.local`). If
 Wi-Fi drops mid-walk, affected keyframes are written locally under
-`data/scene_sessions/<id>/` and the recorder prints the exact rsync command
-to merge them afterwards (run it **from the Mac** — the Mac has no SSH
-server, so Pi→Mac rsync needs Remote Login enabled; Mac→Pi always works).
+`data/scene_sessions/<id>/`; sync them to the Mac with a `git pull` on the
+current branch (do **not** rsync/scp by hand).
+
+### How to record one room correctly
+
+The reconstruction is only as good as the camera path. COLMAP recovers pose
+from **parallax** (the apparent shift of features as the camera *translates*)
+and stitches the room by **matching the same place across time**. Every rule
+below serves one of those two needs.
+
+1. **Translate, don't pivot — especially in corners.** Pure rotation in place
+   gives zero parallax and poses degenerate; corners are where this bites
+   most. Take corners as a smooth *arc* (move forward while turning), never a
+   spin-on-the-spot. On the robot: prefer curved paths over rotate-then-go.
+2. **Close the loop, deliberately.** Walk the room as a loop and **return to
+   the exact starting spot facing the same way**, holding there a second or
+   two. That gives the matcher near-identical start/end frames to lock onto —
+   this is what stops "the far side of the room drifting into the opposite
+   wall." With `matching_mode=auto`/`exhaustive` the pipeline will find that
+   revisit; your job is to make sure it physically exists in the footage.
+3. **Overlap generously.** Consecutive keyframes must share a lot of view —
+   move slowly enough that neighbouring frames look ~70%+ the same. Rushing a
+   stretch breaks the chain and splits the reconstruction.
+4. **Slow down through turns and add frames there.** Turns are the weak point,
+   so give them the most coverage — glance around while arcing so several
+   keyframes see each new heading, rather than one blurry frame swinging past.
+5. **Vary your heading while moving** (glance left/right as you go). The
+   localization index can only report a facing direction it actually
+   recorded; a straight-ahead-only walk leaves heading ambiguous everywhere.
+6. **Keep the camera roughly level.** The floor plan assumes gravity ≈ mean
+   camera-down; a wildly tilting camera warps the top-down projection.
+7. **Fight motion blur.** The robot's jerky moves + low fps = smeared frames
+   that SIFT can't match on bare walls. Move as smoothly as the chassis
+   allows; if frames come out blurry, slow the traverse rather than raising
+   fps.
+8. **Give SIFT something to match.** Blank walls have no features. It's fine —
+   even helpful — for furniture, posters, clutter to be in frame; a room
+   that's all bare white walls is the hardest case.
+9. **Don't touch focus after calibration.** LensPosition is baked into the
+   intrinsics; changing it invalidates the calibrated K.
+
+After the run, check the `poses` result: `registered_frac` should be high
+(≥ ~0.8) and `sub_reconstructions` should be `[N]` — a single number. If you
+see `[80, 54]` (more than one piece), the loop didn't close: re-record with a
+cleaner return to the start, and confirm `matching_mode` is `auto`/`exhaustive`.
 
 **Process** — panel `Scene` tab (select session → Run pipeline) or CLI:
 

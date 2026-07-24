@@ -16,7 +16,11 @@ for entry in (str(REPO_ROOT), str(REPO_ROOT / "server/src"), str(REPO_ROOT / "cl
 
 import numpy as np
 
-from mac_server.scene3d.poses_step import frame_scale, median_scale
+from mac_server.scene3d.poses_step import (
+    frame_scale,
+    median_scale,
+    resolve_matching_mode,
+)
 from mac_server.scene3d.objects_step import (
     ObjectBank,
     cosine,
@@ -47,6 +51,21 @@ class ScaleTest(unittest.TestCase):
     def test_frame_scale_needs_enough_points(self) -> None:
         depth = np.full((10, 10), 3.0, dtype=np.float32)
         self.assertIsNone(frame_scale(depth, [(1.0, 1.0)], [1.0]))
+
+
+class MatchingModeTest(unittest.TestCase):
+    def test_auto_small_session_uses_exhaustive(self) -> None:
+        self.assertEqual(resolve_matching_mode("auto", 147, 600), "exhaustive")
+
+    def test_auto_large_session_falls_back_to_sequential_loop(self) -> None:
+        self.assertEqual(resolve_matching_mode("auto", 900, 600), "sequential+loop")
+
+    def test_auto_at_threshold_is_exhaustive(self) -> None:
+        self.assertEqual(resolve_matching_mode("auto", 600, 600), "exhaustive")
+
+    def test_explicit_mode_passes_through(self) -> None:
+        self.assertEqual(resolve_matching_mode("sequential", 100, 600), "sequential")
+        self.assertEqual(resolve_matching_mode("exhaustive", 5000, 600), "exhaustive")
 
 
 class ObjectBankTest(unittest.TestCase):
