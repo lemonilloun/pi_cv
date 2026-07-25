@@ -1750,6 +1750,12 @@ function renderSceneSessions() {
   loadSceneResults();
 }
 
+function escapeText(value) {
+  const node = document.createElement("span");
+  node.textContent = value == null ? "" : String(value);
+  return node.innerHTML;
+}
+
 function renderSceneStatus(status) {
   const stepsDiv = document.getElementById("sceneSteps");
   const session = sceneState.sessions.find((s) => s.session_id === (status.session_id || sceneState.selected));
@@ -1757,10 +1763,27 @@ function renderSceneStatus(status) {
   stepsDiv.innerHTML = SCENE_STEPS.map((step) => {
     const st = steps[step] || {};
     const cls = status.current_step === step ? "running" : (st.status || "");
-    const extra = st.status === "failed" ? ` — ${st.error}` :
-      (st.report && st.report.warning ? " ⚠" : "");
+    const report = st.report || {};
+    // Facts worth seeing without opening a JSON file: the ones that tell you
+    // whether this run is trustworthy at a glance.
+    const facts = [];
+    if (report.registered_frac !== undefined) facts.push(`${Math.round(report.registered_frac * 100)}% registered`);
+    if (report.sub_reconstructions && report.sub_reconstructions.length > 1) facts.push(`${report.sub_reconstructions.length} pieces`);
+    if (report.hfov_deg !== undefined) facts.push(`HFOV ${report.hfov_deg}°`);
+    if (report.bbox_extent_m) facts.push(`${report.bbox_extent_m.join(" × ")} m`);
+    if (report.depth_kept_frac) facts.push(`depth kept ${Math.round(report.depth_kept_frac * 100)}%`);
+    if (report.gravity_source) facts.push(`gravity: ${report.gravity_source}`);
+    if (report.objects !== undefined) facts.push(`${report.objects} objects`);
+    if (report.edges !== undefined) facts.push(`${report.edges} edges`);
+    const meta = [st.seconds ? st.seconds + "s" : "", facts.join(" · ")].filter(Boolean).join(" · ");
+    // A warning is actionable text, not a glyph — show it.
+    const note = st.status === "failed"
+      ? `<div style="font-size:12px;color:var(--critical);margin:2px 0 6px 4px">${escapeText(st.error || "")}</div>`
+      : (report.warning
+        ? `<div style="font-size:12px;color:var(--series-3);margin:2px 0 6px 4px">⚠ ${escapeText(report.warning)}</div>`
+        : "");
     return `<div><span class="step-chip ${cls}">${step}</span>` +
-      `<span style="font-size:12px;color:var(--muted)">${st.seconds ? st.seconds + "s" : ""}${extra}</span></div>`;
+      `<span style="font-size:12px;color:var(--muted)">${escapeText(meta)}</span></div>${note}`;
   }).join("");
   const progress = document.getElementById("sceneProgress");
   progress.textContent = status.running

@@ -155,7 +155,11 @@ class ScenePipeline:
 
             try:
                 started = time.time()
-                report = functions[step](session, self.config, self.repo_root, progress)
+                # Steps cache their own per-frame artifacts; they need to know
+                # a re-run was explicitly requested, otherwise --force only
+                # re-enters the step and every cached file short-circuits it.
+                step_config = {**self.config, "force": bool(job["force"])}
+                report = functions[step](session, step_config, self.repo_root, progress)
                 with self._lock:
                     job["steps"][step] = {
                         "status": "done",

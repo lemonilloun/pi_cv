@@ -39,11 +39,55 @@ processes it — no real-time constraint (2-3 fps recording is the target).
    step keeps the largest but reports all sizes in `sub_reconstructions` and
    **warns loudly** when frames were dropped, instead of silently hiding the
    unstitched part of the room.
-3. `tsdf` — Open3D ScalableTSDFVolume (voxel 2 cm) → `room_mesh.ply` +
-   top-down `floor_plan.png` (gravity ≈ mean camera-down)
-4. `objects` — per keyframe: mask + depth + pose → world points → DBSCAN;
-   association into an object bank: Pi `track_id` prior, then DINOv2
-   cosine > 0.6 AND centroid < 0.5 m → `objects.json` + per-object `.ply`.
+   COLMAP runs **single-threaded** (`poses.colmap_num_threads`, default 1):
+   torch and pycolmap each ship their own `libomp.dylib`, the server sets
+   `KMP_DUPLICATE_LIB_OK=TRUE` so both load, and multi-threaded bundle
+   adjustment then deadlocks against torch's OpenMP runtime (the process
+   parks at ~0% CPU mid-`poses`, no output). Single-threaded is slower but
+   doesn't hang; only raise it in an environment with a single shared libomp.
+   **The camera bundle adjustment converges on is saved** to
+   `derived/intrinsics_refined.json` and embedded in `poses.json`, and every
+   later step reads it via `SceneSession.active_intrinsics()`. This matters
+   more than it sounds: when the session has no calibration, COLMAP is
+   allowed to refine the focal length, so the poses are expressed in terms of
+   the *refined* camera. Unprojecting depth with the original guess then
+   reconstructs a different camera than the poses describe. On
+   session_20260724_144728 the gap was fx 622 (the old 102° fallback) versus
+   fx 989 (what BA measured, HFOV 75.7° — DA3 independently estimated 74.4°),
+   and the mesh came out 12 × 15 m for a room the camera crossed in 2 × 4 m.
+   The step reports `hfov_deg` / `hfov_deg_assumed` and warns when BA had to
+   move the focal length more than 10%.
+3. `tsdf` — depth hygiene, then Open3D ScalableTSDFVolume (voxel 2 cm) →
+   `room_mesh.ply` + carved `floor_plan.png` + `occupancy.npz`:
+   - **filtering** (`depth_filter.py`) writes `derived/depth_filtered/` once,
+     shared with the objects step so mesh and objects come from the same
+     geometry. Two filters: *flying pixels* (surfaces seen too edge-on to be
+     real — these are the radial streaks the old plan was made of) and
+     *multi-view consistency* (a point must be confirmed by ≥ 2 neighbouring
+     keyframes' own depth). Measured on a real session: 84.9% of pixels kept,
+     1.9% flying, 12.6% inconsistent.
+   - **adaptive truncation** replaces the fixed 5 m cutoff with the 98th
+     percentile of surviving depth (4.19 m on that session). A 5 m cutoff
+     around a 3.9 m camera path permits a ~14 m mesh by construction.
+   - **mesh cleanup**: components below `min_component_triangles` (800) are
+     dropped, then optional decimation to `decimate_triangles`.
+   - **gravity** from a RANSAC floor-plane fit (`occupancy.py`), not the
+     average camera-down axis — so a tilted camera no longer tilts the plan.
+     Reported as `gravity_source`: `imu` > `floor_fit` > `camera_average`.
+   - **the plan is carved, not histogrammed**: each depth ray marks the space
+     between camera and surface FREE, the surface OCCUPIED, beyond it
+     UNKNOWN. That is what produces walls and traversable floor instead of a
+     density cloud, and it's the form a navigation consumer actually wants.
+4. `objects` — per keyframe: mask + **filtered** depth + pose → world points →
+   DBSCAN; association into an object bank: Pi `track_id` prior (now
+   geometry-checked, because the Pi reuses ids), same-class gate, and a
+   centroid gate that **grows with the object** (a 2 m sofa's two views are
+   further apart than any fixed 0.5 m threshold). Boxes are **yaw-only,
+   gravity-aligned** — free 3-DoF PCA on a partially-seen object was how a
+   bed came out 0.09 m thick. Each object carries a `size_verdict`
+   (`ok`/`too_large`/`too_small`) from a per-class plausibility table;
+   implausible ones are flagged, not deleted, and skipped when building graph
+   edges. → `objects.json` + per-object `.ply`.
    Two safety caps keep one bad detection from stalling the whole step for
    minutes: a mask covering more than `max_mask_area_frac` (0.35) of the
    frame is skipped outright (almost always a mis-segmented wall/floor,
@@ -53,8 +97,10 @@ processes it — no real-time constraint (2-3 fps recording is the target).
    multi-minute stall that looks identical to a hang from the outside.
 5. `graph` — CLIP text encoder (**RN50x4/openai — must match the Pi hef**)
    vs ~70-word indoor vocabulary on the averaged Pi CLIP embeddings, COCO
-   vote as prior; `near`/`on` edges from OBB geometry →
-   `scene_graph.json` + `floor_plan_labeled.png`
+   vote as prior; `near` edges now measure the gap between OBB **surfaces**
+   rather than between centroids (a lamp touching a 2 m sofa is 1 m from its
+   centre — the old rule produced 4 edges for 10 objects), `on` uses the
+   box's vertical axis → `scene_graph.json` + `floor_plan_labeled.png`
 
 ## The data contract (session directory)
 
@@ -68,9 +114,13 @@ data/scene_sessions/session_YYYYMMDD_HHMMSS/
 │   └── meta.json            # detections: instance_id, track_id,
 │                            #   class_coco, confidence, bbox_xyxy,
 │                            #   clip_emb (640 floats, L2-normalized)
+│                            # optional: gravity [x,y,z] in the CAMERA frame
 └── derived/                 # everything the Mac pipeline produces
-    ├── depth/  colmap/  poses.json  scale_report.json
+    ├── depth/  depth_filtered/  colmap/  poses.json  scale_report.json
+    ├── intrinsics_refined.json  # the camera COLMAP's BA converged on
     ├── room_mesh.ply  floor_plan.png  floor_plan_labeled.png
+    ├── occupancy.npz        # grid (0 unknown / 1 free / 2 occupied) + walls
+    ├── plan_frame.json      # up, axes, origin, resolution, gravity_source
     ├── objects.json  objects_pcd/  scene_graph.json
     └── pipeline_state.json  # per-step status for the panel
 ```
@@ -78,6 +128,14 @@ data/scene_sessions/session_YYYYMMDD_HHMMSS/
 `masks.png` is at rgb.jpg resolution (nearest-neighbor upscale from the
 640×640 inference); `instance_id` links pixels to `meta.json` entries;
 `track_id` is session-wide. Everything the Mac needs is this directory.
+
+`meta.json`'s **`gravity`** field is the IMU seam. It is absent today and
+absent-by-design in every session recorded before the sensor is fitted; when
+present it is the accelerometer vector in the camera frame, and
+`SceneSession.imu_up_vector()` rotates it into world space for
+`occupancy.estimate_gravity()`, which prefers it over the floor fit. Fitting
+the IMU means setting `SceneRecorder.gravity_source` to an object with a
+`.read()` — no pipeline change.
 
 ## Workflow (who runs what)
 
@@ -100,7 +158,9 @@ the recorder sees while you walk:
 
 ```bash
 ./scripts/run_scene_recorder.sh          # Ctrl+C to stop
-# useful flags: --fps 3 --keyframe-interval 0.5 --no-clip --no-preview
+# useful flags: --fps 3 --no-clip --no-preview
+# keyframe selection: --keyframe-shift-px 12 --keyframe-min-interval 0.2
+#                     --keyframe-max-interval 3.0 --blur-threshold 100
 # --offline reverts to local-disk recording (old behavior)
 ```
 
@@ -135,8 +195,16 @@ below serves one of those two needs.
 5. **Vary your heading while moving** (glance left/right as you go). The
    localization index can only report a facing direction it actually
    recorded; a straight-ahead-only walk leaves heading ambiguous everywhere.
-6. **Keep the camera roughly level.** The floor plan assumes gravity ≈ mean
-   camera-down; a wildly tilting camera warps the top-down projection.
+6. **Tilt the camera up 15–25°.** On a low robot chassis this is the single
+   highest-value change available, and it is worth more than any model swap:
+   a floor-level camera fills the frame with floor and skirting boards, which
+   is both featureless for SIFT and far outside the distribution metric depth
+   was trained on (human eye height, furniture in view). Tilting up puts the
+   room and its furniture in frame instead. Height being fixed on the mount is
+   fine — tilt is the degree of freedom that matters. Roll should stay near
+   zero, but pitch no longer has to: the pipeline now fits gravity from the
+   floor plane (and will use the IMU when fitted) instead of assuming the
+   camera is level.
 7. **Fight motion blur.** The robot's jerky moves + low fps = smeared frames
    that SIFT can't match on bare walls. Move as smoothly as the chassis
    allows; if frames come out blurry, slow the traverse rather than raising

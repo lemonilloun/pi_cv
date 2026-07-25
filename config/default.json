@@ -77,7 +77,7 @@
   },
   "scene3d": {
     "sessions_dir": "data/scene_sessions",
-    "fallback_hfov_deg": 102.0,
+    "fallback_hfov_deg": 75.0,
     "depth": {
       "model_path": "models/depth_anything_v2_metric_hypersim_vitb.pth",
       "encoder": "vitb",
@@ -90,18 +90,25 @@
       "max_exhaustive_frames": 600,
       "vocab_tree_path": null,
       "sequential_overlap": 10,
+      "colmap_num_threads": 1,
       "min_registered_frac": 0.5
     },
     "tsdf": {
       "voxel_m": 0.02,
       "sdf_trunc_m": 0.08,
       "depth_trunc_m": 5.0,
-      "mask_edge_erode_px": 6,
-      "plan_resolution_m": 0.03,
+      "plan_resolution_m": 0.04,
       "plan_height_band_m": [
         0.15,
         1.9
-      ]
+      ],
+      "trunc_percentile": 98.0,
+      "min_component_triangles": 800,
+      "decimate_triangles": 400000,
+      "plan_point_stride": 6,
+      "plan_min_hits": 3,
+      "plan_min_free": 2,
+      "wall_min_cells": 12
     },
     "objects": {
       "device": "mps",
@@ -112,13 +119,24 @@
       "dbscan_min_points": 20,
       "dbscan_max_points": 8000,
       "max_mask_area_frac": 0.35,
-      "point_stride": 4
+      "point_stride": 4,
+      "class_gate": true,
+      "size_gate_factor": 0.5,
+      "max_depth_m": 6.0,
+      "mask_fill": "none"
     },
     "graph": {
       "clip_text_model": "RN50x4-quickgelu",
       "clip_text_pretrained": "openai",
       "near_max_m": 0.5,
       "on_gap_m": 0.08
+    },
+    "filter": {
+      "max_angle_deg": 85.0,
+      "neighbour_views": 6,
+      "min_views": 2,
+      "rel_tol": 0.06,
+      "hard_max_depth_m": 8.0
     }
   },
   "monitoring": {

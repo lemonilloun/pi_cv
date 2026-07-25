@@ -77,10 +77,11 @@ class SceneSession:
             return json.loads(path.read_text(encoding="utf-8"))
         return {}
 
-    def intrinsics(self, fallback_hfov_deg: float = 102.0) -> dict[str, Any]:
-        """Calibrated intrinsics, or a FOV-based estimate when the session
-        was recorded before calibration (flagged `estimated: true` — good
-        enough to exercise the pipeline, not for metric accuracy)."""
+    def intrinsics(self, fallback_hfov_deg: float = 75.0) -> dict[str, Any]:
+        """As-recorded intrinsics: the Pi's calibration, or a FOV-based
+        estimate when the session predates calibration (flagged
+        `estimated: true`). This is the *input* to SfM — everything
+        downstream of the poses step wants `active_intrinsics()` instead."""
         path = self.root / "intrinsics.json"
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
@@ -105,6 +106,37 @@ class SceneSession:
             "fallback_hfov_deg": fallback_hfov_deg,
         }
 
+    def refined_intrinsics(self) -> dict[str, Any] | None:
+        """The camera COLMAP's bundle adjustment converged on, if the poses
+        step has run. None before that."""
+        path = self.refined_intrinsics_path()
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def active_intrinsics(self, fallback_hfov_deg: float = 75.0) -> dict[str, Any]:
+        """The camera every step *after* `poses` must use.
+
+        The poses step hands COLMAP a starting camera and lets bundle
+        adjustment refine the focal length whenever the calibration was only
+        estimated. The resulting poses are expressed in terms of the
+        *refined* camera, so unprojecting depth with the original estimate
+        reconstructs a different camera than the one the poses describe —
+        the geometry is then internally inconsistent no matter how good the
+        depth model is. (Measured on session_20260724_144728: BA converged on
+        fx=989 while the 102-degree fallback assumed fx=622, a 59% mismatch,
+        and the mesh spanned 12x15 m for a room the camera crossed in 2x4 m.)
+
+        So: refined if we have it, as-recorded otherwise.
+        """
+        refined = self.refined_intrinsics()
+        if refined:
+            return refined
+        return self.intrinsics(fallback_hfov_deg)
+
     # ----------------------------------------------------------- derived
 
     def depth_dir(self) -> Path:
@@ -112,6 +144,18 @@ class SceneSession:
 
     def depth_path(self, index: int) -> Path:
         return self.depth_dir() / f"{index:06d}.npy"
+
+    def depth_filtered_dir(self) -> Path:
+        return self.derived / "depth_filtered"
+
+    def depth_filtered_path(self, index: int) -> Path:
+        return self.depth_filtered_dir() / f"{index:06d}.npy"
+
+    def refined_intrinsics_path(self) -> Path:
+        return self.derived / "intrinsics_refined.json"
+
+    def occupancy_path(self) -> Path:
+        return self.derived / "occupancy.npz"
 
     def colmap_dir(self) -> Path:
         return self.derived / "colmap"
@@ -142,6 +186,51 @@ class SceneSession:
 
     def state_path(self) -> Path:
         return self.derived / "pipeline_state.json"
+
+    def imu_up_vector(self, poses: dict[int, Any] | None = None):
+        """World-space up from the recorder's IMU, or None when absent.
+
+        The seam for S6. Each keyframe's meta.json may carry
+        ``"gravity": [x, y, z]`` — the accelerometer vector in the *camera*
+        frame, pointing down. Rotating each one into world space with that
+        keyframe's pose and averaging gives a gravity direction that does
+        not care how the camera was tilted, which is exactly what the naive
+        camera-average estimate cannot do.
+
+        Sessions recorded before the IMU exists simply have no such field
+        and this returns None, so the contract is backwards compatible and
+        `occupancy.estimate_gravity` falls through to the floor fit.
+        """
+        import numpy as np
+
+        if poses is None:
+            if not self.poses_path().exists():
+                return None
+            poses = self.load_poses()
+
+        downs = []
+        for kf in self.keyframes():
+            if kf.index not in poses:
+                continue
+            try:
+                gravity = kf.meta().get("gravity")
+            except (OSError, ValueError):
+                continue
+            if not gravity or len(gravity) != 3:
+                continue
+            vec = np.asarray(gravity, dtype=np.float64)
+            norm = np.linalg.norm(vec)
+            if norm < 1e-6:
+                continue
+            downs.append(np.asarray(poses[kf.index])[:3, :3] @ (vec / norm))
+
+        if not downs:
+            return None
+        mean = np.mean(downs, axis=0)
+        norm = np.linalg.norm(mean)
+        if norm < 1e-6:
+            return None
+        return -(mean / norm)
 
     def load_poses(self) -> dict[int, Any]:
         """poses.json -> {keyframe_index: 4x4 world_from_cam (metric)}."""

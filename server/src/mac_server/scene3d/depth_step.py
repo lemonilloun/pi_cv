@@ -7,6 +7,7 @@ Writes derived/depth/<idx>.npy (float32 meters) + a small preview png.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -44,12 +45,37 @@ def run_depth_step(
 
     out_dir = session.depth_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Which model produced the cache. Depth maps are expensive, so they are
+    # reused across runs — but reusing maps computed by a *different* model
+    # is silently wrong, and swapping the encoder (vits -> vitb) used to
+    # leave the whole session on the old depth with no indication.
+    signature = {
+        "model_path": str(model_path),
+        "encoder": str(depth_cfg.get("encoder", "vits")),
+        "input_size": int(depth_cfg.get("input_size", 518)),
+        "max_depth_m": float(depth_cfg.get("max_depth_m", 20.0)),
+    }
+    signature_path = out_dir / "depth_meta.json"
+    previous = None
+    if signature_path.exists():
+        try:
+            previous = json.loads(signature_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
+    recompute = bool(config.get("force")) or (previous is not None and previous != signature)
+    if recompute and previous != signature and previous is not None:
+        logger.warning(
+            "Depth cache was produced by %s — recomputing with %s",
+            previous.get("encoder"), signature["encoder"],
+        )
+
     frames = session.keyframes()
     done = 0
     total_ms = 0.0
     for kf in frames:
         out_path = session.depth_path(kf.index)
-        if out_path.exists():
+        if out_path.exists() and not recompute:
             done += 1
             continue
         depth, ms = model.infer_bgr(kf.rgb_bgr())
@@ -63,10 +89,12 @@ def run_depth_step(
         if done % 10 == 0 or done == len(frames):
             progress(f"depth {done}/{len(frames)}")
     model.clear_device_cache()
+    signature_path.write_text(json.dumps(signature, indent=1), encoding="utf-8")
 
     report = {
         "frames": len(frames),
         "avg_ms": round(total_ms / max(1, done), 1) if total_ms else None,
+        "recomputed": recompute,
     }
     logger.info("Depth step done: %s", report)
     return report

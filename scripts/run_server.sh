@@ -11,5 +11,7 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 # torch/opencv/pycolmap/open3d each bundle their own libomp.dylib on macOS;
 # loading two copies in one process makes the OpenMP runtime abort() by
 # design (scene3d poses step: pycolmap init after torch/open3d are resident).
+# This flag lets both load; the matching runtime deadlock is then avoided by
+# running COLMAP single-threaded (poses_step.py: colmap_num_threads).
 export KMP_DUPLICATE_LIB_OK=TRUE
 exec python3 -m mac_server.server "$@"

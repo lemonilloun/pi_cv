@@ -93,40 +93,81 @@ def obb_top_bottom(obb: dict[str, Any], up) -> tuple[float, float]:
     return float(heights.max()), float(heights.min())
 
 
+def obb_support(obb: dict[str, Any], direction) -> float:
+    """Half-width of the box along a unit direction (its support function)."""
+    import numpy as np
+
+    rotation = np.asarray(obb["rotation"])  # columns are the box axes
+    half = np.asarray(obb["extent"], dtype=np.float64) / 2.0
+    return float(np.sum(np.abs(rotation.T @ np.asarray(direction)) * half))
+
+
+def obb_gap_m(a: dict[str, Any], b: dict[str, Any]) -> float:
+    """Distance between two boxes' *surfaces* along the line joining them.
+
+    Centroid distance is the wrong measure for furniture: a lamp standing
+    against a 2 m sofa is 1 m from its centre and touching its side. With a
+    0.5 m centroid threshold that room produced 1 and 4 `near` edges for 8
+    and 10 objects — almost no graph at all. Surface gap is what "near"
+    means to anyone reading the graph.
+    """
+    import numpy as np
+
+    ca = np.asarray(a["centroid"], dtype=np.float64)
+    cb = np.asarray(b["centroid"], dtype=np.float64)
+    delta = cb - ca
+    length = float(np.linalg.norm(delta))
+    if length < 1e-9:
+        return 0.0
+    if not a.get("obb") or not b.get("obb"):
+        return length
+    direction = delta / length
+    return max(0.0, length - obb_support(a["obb"], direction)
+               - obb_support(b["obb"], direction))
+
+
+def horizontal_half_extent(obb: dict[str, Any]) -> float:
+    """Half-footprint of a gravity-aligned box (its first two axes are
+    horizontal by construction; the third is vertical)."""
+    extent = obb["extent"]
+    return max(float(extent[0]), float(extent[1])) / 2.0
+
+
 def build_edges(
     objects: list[dict[str, Any]],
     up,
     near_max_m: float = 0.5,
     on_gap_m: float = 0.08,
+    skip_implausible: bool = True,
 ) -> list[dict[str, Any]]:
     import numpy as np
 
     edges = []
     up = np.asarray(up)
-    for i, a in enumerate(objects):
-        for j, b in enumerate(objects):
-            if i >= j:
-                continue
-            ca, cb = np.asarray(a["centroid"]), np.asarray(b["centroid"])
-            dist = float(np.linalg.norm(ca - cb))
-            if dist < near_max_m:
+    usable = [
+        o for o in objects
+        if not (skip_implausible and o.get("size_verdict") in ("too_large", "too_small"))
+    ]
+    for i, a in enumerate(usable):
+        for b in usable[i + 1:]:
+            gap = obb_gap_m(a, b)
+            if gap < near_max_m:
                 edges.append(
                     {
                         "src": a["object_id"], "dst": b["object_id"],
-                        "relation": "near", "distance_m": round(dist, 2),
+                        "relation": "near", "distance_m": round(gap, 2),
                     }
                 )
-        for j, b in enumerate(objects):
-            if i == j or not a.get("obb") or not b.get("obb"):
+    for a in usable:
+        for b in usable:
+            if a is b or not a.get("obb") or not b.get("obb"):
                 continue
-            a_top, a_bottom = obb_top_bottom(a["obb"], up)
+            _, a_bottom = obb_top_bottom(a["obb"], up)
             b_top, _ = obb_top_bottom(b["obb"], up)
-            horizontal = np.linalg.norm(
-                (np.asarray(a["centroid"]) - np.asarray(b["centroid"]))
-                - ((np.asarray(a["centroid"]) - np.asarray(b["centroid"])) @ up) * up
-            )
-            max_half = max(b["obb"]["extent"]) / 2.0
-            if abs(a_bottom - b_top) <= on_gap_m and horizontal <= max_half:
+            offset = np.asarray(a["centroid"]) - np.asarray(b["centroid"])
+            horizontal = float(np.linalg.norm(offset - (offset @ up) * up))
+            if (abs(a_bottom - b_top) <= on_gap_m
+                    and horizontal <= horizontal_half_extent(b["obb"])):
                 edges.append(
                     {"src": a["object_id"], "dst": b["object_id"], "relation": "on"}
                 )

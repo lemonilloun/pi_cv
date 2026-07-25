@@ -78,7 +78,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1536)
     parser.add_argument("--height", type=int, default=864)
     parser.add_argument("--fps", type=float, default=3.0, help="Capture/inference loop rate")
-    parser.add_argument("--keyframe-interval", type=float, default=0.5, help="Min seconds between keyframes")
+    # Keyframes are chosen by parallax, not by the clock — see KeyframeSelector.
+    parser.add_argument("--keyframe-min-interval", type=float, default=0.2,
+                        help="Never emit keyframes faster than this")
+    parser.add_argument("--keyframe-max-interval", type=float, default=3.0,
+                        help="Emit anyway after this long, even without motion")
+    parser.add_argument("--keyframe-shift-px", type=float, default=12.0,
+                        help="Median feature displacement (in a 480x270 image) "
+                             "that counts as a genuinely new viewpoint")
     parser.add_argument("--blur-threshold", type=float, default=100.0, help="Variance-of-Laplacian gate")
     parser.add_argument("--confidence", type=float, default=0.4)
     parser.add_argument("--max-detections", type=int, default=30)
@@ -108,6 +115,64 @@ def variance_of_laplacian(gray: np.ndarray) -> float:
     import cv2
 
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+class KeyframeSelector:
+    """Decides which captured frames become keyframes.
+
+    The old rule was "every 0.5 s if not blurred", which gets both ends
+    wrong on a robot that stops and starts: standing still emits a stream of
+    near-identical frames (zero baseline — nothing to triangulate, and SfM
+    pays O(N^2) for them anyway), while a fast pan leaves a gap wide enough
+    that feature matching cannot bridge it.
+
+    What actually matters for reconstruction is *parallax*: how far the
+    scene has shifted since the last keyframe. So the rule is:
+
+      * emit when the image has moved by `min_shift_px` since the last
+        keyframe (real new viewpoint), or when `max_interval_s` has passed
+        anyway (so a stationary robot still records something);
+      * never emit blurrier than `blur_threshold`;
+      * never emit faster than `min_interval_s`.
+
+    Keeping the decision separate from the flow computation makes it
+    unit-testable without a camera.
+    """
+
+    def __init__(
+        self,
+        min_interval_s: float = 0.2,
+        max_interval_s: float = 3.0,
+        min_shift_px: float = 12.0,
+        blur_threshold: float = 100.0,
+    ) -> None:
+        self.min_interval_s = min_interval_s
+        self.max_interval_s = max_interval_s
+        self.min_shift_px = min_shift_px
+        self.blur_threshold = blur_threshold
+
+    def decide(
+        self,
+        elapsed_s: float,
+        shift_px: float | None,
+        sharpness: float,
+        is_first: bool = False,
+    ) -> tuple[bool, str]:
+        """Returns (emit, reason) — the reason goes into the log so a
+        disappointing session can be explained after the fact."""
+        if is_first:
+            return (sharpness >= self.blur_threshold, "first")
+        if elapsed_s < self.min_interval_s:
+            return False, "too_soon"
+        if sharpness < self.blur_threshold:
+            return False, "blurred"
+        if elapsed_s >= self.max_interval_s:
+            return True, "interval"
+        if shift_px is None:
+            return True, "no_flow"
+        if shift_px >= self.min_shift_px:
+            return True, "parallax"
+        return False, "no_parallax"
 
 
 class SceneUplink:
@@ -306,9 +371,20 @@ class SceneRecorder:
             ),
             excluded_classes=set(),
         )
+        self.selector = KeyframeSelector(
+            min_interval_s=args.keyframe_min_interval,
+            max_interval_s=args.keyframe_max_interval,
+            min_shift_px=args.keyframe_shift_px,
+            blur_threshold=args.blur_threshold,
+        )
+        # Set to an object with .read() -> [x, y, z] (gravity in the camera
+        # frame) once an IMU is fitted; see _emit_keyframe.
+        self.gravity_source = None
         self._keyframe_index = 0
         self._local_keyframes = 0
         self._last_keyframe_at = 0.0
+        self._last_keyframe_gray: np.ndarray | None = None
+        self._select_reasons: dict[str, int] = {}
         self._frame_index = 0
         self._started_at = time.time()
         self._stop = False
@@ -391,16 +467,51 @@ class SceneRecorder:
         if self.uplink is not None and not self.args.no_preview:
             self._send_preview(bgr, detections)
 
+    def _image_shift_px(self, gray: np.ndarray) -> float | None:
+        """Median feature displacement since the last keyframe, in pixels of
+        the downscaled gray image — a pose-free stand-in for parallax.
+
+        Sparse LK on a 480x270 image costs a couple of milliseconds, which
+        is nothing next to segmentation, and it is the only signal available
+        on the Pi for "has the viewpoint actually changed".
+        """
+        cv2 = self._cv2
+        previous = self._last_keyframe_gray
+        if previous is None or previous.shape != gray.shape:
+            return None
+        points = cv2.goodFeaturesToTrack(
+            previous, maxCorners=200, qualityLevel=0.01, minDistance=8
+        )
+        if points is None or len(points) < 12:
+            return None
+        moved, status, _ = cv2.calcOpticalFlowPyrLK(previous, gray, points, None)
+        if moved is None or status is None:
+            return None
+        ok = status.reshape(-1) == 1
+        if ok.sum() < 12:
+            return None
+        deltas = moved.reshape(-1, 2)[ok] - points.reshape(-1, 2)[ok]
+        return float(np.median(np.linalg.norm(deltas, axis=1)))
+
     def _is_keyframe(self, bgr: np.ndarray, now: float) -> bool:
-        if now - self._last_keyframe_at < self.args.keyframe_interval:
-            return False
         cv2 = self._cv2
         gray = cv2.cvtColor(cv2.resize(bgr, (480, 270)), cv2.COLOR_BGR2GRAY)
-        blur = variance_of_laplacian(gray)
-        if blur < self.args.blur_threshold:
-            logger.debug("Skipping blurred frame (VoL %.1f)", blur)
-            return False
-        return True
+        sharpness = variance_of_laplacian(gray)
+        shift = self._image_shift_px(gray)
+        emit, reason = self.selector.decide(
+            elapsed_s=now - self._last_keyframe_at,
+            shift_px=shift,
+            sharpness=sharpness,
+            is_first=self._last_keyframe_gray is None,
+        )
+        self._select_reasons[reason] = self._select_reasons.get(reason, 0) + 1
+        if emit:
+            self._last_keyframe_gray = gray
+            logger.debug(
+                "keyframe accepted (%s): shift %s px, VoL %.0f",
+                reason, "n/a" if shift is None else f"{shift:.1f}", sharpness,
+            )
+        return emit
 
     # ------------------------------------------------------------- output
 
@@ -454,6 +565,17 @@ class SceneRecorder:
             "timestamp_ns": int(now * 1e9),
             "detections": meta_dets,
         }
+        # IMU seam. `self.gravity_source` is None until the accelerometer is
+        # fitted; when it exists it returns the gravity vector in the CAMERA
+        # frame (pointing down), and the Mac side is already waiting for it —
+        # SceneSession.imu_up_vector() rotates it into world space and
+        # occupancy.estimate_gravity() prefers it over the floor fit. Adding
+        # the sensor is therefore a change to this one attribute, not to the
+        # pipeline, and old sessions without the field keep working.
+        if self.gravity_source is not None:
+            gravity = self.gravity_source.read()
+            if gravity is not None:
+                meta["gravity"] = [round(float(v), 5) for v in gravity]
 
         sent = False
         if self.uplink is not None:
