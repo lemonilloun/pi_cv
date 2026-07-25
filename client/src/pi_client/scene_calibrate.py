@@ -60,6 +60,8 @@ CANDIDATE_PATTERNS = [
 ]
 
 COVERAGE_GRID = 3  # 3x3 regions of the frame to encourage spreading boards out
+GOOD_RMS_PX = 0.5    # nothing to improve below this
+USABLE_RMS_PX = 1.5  # above this the intrinsics are not trustworthy
 
 
 def parse_args() -> argparse.Namespace:
@@ -359,8 +361,37 @@ def main() -> int:
         obj_points, img_points, (args.width, args.height), None, None
     )
 
-    passed = rms < 0.5
-    logger.info("RMS reprojection error: %.3f px (target < 0.5)", rms)
+    # Two thresholds, not one. Below GOOD_RMS_PX the calibration is as good as
+    # this setup gets; between GOOD and USABLE it is still perfectly usable for
+    # reconstruction (a ~1 px reprojection error on a 1536 px sensor is well
+    # under the error monocular depth contributes) — it just means the boards
+    # moved a little while they were captured. Only above USABLE_RMS_PX is
+    # there a real reason to redo it. Reporting one strict target made a
+    # successful run read like a failure.
+    passed = rms < GOOD_RMS_PX
+    usable = rms < USABLE_RMS_PX
+    if passed:
+        logger.info("RMS reprojection error: %.3f px — good", rms)
+    elif usable:
+        logger.info(
+            "RMS reprojection error: %.3f px — USABLE (ideal is < %.1f). "
+            "Calibration saved and safe to use. To tighten it, hold the board "
+            "still for ~1.5 s per capture; this error level is normal when "
+            "boards are grabbed about once a second by hand.",
+            rms, GOOD_RMS_PX,
+        )
+    else:
+        logger.warning(
+            "RMS reprojection error: %.3f px — too high to trust (want < %.1f). "
+            "Usual causes: motion blur, a board that isn't flat, or a wrong "
+            "--square-mm/pattern. Saving anyway so nothing is lost, but redo it.",
+            rms, USABLE_RMS_PX,
+        )
+    logger.info(
+        "Pattern %dx%d INNER CORNERS = a %dx%d SQUARE board; square %.1f mm "
+        "(square size sets world scale only — it does not affect fx/fy/cx/cy).",
+        pattern[0], pattern[1], pattern[0] + 1, pattern[1] + 1, args.square_mm,
+    )
     if not covered.issuperset({(r, c) for r in range(COVERAGE_GRID) for c in range(COVERAGE_GRID)}):
         missing = COVERAGE_GRID * COVERAGE_GRID - len(covered)
         logger.warning("%d/%d frame regions never had a board — distortion at those edges is less certain",
@@ -394,9 +425,11 @@ def main() -> int:
         # The camera is already stopped; render a synthetic result card
         # instead of a live frame so the outcome is unmistakable.
         final = np.zeros((args.height, args.width, 3), dtype=np.uint8)
-        color = (60, 220, 60) if passed else (0, 60, 220)
+        color = (60, 220, 60) if passed else ((0, 190, 220) if usable else (0, 60, 220))
         cv2.rectangle(final, (0, 0), (args.width - 1, args.height - 1), color, 16)
-        title = "CALIBRATION OK" if passed else "CALIBRATION WEAK — consider redoing"
+        title = ("CALIBRATION OK" if passed
+                 else ("CALIBRATION USABLE — saved" if usable
+                       else "CALIBRATION WEAK — redo it"))
         cv2.putText(final, title, (60, args.height // 2 - 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3, cv2.LINE_AA)
         cv2.putText(final, f"RMS {rms:.3f} px  ({len(obj_points)} boards, pattern {pattern[0]}x{pattern[1]})",
