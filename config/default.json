@@ -92,7 +92,7 @@
       "sequential_overlap": 10,
       "colmap_num_threads": 1,
       "min_registered_frac": 0.5,
-      "scale_source": "auto",
+      "scale_source": "depth",
       "min_imu_intervals": 20,
       "max_imu_scale_iqr": 0.25
     },

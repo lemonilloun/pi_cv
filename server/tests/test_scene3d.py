@@ -1502,3 +1502,36 @@ class ImuScaleTest(unittest.TestCase):
         self.assertAlmostEqual(scale, 3.0, places=6)
         self.assertIn(7, rejected)
         self.assertIn(19, rejected)
+
+
+class CameraParamsNumpyTest(unittest.TestCase):
+    """pycolmap hands `params` over as a numpy array, and `array or []`
+    raises "truth value of an array is ambiguous" — which silently cost a
+    whole run its refined intrinsics, the single largest quality fix in the
+    pipeline. The type has to be exercised, not just the values."""
+
+    class _Camera:
+        width, height = 1536, 864
+
+        def __init__(self, params):
+            self.params = params
+
+    def test_numpy_params_are_read(self) -> None:
+        cam = self._Camera(np.array([1006.3, 1007.6, 789.2, 419.4,
+                                     -0.003, 0.051, -0.004, 0.007]))
+        intr = camera_to_intrinsics(cam)
+        self.assertAlmostEqual(intr["fx"], 1006.3, places=3)
+        self.assertAlmostEqual(intr["dist"][1], 0.051, places=4)
+
+    def test_numpy_dist_argument_is_read(self) -> None:
+        cam = self._Camera(np.array([1000.0, 1000.0, 768.0, 432.0]))
+        intr = camera_to_intrinsics(cam, dist=np.array([0.1, 0.2, 0.0, 0.0, 0.0]))
+        self.assertAlmostEqual(intr["dist"][0], 0.1, places=6)
+
+    def test_empty_dist_falls_back_to_the_camera_params(self) -> None:
+        cam = self._Camera(np.array([1000.0, 1000.0, 768.0, 432.0, 0.5, 0.0, 0.0, 0.0]))
+        self.assertAlmostEqual(camera_to_intrinsics(cam, dist=[])["dist"][0], 0.5)
+
+    def test_pinhole_params_without_distortion(self) -> None:
+        cam = self._Camera(np.array([1000.0, 1000.0, 768.0, 432.0]))
+        self.assertEqual(camera_to_intrinsics(cam, dist=None)["dist"], [0.0, 0.0, 0.0, 0.0])

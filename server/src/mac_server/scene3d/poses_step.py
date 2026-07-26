@@ -103,7 +103,11 @@ def camera_to_intrinsics(camera, dist: list[float] | None = None) -> dict[str, A
     """
     width = int(getattr(camera, "width", 0))
     height = int(getattr(camera, "height", 0))
-    params = [float(v) for v in (getattr(camera, "params", None) or [])]
+    # pycolmap returns `params` as a numpy array, and `array or []` raises
+    # "truth value of an array is ambiguous" — the emptiness test has to be
+    # explicit, not a truthiness fallback.
+    raw_params = getattr(camera, "params", None)
+    params = [] if raw_params is None else [float(v) for v in raw_params]
 
     def accessor(name: str):
         value = getattr(camera, name, None)
@@ -129,7 +133,9 @@ def camera_to_intrinsics(camera, dist: list[float] | None = None) -> dict[str, A
         "fy": float(fy),
         "cx": float(cx if cx is not None else width / 2.0),
         "cy": float(cy if cy is not None else height / 2.0),
-        "dist": list(dist or params[4:8] or [0.0, 0.0, 0.0, 0.0]),
+        "dist": [float(v) for v in (
+            dist if dist is not None and len(dist) else (params[4:8] or [0.0] * 4)
+        )],
         "source": "colmap_refined",
     }
 
@@ -190,6 +196,19 @@ def imu_scale_samples(
 
     Returns {keyframe_index: scale} for the surviving intervals; the caller
     reduces them with the same MAD-rejecting median used for depth scale.
+
+    **Measured status: not usable on this rig yet, hence
+    `poses.scale_source` defaulting to `depth`.** On
+    session_20260726_193117 the preintegrated velocity ran to 78 m/s over
+    215 s of driving. The cause is not sensor noise: the chassis swings
+    ~3 deg (p10..p90, peaking at 10.8 deg) around the pose the gravity
+    reference was measured in, and subtracting a *constant* gravity vector
+    from a rig that is actually tilting leaks 9.81*sin(3 deg) = 0.52 m/s^2.
+    Removing a constant bias does not help — the leak varies with the
+    chassis. The fix is to compensate with the sensor's own live attitude
+    (or SHTP mode's on-chip linear acceleration) instead of a static
+    reference; until then this is computed and reported as a diagnostic and
+    must not be allowed to set the size of a reconstruction.
     """
     import numpy as np
 
