@@ -97,6 +97,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-imu", action="store_true",
                         help="Ignore the IMU even if it is connected and calibrated")
     parser.add_argument("--imu-port", default="/dev/ttyUSB0")
+    parser.add_argument("--zupt-shift-px", type=float, default=2.0,
+                        help="Image shift below which the rig counts as stopped, "
+                             "so the IMU's velocity is pinned back to zero")
     parser.add_argument("--imu-calibration", type=Path,
                         default=REPO_ROOT / "config/imu_calibration.json")
     parser.add_argument("--offline", action="store_true",
@@ -524,6 +527,16 @@ class SceneRecorder:
         gray = cv2.cvtColor(cv2.resize(bgr, (480, 270)), cv2.COLOR_BGR2GRAY)
         sharpness = variance_of_laplacian(gray)
         shift = self._image_shift_px(gray)
+        # Zero-velocity update. The accelerometer cannot tell "standing
+        # still" from "rolling at constant speed" — both read zero linear
+        # acceleration — so the evidence has to come from the camera, and we
+        # already have it: an image that did not shift means a rig that did
+        # not move. Without this, velocity error integrates into position
+        # without bound and the metric scale estimate degrades over a run.
+        if (self.gravity_source is not None and shift is not None
+                and shift < self.args.zupt_shift_px):
+            self.gravity_source.integrator.zero_velocity()
+
         emit, reason = self.selector.decide(
             elapsed_s=now - self._last_keyframe_at,
             shift_px=shift,

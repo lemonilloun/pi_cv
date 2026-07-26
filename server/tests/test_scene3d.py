@@ -1418,3 +1418,87 @@ class ImuIntegratorTest(unittest.TestCase):
         integrator.add(self._sample(0.02, (500.0, 0.0, 1000.0)))  # a jolt
         integrator.add(self._sample(0.03, (0.0, 0.0, 1000.0)))
         self.assertGreater(integrator.cut()["peak_linear_accel_ms2"], 4.0)
+
+
+class ImuScaleTest(unittest.TestCase):
+    """The IMU scale is meant to replace a monocular estimate the project
+    already knows it cannot trust, so its gates matter as much as its
+    arithmetic: a bad interval that slips through moves the size of the whole
+    reconstruction."""
+
+    def setUp(self) -> None:
+        from mac_server.scene3d.poses_step import imu_scale_samples
+
+        self.samples = imu_scale_samples
+
+    @staticmethod
+    def _centers(step, count=6):
+        # COLMAP positions, in COLMAP units, marching along +X.
+        return {i: np.array([i * step, 0.0, 0.0]) for i in range(count)}
+
+    @staticmethod
+    def _segments(distance_m, count=6, yaw=0.0, speed=0.3):
+        return {
+            i: {"distance_m": distance_m, "speed_ms": speed, "yaw_deg": yaw * i}
+            for i in range(count)
+        }
+
+    def test_recovers_a_known_scale(self) -> None:
+        # COLMAP steps of 0.05 units, real steps of 0.15 m -> scale 3.0.
+        got = self.samples(self._segments(0.15), self._centers(0.05))
+        self.assertEqual(len(got), 5)  # interval 0 has no predecessor
+        for value in got.values():
+            self.assertAlmostEqual(value, 3.0, places=6)
+
+    def test_tiny_motion_is_skipped(self) -> None:
+        # One small number over another is noise, not a measurement.
+        got = self.samples(self._segments(0.005), self._centers(0.05))
+        self.assertEqual(got, {})
+
+    def test_a_gap_in_registration_is_not_paired(self) -> None:
+        centers = self._centers(0.05)
+        del centers[3]  # COLMAP failed to register keyframe 3
+        got = self.samples(self._segments(0.15), centers)
+        self.assertNotIn(3, got)  # 3 has no predecessor pose either side
+        self.assertNotIn(4, got)
+
+    def test_turning_intervals_are_skipped(self) -> None:
+        """Displacement is accumulated in the rotating sensor frame, so a
+        big yaw step mid-interval shortens the vector and would bias the
+        scale downward."""
+        got = self.samples(self._segments(0.15, yaw=45.0), self._centers(0.05))
+        self.assertEqual(got, {})
+
+    def test_small_yaw_steps_are_kept(self) -> None:
+        got = self.samples(self._segments(0.15, yaw=3.0), self._centers(0.05))
+        self.assertEqual(len(got), 5)
+
+    def test_yaw_wraparound_is_not_a_big_step(self) -> None:
+        segments = {
+            1: {"distance_m": 0.15, "speed_ms": 0.3, "yaw_deg": 359.0},
+            2: {"distance_m": 0.15, "speed_ms": 0.3, "yaw_deg": 2.0},
+        }
+        segments[0] = {"distance_m": 0.15, "speed_ms": 0.3, "yaw_deg": 356.0}
+        got = self.samples(segments, self._centers(0.05))
+        self.assertIn(2, got)  # 359 -> 2 is a 3 deg step, not 357
+
+    def test_implausible_speed_is_skipped(self) -> None:
+        # Velocity had drifted; the displacement it produced is fiction.
+        got = self.samples(self._segments(0.15, speed=9.0), self._centers(0.05))
+        self.assertEqual(got, {})
+
+    def test_missing_yaw_does_not_block_the_interval(self) -> None:
+        segments = {i: {"distance_m": 0.15, "speed_ms": 0.3} for i in range(4)}
+        self.assertEqual(len(self.samples(segments, self._centers(0.05))), 3)
+
+    def test_scale_survives_a_few_bad_intervals(self) -> None:
+        from mac_server.scene3d.poses_step import median_scale
+
+        segments = self._segments(0.15, count=30)
+        segments[7]["distance_m"] = 2.5    # a jolt
+        segments[19]["distance_m"] = 0.9
+        got = self.samples(segments, self._centers(0.05, count=30))
+        scale, iqr, rejected = median_scale(got)
+        self.assertAlmostEqual(scale, 3.0, places=6)
+        self.assertIn(7, rejected)
+        self.assertIn(19, rejected)

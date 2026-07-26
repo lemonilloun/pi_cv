@@ -91,7 +91,10 @@
       "vocab_tree_path": null,
       "sequential_overlap": 10,
       "colmap_num_threads": 1,
-      "min_registered_frac": 0.5
+      "min_registered_frac": 0.5,
+      "scale_source": "auto",
+      "min_imu_intervals": 20,
+      "max_imu_scale_iqr": 0.25
     },
     "tsdf": {
       "voxel_m": 0.02,

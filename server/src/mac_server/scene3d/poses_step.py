@@ -161,6 +161,63 @@ def median_scale(per_frame_scales: dict[int, float]) -> tuple[float, float, list
     return scale, iqr_over_median, rejected
 
 
+def imu_scale_samples(
+    segments: dict[int, dict[str, Any]],
+    centers: dict[int, Any],
+    min_distance_m: float = 0.03,
+    max_yaw_step_deg: float = 20.0,
+    max_speed_ms: float = 2.0,
+) -> dict[int, float]:
+    """Per-interval metric/COLMAP scale from preintegrated IMU motion.
+
+    COLMAP recovers camera positions only up to an unknown factor. The
+    pipeline currently fixes that factor with monocular depth, which carries
+    its own scale error — this project's room mapping is on hold precisely
+    because that scale could not be trusted. The accelerometer measures
+    metres, so the ratio of the two displacements over an interval *is* the
+    factor, in physical units.
+
+    Only intervals where both measurements are meaningful are used:
+
+    * both keyframes registered, and **consecutive** in the recording —
+      the segment describes motion since the previous keyframe, so a gap
+      would compare an IMU path against the wrong chord;
+    * enough motion, or the ratio is one small number over another;
+    * little yaw change, because displacement is accumulated in the sensor
+      frame: a rig that turns a lot mid-interval smears the vector it is
+      integrating, and the magnitude comes out short;
+    * a plausible speed, which rejects intervals where velocity had drifted.
+
+    Returns {keyframe_index: scale} for the surviving intervals; the caller
+    reduces them with the same MAD-rejecting median used for depth scale.
+    """
+    import numpy as np
+
+    scales: dict[int, float] = {}
+    for index, segment in sorted(segments.items()):
+        previous = index - 1
+        if previous not in centers or index not in centers:
+            continue
+        distance_m = float(segment.get("distance_m") or 0.0)
+        if distance_m < min_distance_m:
+            continue
+        if float(segment.get("speed_ms") or 0.0) > max_speed_ms:
+            continue
+        yaw_now = segment.get("yaw_deg")
+        yaw_prev = (segments.get(previous) or {}).get("yaw_deg")
+        if yaw_now is not None and yaw_prev is not None:
+            step = abs((float(yaw_now) - float(yaw_prev) + 180.0) % 360.0 - 180.0)
+            if step > max_yaw_step_deg:
+                continue
+        colmap_distance = float(
+            np.linalg.norm(np.asarray(centers[index]) - np.asarray(centers[previous]))
+        )
+        if colmap_distance < 1e-6:
+            continue
+        scales[index] = distance_m / colmap_distance
+    return scales
+
+
 def frame_scale(
     depth_map,
     points_uv,
@@ -351,14 +408,63 @@ def run_poses_step(
         if scale is not None:
             per_frame_scales[kf_index] = scale
 
-    if len(per_frame_scales) < 3:
+    # ------------------------------------------------- two scale sources
+    # Depth: median(DAv2 metric / COLMAP sparse). Inherits whatever scale
+    # error the monocular network has.
+    # IMU: median(preintegrated metres / COLMAP chord). Grounded in m/s^2,
+    # independent of any network.
+    depth_scale = depth_iqr = None
+    depth_rejected: list[int] = []
+    if len(per_frame_scales) >= 3:
+        depth_scale, depth_iqr, depth_rejected = median_scale(per_frame_scales)
+        logger.info("Scale from depth: %.4f (IQR/median %.3f, %d frames rejected)",
+                    depth_scale, depth_iqr, len(depth_rejected))
+
+    centers = {k: v[:3, 3] for k, v in world_from_cam_unscaled.items()}
+    imu_samples = imu_scale_samples(session.imu_segments(), centers)
+    imu_scale = imu_iqr = None
+    min_imu = int(poses_cfg.get("min_imu_intervals", 20))
+    if len(imu_samples) >= 3:
+        imu_scale, imu_iqr, imu_rejected = median_scale(imu_samples)
+        logger.info("Scale from IMU:   %.4f (IQR/median %.3f, %d of %d intervals used)",
+                    imu_scale, imu_iqr, len(imu_samples) - len(imu_rejected),
+                    len(imu_samples))
+
+    source = str(poses_cfg.get("scale_source", "auto")).lower()
+    max_imu_iqr = float(poses_cfg.get("max_imu_scale_iqr", 0.25))
+    imu_usable = (
+        imu_scale is not None
+        and len(imu_samples) >= min_imu
+        and imu_iqr is not None
+        and imu_iqr <= max_imu_iqr
+    )
+    if source == "imu" and imu_scale is not None:
+        chosen = "imu"
+    elif source == "depth" and depth_scale is not None:
+        chosen = "depth"
+    elif source == "auto" and imu_usable:
+        # Gated on its own spread rather than trusted blindly: a loose IMU
+        # scale means velocity drifted or the rig was turning constantly,
+        # and depth is the better bet in that case.
+        chosen = "imu"
+    elif depth_scale is not None:
+        chosen = "depth"
+    elif imu_scale is not None:
+        chosen = "imu"
+    else:
         raise RuntimeError(
-            f"Scale alignment failed: only {len(per_frame_scales)} frames had "
-            "usable sparse depth (run the depth step first?)"
+            f"Scale alignment failed: only {len(per_frame_scales)} frames had usable "
+            f"sparse depth and only {len(imu_samples)} IMU intervals were usable. "
+            "Run the depth step first, or record with a calibrated IMU."
         )
-    scale, iqr_over_median, rejected = median_scale(per_frame_scales)
-    logger.info("Metric scale %.4f (IQR/median %.3f, %d frames rejected)",
-                scale, iqr_over_median, len(rejected))
+
+    scale = imu_scale if chosen == "imu" else depth_scale
+    iqr_over_median = imu_iqr if chosen == "imu" else depth_iqr
+    rejected = [] if chosen == "imu" else depth_rejected
+    disagreement = None
+    if imu_scale and depth_scale:
+        disagreement = abs(imu_scale - depth_scale) / max(depth_scale, 1e-9)
+    logger.info("Using the %s scale: %.4f", chosen, scale)
 
     world_from_cam = {}
     for kf_index, wfc in world_from_cam_unscaled.items():
@@ -405,8 +511,21 @@ def run_poses_step(
         "scale_iqr_over_median": round(iqr_over_median, 3),
         "matching": matching_used,
         "sub_reconstructions": frags,
+        "scale_source": chosen,
+        "scale_depth": None if depth_scale is None else round(depth_scale, 4),
+        "scale_imu": None if imu_scale is None else round(imu_scale, 4),
+        "imu_intervals": len(imu_samples),
     }
     warnings = []
+    if disagreement is not None and disagreement > 0.20:
+        warnings.append(
+            f"The two scale estimates disagree by {disagreement:.0%} "
+            f"(depth {depth_scale:.3f} vs IMU {imu_scale:.3f}); using the {chosen} one. "
+            "They are independent — depth comes from the monocular network, the IMU "
+            "from measured m/s² — so a large gap means one of them is wrong, and the "
+            "network is the usual suspect. Check the reconstruction against a real "
+            "measurement in the room before trusting its dimensions."
+        )
     if refined:
         report["hfov_deg"] = round(hfov_deg(refined["fx"], refined["width"]), 1)
         report["hfov_deg_assumed"] = round(

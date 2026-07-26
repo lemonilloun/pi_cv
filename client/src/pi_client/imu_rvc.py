@@ -257,10 +257,17 @@ class ImuIntegrator:
         self._samples = 0
         self._dv = [0.0, 0.0, 0.0]     # velocity change, sensor frame, m/s
         self._dp = [0.0, 0.0, 0.0]     # position change, sensor frame, m
-        self._vel = [0.0, 0.0, 0.0]    # running velocity within this segment
         self._peak_linear = 0.0        # m/s^2, for shake/blur rejection
         self._sum_linear = 0.0
         self._last: ImuSample | None = None
+        self._zupts = 0
+        # Velocity is deliberately NOT reset here. It is a property of the
+        # vehicle, not of the segment: a robot rolling at a steady speed has
+        # near-zero acceleration, so a segment that restarts from v=0 measures
+        # almost no displacement and the scale estimate collapses. Velocity
+        # only goes to zero when something says the rig actually stopped —
+        # see `zero_velocity`.
+        self._vel = [0.0, 0.0, 0.0]
 
     def set_reference(self, up_sensor: tuple[float, float, float] | None) -> None:
         self.up_sensor = up_sensor
@@ -303,6 +310,26 @@ class ImuIntegrator:
             self._vel[k] += linear[k] * dt
             self._dv[k] += linear[k] * dt
 
+    def zero_velocity(self) -> None:
+        """Zero-velocity update: declare the rig stopped.
+
+        Velocity carried across segments would otherwise drift without
+        bound — an acceleration error of a, unopposed, becomes a velocity
+        error of a*t and a position error of 0.5*a*t^2. Pinning velocity to
+        zero whenever the rig is known to be still is what keeps that
+        bounded; it is the same trick pedestrian dead reckoning uses at each
+        footfall.
+
+        The evidence has to come from outside the accelerometer, because a
+        rig moving at constant speed and a rig standing still both read zero
+        linear acceleration. Here it comes from the camera: the recorder
+        already measures how far the image shifted between keyframes for its
+        keyframe selector, and an image that did not move means a rig that
+        did not move.
+        """
+        self._vel = [0.0, 0.0, 0.0]
+        self._zupts += 1
+
     def cut(self) -> dict[str, Any]:
         """Take the segment accumulated so far and start a new one."""
         segment = {
@@ -316,10 +343,14 @@ class ImuIntegrator:
             "mean_linear_accel_ms2": round(
                 self._sum_linear / self._samples if self._samples else 0.0, 4
             ),
+            "zupts": self._zupts,
         }
-        last = self._last
+        last, velocity = self._last, list(self._vel)
         self.reset()
-        self._last = last  # continuity: the next segment starts where this ended
+        # Continuity across the cut: the next segment starts from the same
+        # sample and the same velocity this one ended at.
+        self._last = last
+        self._vel = velocity
         return segment
 
 

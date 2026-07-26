@@ -187,6 +187,21 @@ class SceneSession:
     def state_path(self) -> Path:
         return self.derived / "pipeline_state.json"
 
+    def imu_segments(self) -> dict[int, dict[str, Any]]:
+        """{keyframe_index: preintegrated IMU segment} for the keyframes that
+        have one. The segment describes motion since the PREVIOUS keyframe,
+        so it pairs with the (index-1, index) interval."""
+        out: dict[int, dict[str, Any]] = {}
+        for kf in self.keyframes():
+            try:
+                imu = kf.meta().get("imu")
+            except (OSError, ValueError):
+                continue
+            segment = (imu or {}).get("segment")
+            if segment:
+                out[kf.index] = {**segment, "yaw_deg": (imu or {}).get("yaw_deg")}
+        return out
+
     def imu_up_vector(self, poses: dict[int, Any] | None = None):
         """World-space up from the recorder's IMU, or None when absent.
 
