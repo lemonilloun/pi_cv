@@ -1182,78 +1182,147 @@ class KabschTest(unittest.TestCase):
             self.kabsch([[0, 0, 1]], [[0, 0, 1]])
 
 
-class ImuCalibrationGeometryTest(unittest.TestCase):
-    def setUp(self) -> None:
-        from pi_client.imu_calibrate import board_normal_camera, spread_deg
-
-        self.board_normal_camera = board_normal_camera
-        self.spread_deg = spread_deg
-
-    def test_board_normal_points_back_at_the_camera(self) -> None:
-        """Corner ordering flips the board's own +Z with viewing angle, so
-        the sign has to be settled physically, not by convention."""
-        import cv2
-
-        # Board 2 m in front of the camera, its own +Z pointing AWAY.
-        rvec, _ = cv2.Rodrigues(np.eye(3))
-        normal = self.board_normal_camera(rvec, np.array([0.0, 0.0, 2.0]))
-        self.assertLess(float(normal[2]), 0.0)  # flipped to face the camera
-
-    def test_board_normal_left_alone_when_already_facing_the_camera(self) -> None:
-        import cv2
-
-        flip, _ = cv2.Rodrigues(np.array([np.pi, 0.0, 0.0]))
-        rvec, _ = cv2.Rodrigues(flip)
-        normal = self.board_normal_camera(rvec, np.array([0.0, 0.0, 2.0]))
-        self.assertLess(float(normal[2]), 0.0)
-
-    def test_spread_of_identical_vectors_is_zero(self) -> None:
-        vectors = [np.array([0.0, 0.0, 1.0])] * 4
-        self.assertAlmostEqual(self.spread_deg(vectors), 0.0, places=6)
-
-    def test_spread_finds_the_widest_pair(self) -> None:
-        vectors = [
-            np.array([0.0, 0.0, 1.0]),
-            np.array([0.0, np.sin(np.radians(10)), np.cos(np.radians(10))]),
-            np.array([0.0, np.sin(np.radians(40)), np.cos(np.radians(40))]),
-        ]
-        self.assertAlmostEqual(self.spread_deg(vectors), 40.0, places=3)
-
-
-class NominalMountingTest(unittest.TestCase):
-    """The hand-described mounting (accel X forward, Y left) is reported as a
-    difference, never used as the answer — but the reference matrix itself
-    must be a real rotation or the reported difference is meaningless."""
+class BoardUpTest(unittest.TestCase):
+    """Reading gravity off a wall board hinges on picking the right in-plane
+    axis and the right sign. Corner ordering flips with viewing angle, so the
+    choice is made physically (closest to the camera's own up) — these pin
+    that down, including the case where the board is NOT on a wall."""
 
     def setUp(self) -> None:
-        from pi_client.imu_calibrate import NOMINAL_CAM_FROM_IMU, rotation_angle_deg
+        from pi_client.imu_calibrate import board_up_camera
 
-        self.nominal = NOMINAL_CAM_FROM_IMU
-        self.angle = rotation_angle_deg
+        self.board_up_camera = board_up_camera
 
-    def test_nominal_is_a_proper_rotation(self) -> None:
-        self.assertAlmostEqual(float(np.linalg.det(self.nominal)), 1.0, places=9)
-        np.testing.assert_allclose(self.nominal @ self.nominal.T, np.eye(3), atol=1e-12)
+    @staticmethod
+    def _rvec(matrix):
+        import cv2
 
-    def test_nominal_maps_the_described_axes(self) -> None:
-        # IMU +X is forward -> camera +Z (forward)
-        np.testing.assert_allclose(self.nominal @ [1, 0, 0], [0, 0, 1], atol=1e-12)
-        # IMU +Y is left -> camera -X (camera X points right)
-        np.testing.assert_allclose(self.nominal @ [0, 1, 0], [-1, 0, 0], atol=1e-12)
-        # IMU +Z is up -> camera -Y (camera Y points down)
-        np.testing.assert_allclose(self.nominal @ [0, 0, 1], [0, -1, 0], atol=1e-12)
+        rvec, _ = cv2.Rodrigues(np.asarray(matrix, dtype=np.float64))
+        return rvec
 
-    def test_identical_rotations_are_zero_apart(self) -> None:
-        self.assertAlmostEqual(self.angle(self.nominal, self.nominal), 0.0, places=6)
+    @staticmethod
+    def _board(up, right):
+        """Board pose whose in-plane axes are `right` and -`up` (the board's
+        +Y runs downward, the usual raster order). Columns of R_cam_from_board
+        are the board's axes in camera coords, so the third column must be
+        the cross product of the first two — otherwise the matrix is
+        left-handed and Rodrigues returns nonsense."""
+        up = np.asarray(up, dtype=np.float64)
+        right = np.asarray(right, dtype=np.float64)
+        normal = np.cross(right, -up)
+        return np.stack([right, -up, normal], axis=1)
 
-    def test_a_20_degree_camera_tilt_reads_as_20_degrees(self) -> None:
+    def test_upright_board_facing_the_camera(self) -> None:
+        # Camera axes: X right, Y down, Z forward. Board on the wall ahead.
+        up, _ = self.board_up_camera(self._rvec(
+            self._board(up=[0, -1, 0], right=[1, 0, 0])
+        ))
+        self.assertIsNotNone(up)
+        np.testing.assert_allclose(up, [0, -1, 0], atol=1e-9)
+
+    def test_board_rotated_90_in_its_plane_still_reads_up(self) -> None:
+        # The vertical direction is now the board's OTHER in-plane axis.
+        up, _ = self.board_up_camera(self._rvec(
+            self._board(up=[0, -1, 0], right=[0, 0, -1])
+        ))
+        np.testing.assert_allclose(up, [0, -1, 0], atol=1e-9)
+
+    def test_sign_flip_is_corrected(self) -> None:
+        # Board detected upside down: raw axis points at camera +Y (down).
+        up, _ = self.board_up_camera(self._rvec(
+            self._board(up=[0, 1, 0], right=[-1, 0, 0])
+        ))
+        np.testing.assert_allclose(up, [0, -1, 0], atol=1e-9)
+
+    def test_camera_pitched_up_still_works(self) -> None:
+        # Camera tilted up 20 deg: world up is no longer camera -Y exactly.
         theta = np.radians(20.0)
-        # Pitch about the camera's X axis, i.e. the camera tilted up.
-        pitch = np.array([
-            [1, 0, 0],
-            [0, np.cos(theta), -np.sin(theta)],
-            [0, np.sin(theta), np.cos(theta)],
-        ])
-        self.assertAlmostEqual(
-            self.angle(pitch @ self.nominal, self.nominal), 20.0, places=4
-        )
+        world_up_in_cam = np.array([0.0, -np.cos(theta), -np.sin(theta)])
+        right = np.array([1.0, 0.0, 0.0])
+        up, reason = self.board_up_camera(self._rvec(
+            self._board(up=world_up_in_cam, right=right)
+        ))
+        self.assertIsNotNone(up, reason)
+        np.testing.assert_allclose(up, world_up_in_cam, atol=1e-9)
+
+    def test_board_lying_flat_is_rejected(self) -> None:
+        # A board on a table/floor has a vertical normal — this procedure
+        # reads gravity off the in-plane axis, so it must refuse.
+        flat = np.stack([
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
+            np.array([0.0, -1.0, 0.0]),   # normal points up
+        ], axis=1)
+        up, reason = self.board_up_camera(self._rvec(flat))
+        self.assertIsNone(up)
+        self.assertIn("vertical", reason)
+
+
+class ImuReadModeTest(unittest.TestCase):
+    """`read()` is what ends up in every keyframe, so its two modes and its
+    refusal cases are worth locking down."""
+
+    def _reader(self, calibration):
+        from pi_client.imu_rvc import RvcReader
+
+        reader = RvcReader.__new__(RvcReader)
+        reader.calibration = calibration
+        reader._suppressed = 0
+        reader._lock = __import__("threading").Lock()
+        reader._samples = []
+        return reader
+
+    @staticmethod
+    def _sample(accel):
+        from pi_client.imu_rvc import ImuSample
+
+        return ImuSample(index=0, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0,
+                         accel_mg=accel, monotonic=0.0)
+
+    def test_no_calibration_means_no_gravity(self) -> None:
+        reader = self._reader(None)
+        reader._samples = [self._sample((0, 0, 1000))]
+        self.assertIsNone(reader.read())
+
+    def test_reference_mode_returns_the_measured_constant(self) -> None:
+        reader = self._reader({
+            "mode": "reference",
+            "up_camera_reference": [0.0, -1.0, 0.0],
+            "up_imu_reference": [0.0, 0.0, 1.0],
+            "tilt_tolerance_deg": 4.0,
+        })
+        reader._samples = [self._sample((0, 0, 1000))]
+        np.testing.assert_allclose(reader.read(), [0.0, 1.0, 0.0], atol=1e-9)
+
+    def test_reference_mode_withholds_when_the_rig_has_tilted(self) -> None:
+        reader = self._reader({
+            "mode": "reference",
+            "up_camera_reference": [0.0, -1.0, 0.0],
+            "up_imu_reference": [0.0, 0.0, 1.0],
+            "tilt_tolerance_deg": 4.0,
+        })
+        # ~17 deg away from the reference attitude.
+        reader._samples = [self._sample((300, 0, 1000))]
+        self.assertIsNone(reader.read())
+        self.assertEqual(reader._suppressed, 1)
+
+    def test_reference_mode_tolerates_small_drift(self) -> None:
+        reader = self._reader({
+            "mode": "reference",
+            "up_camera_reference": [0.0, -1.0, 0.0],
+            "up_imu_reference": [0.0, 0.0, 1.0],
+            "tilt_tolerance_deg": 4.0,
+        })
+        reader._samples = [self._sample((30, 0, 1000))]  # ~1.7 deg
+        self.assertIsNotNone(reader.read())
+
+    def test_full_mode_tracks_the_current_attitude(self) -> None:
+        # cam_from_imu maps IMU +Z (up) onto camera -Y (up).
+        rotation = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+        reader = self._reader({"mode": "full", "cam_from_imu": rotation})
+        reader._samples = [self._sample((0, 0, 1000))]
+        np.testing.assert_allclose(reader.read(), [0.0, 1.0, 0.0], atol=1e-9)
+        # Tilted: the answer must move, unlike reference mode.
+        reader._samples = [self._sample((500, 0, 866))]
+        tilted = reader.read()
+        self.assertGreater(abs(tilted[0]), 0.4)

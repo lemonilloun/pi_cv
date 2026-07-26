@@ -303,17 +303,45 @@ cross-checks it against the Euler *tilt angle*, which is convention-free.
 Linear acceleration is handled by a 0.5 s median window on the Pi plus the
 Mac averaging gravity over every keyframe of the session.
 
-**The sensor→camera rotation is measured, never declared.**
-`./scripts/run_imu_calibrate.sh` puts the chessboard flat on the floor:
-`solvePnP` gives the floor normal (= up) in the camera frame, the
-accelerometer gives up in its own frame, and tilting the rig produces pairs
-that fix the rotation via Wahba/Kabsch. Guards that stop a confident wrong
-answer: a rest stage (|accel| must be ~1 g, both tilt estimates must agree),
-a minimum angular spread of 25° (pairs at one orientation leave the rotation
-about that axis unconstrained), and a reported per-pair residual — a couple
-of degrees is good, over 8° means redo it. It also prints how far above
-horizontal the camera's optical axis sits, which is the number the recording
-guide's "tilt up 15–25°" rule refers to.
+**The reference comes from a chessboard on a WALL, and the robot never
+tilts.** Two facts drive the procedure. First, this rig drives in the X-Y
+plane; it cannot be rolled or turned over on request. Second — and this is
+what makes that a non-problem — for a robot that only translates and yaws,
+gravity in the camera frame is a **constant**: yaw is a rotation about the
+gravity axis itself, so it leaves that axis unchanged. Driving around
+produces the same measurement over and over, and one accurate static
+measurement is all the pipeline needs.
+
+A board taped flat to a vertical wall, hanging plumb, gives it. `solvePnP`
+returns the board's pose; its in-plane vertical axis is gravity. (A board on
+the *floor* would give gravity as the plane normal with no need to hang it
+straight, but the camera sits ~40 cm up and pitched upward, so it sees the
+floor at a grazing angle where the pose solve is badly conditioned. The wall
+is seen face-on.) Which in-plane axis is vertical, and which way round, are
+decided physically — whichever of the four candidates lies closest to the
+camera's own up — because corner ordering flips with viewing angle.
+
+Two calibration modes result:
+
+* **`reference`** — the normal outcome, and what a level robot should get.
+  A measured constant plus the IMU reading taken alongside it. At record
+  time the IMU's job is to *verify the pose still holds*: drift beyond
+  `tilt_tolerance_deg` (4° default) and the recorder emits no gravity for
+  those frames, so the Mac falls back to its floor fit instead of being fed
+  a stale vector.
+* **`full`** — optional live tilt tracking. Needs genuinely different rig
+  attitudes, which here means propping one side up: a 2–4 cm book under the
+  left wheels, then under the front. ~8° of spread is enough; the script
+  accepts each new attitude by itself and reports what the residual costs
+  (a later 5° tilt typically maps with well under 1° of error). Ctrl+C
+  before that just writes `reference` rather than a badly-conditioned
+  rotation that would look authoritative.
+
+Guards throughout: a rest stage (|accel| must be ~1 g and both tilt
+estimates must agree), rejection of a board that is not on a vertical
+surface, and the scatter of the reference views themselves. It also prints
+how far above horizontal the camera's optical axis sits — the number the
+recording guide's "tilt up 15–25°" rule refers to.
 
 Needs `config/scene_intrinsics.json` first (solvePnP needs a calibrated
 camera). Writes `config/imu_calibration.json` (gitignored, like the
@@ -324,7 +352,7 @@ intrinsics).
 ./scripts/run_imu_calibrate.sh  --square-mm 24                       # then the IMU
 ```
 
-The recorder then picks it up automatically and writes `gravity` into each
+The recorder picks it up automatically and writes `gravity` into each
 keyframe's `meta.json`; `--no-imu` opts out. **Without the calibration file
 the reader reports no gravity at all** rather than guessing an axis mapping —
 the Mac trusts an IMU vector over its own floor fit, so a confidently wrong

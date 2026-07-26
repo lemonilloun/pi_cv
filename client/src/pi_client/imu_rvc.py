@@ -241,6 +241,7 @@ class RvcReader:
         self._samples: list[ImuSample] = []
         self._frames_ok = 0
         self._frames_bad = 0
+        self._suppressed = 0  # reads withheld because the rig left its reference pose
 
     # ------------------------------------------------------------ lifecycle
 
@@ -324,6 +325,8 @@ class RvcReader:
                 "frames_bad": self._frames_bad,
                 "window": len(self._samples),
                 "calibrated": self.calibration is not None,
+                "mode": (self.calibration or {}).get("mode"),
+                "suppressed_off_reference": self._suppressed,
             }
 
     def averaged_up_sensor(self) -> tuple[float, float, float] | None:
@@ -347,22 +350,49 @@ class RvcReader:
         """Gravity (pointing DOWN) in the CAMERA frame, or None.
 
         This is the contract `scene_recorder.gravity_source` expects and what
-        `SceneSession.imu_up_vector()` on the Mac consumes. Returns None
-        without a calibration rather than guessing an axis mapping — a
-        confidently wrong gravity vector is worse than none, because the Mac
-        would trust it over the floor-plane fit.
+        `SceneSession.imu_up_vector()` on the Mac consumes. Two calibration
+        modes, both produced by `imu_calibrate.py`:
+
+        * **reference** — the normal outcome for a robot that drives level.
+          Gravity in the camera frame is a constant for a rig that only
+          translates and yaws (yaw turns about the gravity axis itself), so
+          the calibration measured it once against a plumb wall board. Here
+          the IMU's job is to confirm the rig is still in that attitude: if
+          it has tilted more than `tilt_tolerance_deg` away, this returns
+          None and the Mac falls back to its floor-plane fit rather than
+          being handed a vector that no longer describes reality.
+
+        * **full** — a rotation solved from several rig attitudes, so
+          gravity is tracked live however the rig is tilted.
+
+        Returns None with no calibration at all, rather than guessing an
+        axis mapping: the Mac prefers an IMU vector over its own floor fit,
+        so a confidently wrong one is worse than none.
         """
         if not self.calibration:
             return None
-        rotation = self.calibration.get("cam_from_imu")
-        if not rotation:
-            return None
+        import numpy as np
+
         up_sensor = self.averaged_up_sensor()
         if up_sensor is None:
             return None
-        import numpy as np
+        sensor = np.asarray(up_sensor, dtype=np.float64)
 
-        up_camera = np.asarray(rotation, dtype=np.float64) @ np.asarray(up_sensor)
+        rotation = self.calibration.get("cam_from_imu")
+        if self.calibration.get("mode") == "full" and rotation:
+            up_camera = np.asarray(rotation, dtype=np.float64) @ sensor
+        else:
+            reference_imu = self.calibration.get("up_imu_reference")
+            reference_cam = self.calibration.get("up_camera_reference")
+            if not reference_imu or not reference_cam:
+                return None
+            drift = angle_between_deg(sensor, np.asarray(reference_imu, dtype=np.float64))
+            tolerance = float(self.calibration.get("tilt_tolerance_deg", 4.0))
+            if not math.isfinite(drift) or drift > tolerance:
+                self._suppressed += 1
+                return None
+            up_camera = np.asarray(reference_cam, dtype=np.float64)
+
         norm = float(np.linalg.norm(up_camera))
         if norm < 1e-6:
             return None
