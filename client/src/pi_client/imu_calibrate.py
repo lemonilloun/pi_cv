@@ -126,6 +126,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-views", type=int, default=8,
                         help="Views averaged into the reference measurement")
     parser.add_argument("--rest-seconds", type=float, default=5.0)
+    parser.add_argument("--settle-seconds", type=float, default=8.0,
+                        help="Once the reference is collected, finish automatically "
+                             "after this long with no new rig attitude")
     parser.add_argument("--tilt-tolerance-deg", type=float, default=DEFAULT_TILT_TOLERANCE_DEG,
                         help="How far the rig may drift from the reference attitude before "
                              "the recorder stops trusting the reference vector")
@@ -332,7 +335,17 @@ def main() -> int:
                     "move it to another side. Preview: http://%s:8080/ -> Live tab.", host)
 
         message = "looking for the board"
+        # Once the reference is in hand the run is already useful, and for a
+        # robot that cannot tilt no further attitude will ever arrive. Ending
+        # on a quiet timer means the common case finishes by itself instead
+        # of sitting there looking stuck; propping a book under a wheel
+        # restarts the clock, so the optional `full` path still works.
+        last_accept = time.monotonic()
         while not stop["flag"] and len(up_camera) < args.views:
+            if (len(up_camera) >= args.reference_views
+                    and time.monotonic() - last_accept >= args.settle_seconds):
+                logger.info("No new rig attitude for %.0f s — finishing.", args.settle_seconds)
+                break
             bgr = source.capture_bgr()
             if bgr is None:
                 continue
@@ -367,14 +380,16 @@ def main() -> int:
                     if novelty >= MIN_NEW_ANGLE_DEG or len(up_camera) < args.reference_views:
                         up_camera.append(cam_up)
                         up_imu.append(imu_vec)
+                        last_accept = time.monotonic()
                         message = (f"view {len(up_camera)} accepted "
                                    f"(attitude {novelty:.1f} deg from the nearest earlier one)")
                         logger.info("View %d/%d  cam_up=[%+.3f %+.3f %+.3f]  "
                                     "imu_up=[%+.3f %+.3f %+.3f]",
                                     len(up_camera), args.views, *cam_up, *imu_vec)
                     else:
-                        message = ("reference collected — prop one side up on a book "
-                                   "to also enable tilt tracking")
+                        remaining = args.settle_seconds - (time.monotonic() - last_accept)
+                        message = (f"reference collected — finishing in {max(0.0, remaining):.0f} s. "
+                                   "Prop one side up on a book now if you want tilt tracking.")
                 elif cam_up is None:
                     message = reason
                 else:
