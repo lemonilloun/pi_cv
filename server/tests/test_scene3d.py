@@ -1035,3 +1035,186 @@ class ImuSeamTest(unittest.TestCase):
             np.testing.assert_allclose(
                 session.imu_up_vector({1: np.eye(4)}), [0, -1, 0], atol=1e-9
             )
+
+
+def _rvc_frame(index=0, yaw=0.0, pitch=0.0, roll=0.0, accel=(0, 0, 1000)):
+    """Build a well-formed RVC frame for tests."""
+    import struct
+
+    body = bytes([index]) + struct.pack(
+        "<hhhhhh",
+        int(round(yaw * 100)), int(round(pitch * 100)), int(round(roll * 100)),
+        int(accel[0]), int(accel[1]), int(accel[2]),
+    ) + bytes(3)
+    return b"\xaa\xaa" + body + bytes([sum(body) & 0xFF])
+
+
+class ImuRvcParseTest(unittest.TestCase):
+    """The framing has to survive a lossy USB-serial bridge: a decoder that
+    only advances whole frames stays misaligned forever after one dropped
+    byte, which looks exactly like a broken sensor."""
+
+    def setUp(self) -> None:
+        from pi_client import imu_rvc
+
+        self.imu = imu_rvc
+
+    def test_frame_is_19_bytes(self) -> None:
+        self.assertEqual(len(_rvc_frame()), self.imu.FRAME_LEN)
+
+    def test_round_trip(self) -> None:
+        sample = self.imu.parse_frame(
+            _rvc_frame(index=42, yaw=5.14, pitch=0.23, roll=-1.29, accel=(20, 4, 997))
+        )
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.index, 42)
+        self.assertAlmostEqual(sample.yaw_deg, 5.14, places=2)
+        self.assertAlmostEqual(sample.roll_deg, -1.29, places=2)
+        self.assertEqual(sample.accel_mg, (20.0, 4.0, 997.0))
+
+    def test_negative_values_are_signed(self) -> None:
+        sample = self.imu.parse_frame(_rvc_frame(pitch=-30.0, accel=(-500, 0, -866)))
+        self.assertAlmostEqual(sample.pitch_deg, -30.0, places=2)
+        self.assertEqual(sample.accel_mg[0], -500.0)
+        self.assertEqual(sample.accel_mg[2], -866.0)
+
+    def test_bad_checksum_rejected(self) -> None:
+        frame = bytearray(_rvc_frame())
+        frame[18] ^= 0xFF
+        self.assertIsNone(self.imu.parse_frame(bytes(frame)))
+
+    def test_wrong_header_rejected(self) -> None:
+        frame = bytearray(_rvc_frame())
+        frame[0] = 0xAB
+        self.assertIsNone(self.imu.parse_frame(bytes(frame)))
+
+    def test_accelerometer_up_points_up_at_rest(self) -> None:
+        # An accelerometer at rest reads the normal force, i.e. UP; gravity
+        # is its negation. Getting this backwards silently inverts the mesh.
+        sample = self.imu.parse_frame(_rvc_frame(accel=(0, 0, 1000)))
+        self.assertEqual(sample.up_sensor(), (0.0, 0.0, 1.0))
+        self.assertEqual(sample.down_sensor(), (-0.0, -0.0, -1.0))
+
+    def test_zero_acceleration_has_no_direction(self) -> None:
+        self.assertIsNone(self.imu.parse_frame(_rvc_frame(accel=(0, 0, 0))).up_sensor())
+
+    def test_stream_of_frames(self) -> None:
+        stream = b"".join(_rvc_frame(index=i) for i in range(5))
+        samples, rest = self.imu.iter_frames(stream)
+        self.assertEqual([s.index for s in samples], [0, 1, 2, 3, 4])
+        self.assertEqual(rest, b"")
+
+    def test_resyncs_after_a_dropped_byte(self) -> None:
+        good = _rvc_frame(index=7)
+        stream = b"\x12\x34" + _rvc_frame(index=6)[3:] + good  # first frame truncated
+        samples, _ = self.imu.iter_frames(stream)
+        self.assertEqual([s.index for s in samples], [7])
+
+    def test_partial_trailing_frame_is_kept_for_next_read(self) -> None:
+        whole = _rvc_frame(index=1)
+        samples, rest = self.imu.iter_frames(whole + _rvc_frame(index=2)[:10])
+        self.assertEqual([s.index for s in samples], [1])
+        self.assertEqual(len(rest), 10)
+        # The remainder plus the rest of the frame must decode next time.
+        more, _ = self.imu.iter_frames(rest + _rvc_frame(index=2)[10:])
+        self.assertEqual([s.index for s in more], [2])
+
+    def test_header_bytes_inside_the_payload_do_not_derail_it(self) -> None:
+        # 0xAAAA is a legal accel value (-21846 mg is not, but the byte
+        # pattern can still occur across fields), so the decoder must rely on
+        # the checksum rather than the header alone.
+        stream = _rvc_frame(index=3, accel=(-21846, 0, 1000)) + _rvc_frame(index=4)
+        samples, _ = self.imu.iter_frames(stream)
+        self.assertEqual([s.index for s in samples], [3, 4])
+
+    def test_tilt_angles_agree_between_the_two_sources(self) -> None:
+        # Convention-free cross-check used by the calibration's rest stage.
+        sample = self.imu.parse_frame(_rvc_frame(pitch=0.23, roll=-1.29, accel=(22, 4, 995)))
+        self.assertAlmostEqual(sample.euler_tilt_deg(), sample.accel_tilt_deg(), delta=0.5)
+
+
+class KabschTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from pi_client.imu_rvc import angle_between_deg, kabsch_rotation
+
+        self.kabsch = kabsch_rotation
+        self.angle = angle_between_deg
+
+    @staticmethod
+    def _rotation(yaw, pitch, roll):
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cr, sr = np.cos(roll), np.sin(roll)
+        rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+        ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+        rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+        return rz @ ry @ rx
+
+    def test_recovers_a_known_rotation(self) -> None:
+        truth = self._rotation(0.4, -0.25, 0.9)
+        rng = np.random.default_rng(0)
+        source = rng.normal(size=(8, 3))
+        source /= np.linalg.norm(source, axis=1, keepdims=True)
+        target = source @ truth.T
+        np.testing.assert_allclose(self.kabsch(source, target), truth, atol=1e-9)
+
+    def test_result_is_a_rotation_not_a_reflection(self) -> None:
+        rng = np.random.default_rng(1)
+        source = rng.normal(size=(6, 3))
+        target = rng.normal(size=(6, 3))
+        rotation = self.kabsch(source, target)
+        self.assertAlmostEqual(float(np.linalg.det(rotation)), 1.0, places=9)
+        np.testing.assert_allclose(rotation @ rotation.T, np.eye(3), atol=1e-9)
+
+    def test_tolerates_noise(self) -> None:
+        truth = self._rotation(-0.7, 0.3, 0.15)
+        rng = np.random.default_rng(2)
+        source = rng.normal(size=(20, 3))
+        source /= np.linalg.norm(source, axis=1, keepdims=True)
+        target = source @ truth.T + rng.normal(scale=0.02, size=(20, 3))
+        target /= np.linalg.norm(target, axis=1, keepdims=True)
+        recovered = self.kabsch(source, target)
+        residual = max(self.angle(recovered @ s, t) for s, t in zip(source, target))
+        self.assertLess(residual, 5.0)
+
+    def test_rejects_too_few_pairs(self) -> None:
+        with self.assertRaises(ValueError):
+            self.kabsch([[0, 0, 1]], [[0, 0, 1]])
+
+
+class ImuCalibrationGeometryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from pi_client.imu_calibrate import board_normal_camera, spread_deg
+
+        self.board_normal_camera = board_normal_camera
+        self.spread_deg = spread_deg
+
+    def test_board_normal_points_back_at_the_camera(self) -> None:
+        """Corner ordering flips the board's own +Z with viewing angle, so
+        the sign has to be settled physically, not by convention."""
+        import cv2
+
+        # Board 2 m in front of the camera, its own +Z pointing AWAY.
+        rvec, _ = cv2.Rodrigues(np.eye(3))
+        normal = self.board_normal_camera(rvec, np.array([0.0, 0.0, 2.0]))
+        self.assertLess(float(normal[2]), 0.0)  # flipped to face the camera
+
+    def test_board_normal_left_alone_when_already_facing_the_camera(self) -> None:
+        import cv2
+
+        flip, _ = cv2.Rodrigues(np.array([np.pi, 0.0, 0.0]))
+        rvec, _ = cv2.Rodrigues(flip)
+        normal = self.board_normal_camera(rvec, np.array([0.0, 0.0, 2.0]))
+        self.assertLess(float(normal[2]), 0.0)
+
+    def test_spread_of_identical_vectors_is_zero(self) -> None:
+        vectors = [np.array([0.0, 0.0, 1.0])] * 4
+        self.assertAlmostEqual(self.spread_deg(vectors), 0.0, places=6)
+
+    def test_spread_finds_the_widest_pair(self) -> None:
+        vectors = [
+            np.array([0.0, 0.0, 1.0]),
+            np.array([0.0, np.sin(np.radians(10)), np.cos(np.radians(10))]),
+            np.array([0.0, np.sin(np.radians(40)), np.cos(np.radians(40))]),
+        ]
+        self.assertAlmostEqual(self.spread_deg(vectors), 40.0, places=3)

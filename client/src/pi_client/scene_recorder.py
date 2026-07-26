@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-keyframes", type=int, default=2000)
     parser.add_argument("--host", default=None, help="Mac server host (default: from .env/config)")
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--no-imu", action="store_true",
+                        help="Ignore the IMU even if it is connected and calibrated")
+    parser.add_argument("--imu-port", default="/dev/ttyUSB0")
+    parser.add_argument("--imu-calibration", type=Path,
+                        default=REPO_ROOT / "config/imu_calibration.json")
     parser.add_argument("--offline", action="store_true",
                         help="No uplink: write everything locally (old behavior)")
     parser.add_argument("--no-preview", action="store_true",
@@ -377,9 +382,30 @@ class SceneRecorder:
             min_shift_px=args.keyframe_shift_px,
             blur_threshold=args.blur_threshold,
         )
-        # Set to an object with .read() -> [x, y, z] (gravity in the camera
-        # frame) once an IMU is fitted; see _emit_keyframe.
+        # IMU. Optional by design: no sensor, no calibration, or an unplugged
+        # cable all degrade to the Mac's floor-plane gravity fit rather than
+        # stopping a recording. `read()` returns gravity (down) in the camera
+        # frame — see imu_rvc.RvcReader and _emit_keyframe.
         self.gravity_source = None
+        if not args.no_imu:
+            from pi_client.imu_rvc import RvcReader
+
+            reader = RvcReader(
+                port=args.imu_port, calibration_path=args.imu_calibration
+            )
+            if not args.imu_calibration.exists():
+                logger.warning(
+                    "IMU calibration missing (%s) — gravity will NOT be recorded. "
+                    "Run ./scripts/run_imu_calibrate.sh; without it the sensor's "
+                    "orientation relative to the camera is unknown and a guessed "
+                    "gravity vector would be worse than none.",
+                    args.imu_calibration,
+                )
+            elif reader.start():
+                self.gravity_source = reader
+            else:
+                logger.warning("IMU not available on %s — continuing without it.",
+                               args.imu_port)
         self._keyframe_index = 0
         self._local_keyframes = 0
         self._last_keyframe_at = 0.0
@@ -657,6 +683,12 @@ class SceneRecorder:
             pass
         if self.hailo is not None:
             self.hailo.close()
+        if self.gravity_source is not None:
+            try:
+                logger.info("IMU: %s", self.gravity_source.stats())
+                self.gravity_source.stop()
+            except Exception:
+                pass
         session_meta = {
             "created_at": self._started_at,
             "duration_s": round(time.time() - self._started_at, 1),
@@ -668,6 +700,8 @@ class SceneRecorder:
             "confidence": self.args.confidence,
             "fps_target": self.args.fps,
             "keyframes_local_fallback": self._local_keyframes,
+            "imu": self.gravity_source is not None,
+            "keyframe_selection": dict(self._select_reasons),
         }
         sent_end = False
         if self.uplink is not None:

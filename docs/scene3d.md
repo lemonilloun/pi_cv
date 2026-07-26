@@ -284,6 +284,56 @@ PnP against the COLMAP sparse model, i.e. visual relocalization) would
 compute pose from the live frame directly instead of borrowing it, but
 that's a separate, heavier feature — not implemented yet.
 
+## IMU (BNO08x UART-RVC) — gravity that doesn't depend on seeing the floor
+
+The sensor sits on a CH340 USB-serial bridge at `/dev/ttyUSB0`, 115200 8N1,
+streaming **UART-RVC** — a fixed 19-byte frame at 100 Hz, `0xAA 0xAA`,
+index, yaw/pitch/roll (0.01°), accel xyz (mg), checksum = `sum(bytes 2..17)
+& 0xFF`. In a terminal this looks like binary garbage with a counter, which
+reads like SHTP; it isn't. Verified on the device: 200/200 frames
+checksum-clean, 100 Hz, |accel| ≈ 995 mg at rest, per-axis noise ~2 mg.
+
+**Gravity comes from the accelerometer, not from the fused pitch/roll.** The
+frame carries both and they disagree by an axis permutation — measured at
+rest, "down" is `(+0.007, +0.023, −0.9997)` from the Euler angles and
+`(−0.024, −0.007, −0.9997)` from the accelerometer. Identical tilt (~1.4°),
+different frame. Rather than pick a datasheet convention, `imu_rvc.py` uses
+the accelerometer (a direct measurement whose 1 g scale we verified) and
+cross-checks it against the Euler *tilt angle*, which is convention-free.
+Linear acceleration is handled by a 0.5 s median window on the Pi plus the
+Mac averaging gravity over every keyframe of the session.
+
+**The sensor→camera rotation is measured, never declared.**
+`./scripts/run_imu_calibrate.sh` puts the chessboard flat on the floor:
+`solvePnP` gives the floor normal (= up) in the camera frame, the
+accelerometer gives up in its own frame, and tilting the rig produces pairs
+that fix the rotation via Wahba/Kabsch. Guards that stop a confident wrong
+answer: a rest stage (|accel| must be ~1 g, both tilt estimates must agree),
+a minimum angular spread of 25° (pairs at one orientation leave the rotation
+about that axis unconstrained), and a reported per-pair residual — a couple
+of degrees is good, over 8° means redo it. It also prints how far above
+horizontal the camera's optical axis sits, which is the number the recording
+guide's "tilt up 15–25°" rule refers to.
+
+Needs `config/scene_intrinsics.json` first (solvePnP needs a calibrated
+camera). Writes `config/imu_calibration.json` (gitignored, like the
+intrinsics).
+
+```bash
+./scripts/run_scene_calibrate.sh --square-mm 24 --lens-position 1.0  # camera first
+./scripts/run_imu_calibrate.sh  --square-mm 24                       # then the IMU
+```
+
+The recorder then picks it up automatically and writes `gravity` into each
+keyframe's `meta.json`; `--no-imu` opts out. **Without the calibration file
+the reader reports no gravity at all** rather than guessing an axis mapping —
+the Mac trusts an IMU vector over its own floor fit, so a confidently wrong
+one is worse than none.
+
+RVC gives no raw gyro or magnetometer, so gyro-as-rotation-prior for COLMAP
+is not available in this mode; it would need SHTP. Not a loss right now —
+poses already register 99% of frames.
+
 ## Session management
 
 Sessions can be renamed (display name, stored in session_meta.json — the
