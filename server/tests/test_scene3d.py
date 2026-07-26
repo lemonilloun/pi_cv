@@ -1218,3 +1218,42 @@ class ImuCalibrationGeometryTest(unittest.TestCase):
             np.array([0.0, np.sin(np.radians(40)), np.cos(np.radians(40))]),
         ]
         self.assertAlmostEqual(self.spread_deg(vectors), 40.0, places=3)
+
+
+class NominalMountingTest(unittest.TestCase):
+    """The hand-described mounting (accel X forward, Y left) is reported as a
+    difference, never used as the answer — but the reference matrix itself
+    must be a real rotation or the reported difference is meaningless."""
+
+    def setUp(self) -> None:
+        from pi_client.imu_calibrate import NOMINAL_CAM_FROM_IMU, rotation_angle_deg
+
+        self.nominal = NOMINAL_CAM_FROM_IMU
+        self.angle = rotation_angle_deg
+
+    def test_nominal_is_a_proper_rotation(self) -> None:
+        self.assertAlmostEqual(float(np.linalg.det(self.nominal)), 1.0, places=9)
+        np.testing.assert_allclose(self.nominal @ self.nominal.T, np.eye(3), atol=1e-12)
+
+    def test_nominal_maps_the_described_axes(self) -> None:
+        # IMU +X is forward -> camera +Z (forward)
+        np.testing.assert_allclose(self.nominal @ [1, 0, 0], [0, 0, 1], atol=1e-12)
+        # IMU +Y is left -> camera -X (camera X points right)
+        np.testing.assert_allclose(self.nominal @ [0, 1, 0], [-1, 0, 0], atol=1e-12)
+        # IMU +Z is up -> camera -Y (camera Y points down)
+        np.testing.assert_allclose(self.nominal @ [0, 0, 1], [0, -1, 0], atol=1e-12)
+
+    def test_identical_rotations_are_zero_apart(self) -> None:
+        self.assertAlmostEqual(self.angle(self.nominal, self.nominal), 0.0, places=6)
+
+    def test_a_20_degree_camera_tilt_reads_as_20_degrees(self) -> None:
+        theta = np.radians(20.0)
+        # Pitch about the camera's X axis, i.e. the camera tilted up.
+        pitch = np.array([
+            [1, 0, 0],
+            [0, np.cos(theta), -np.sin(theta)],
+            [0, np.sin(theta), np.cos(theta)],
+        ])
+        self.assertAlmostEqual(
+            self.angle(pitch @ self.nominal, self.nominal), 20.0, places=4
+        )

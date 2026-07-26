@@ -77,6 +77,26 @@ MIN_SPREAD_DEG = 25.0
 GOOD_RESIDUAL_DEG = 3.0
 USABLE_RESIDUAL_DEG = 8.0
 
+# The mounting as described by hand: the IMU's accelerometer X points
+# forward and Y points left, i.e. Z points up. In OpenCV camera axes
+# (X right, Y down, Z forward) that maps IMU X -> +Z, Y -> -X, Z -> -Y.
+# Nothing depends on this being right — the calibration measures the real
+# rotation regardless. It is reported as a difference so a surprise
+# (a rotated bracket, or the camera's own up-tilt) shows up as a number
+# instead of quietly living inside a 3x3 matrix.
+NOMINAL_CAM_FROM_IMU = np.array([
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [1.0, 0.0, 0.0],
+])
+
+
+def rotation_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    """How far apart two rotations are, as a single angle."""
+    relative = np.asarray(a) @ np.asarray(b).T
+    cos_theta = (float(np.trace(relative)) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0))))
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Calibrate IMU orientation against the camera")
@@ -367,6 +387,17 @@ def main() -> int:
         logger.info("Camera optical axis is %.1f deg above horizontal in the current pose "
                     "(the recording guide wants +15 to +25).", camera_pitch)
 
+    off_nominal = rotation_angle_deg(rotation, NOMINAL_CAM_FROM_IMU)
+    logger.info("Measured mounting differs from the nominal "
+                "(accel X forward, Y left) by %.1f deg.", off_nominal)
+    if off_nominal > 30.0:
+        logger.warning(
+            "  That is more than the camera's up-tilt can explain. Either the sensor "
+            "board is mounted rotated relative to how it was described, or the board "
+            "was not flat on the floor during capture. The measured rotation is what "
+            "gets used either way — this is a heads-up, not an error."
+        )
+
     payload = {
         "cam_from_imu": [[float(v) for v in row] for row in rotation],
         "pairs": len(up_camera),
@@ -374,6 +405,7 @@ def main() -> int:
         "residual_deg_mean": round(mean_residual, 3),
         "residual_deg_max": round(max_residual, 3),
         "camera_pitch_deg": None if camera_pitch is None else round(camera_pitch, 1),
+        "off_nominal_deg": round(off_nominal, 1),
         "rest": rest,
         "port": args.port,
         "baud": args.baud,
