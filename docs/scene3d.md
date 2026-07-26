@@ -57,6 +57,25 @@ processes it — no real-time constraint (2-3 fps recording is the target).
    and the mesh came out 12 × 15 m for a room the camera crossed in 2 × 4 m.
    The step reports `hfov_deg` / `hfov_deg_assumed` and warns when BA had to
    move the focal length more than 10%.
+   **Metric scale has two independent sources.** COLMAP recovers motion only
+   up to a factor. Historically that factor came from
+   median(DAv2 metric depth / COLMAP sparse depth), which inherits whatever
+   scale error the monocular network carries — the reason room mapping has
+   been on hold. With an IMU fitted there is a second, network-independent
+   source: each keyframe carries `imu.segment.distance_m`, a preintegrated
+   displacement in **metres**, and its ratio to the COLMAP chord between the
+   same two keyframes is the factor in physical units. Magnitudes only, so
+   the rotation about gravity — unobservable for a robot that drives
+   in-plane — never enters it. An interval is used only when both keyframes
+   are registered and consecutive, motion exceeds 3 cm, yaw barely changed
+   (displacement accumulates in the rotating sensor frame, so turning
+   shortens it) and speed is plausible; survivors go through the same
+   MAD-rejecting median as the depth scale. `poses.scale_source`
+   (`auto`|`depth`|`imu`, default `auto`) takes the IMU when it has
+   `min_imu_intervals` (20) and a spread under `max_imu_scale_iqr` (0.25),
+   else depth. Both land in the report as `scale_depth` / `scale_imu`, and a
+   disagreement over 20% is warned about — they are independent, so a gap
+   means one of them is wrong.
 3. `tsdf` — depth hygiene, then Open3D ScalableTSDFVolume (voxel 2 cm) →
    `room_mesh.ply` + carved `floor_plan.png` + `occupancy.npz`:
    - **filtering** (`depth_filter.py`) writes `derived/depth_filtered/` once,
