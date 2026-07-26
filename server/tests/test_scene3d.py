@@ -1326,3 +1326,95 @@ class ImuReadModeTest(unittest.TestCase):
         reader._samples = [self._sample((500, 0, 866))]
         tilted = reader.read()
         self.assertGreater(abs(tilted[0]), 0.4)
+
+
+class ImuIntegratorTest(unittest.TestCase):
+    """Preintegration is the piece that makes the accelerometer useful: over
+    a keyframe interval its error is millimetres, and the next camera frame
+    resets it. These pin down the arithmetic and the guards."""
+
+    def setUp(self) -> None:
+        from pi_client.imu_rvc import G_MS2, ImuIntegrator, ImuSample
+
+        self.G = G_MS2
+        self.ImuIntegrator = ImuIntegrator
+        self.ImuSample = ImuSample
+
+    def _sample(self, t, accel_mg):
+        return self.ImuSample(index=int(t * 100) % 256, yaw_deg=0.0, pitch_deg=0.0,
+                              roll_deg=0.0, accel_mg=accel_mg, monotonic=t)
+
+    def _feed(self, integrator, accel_mg, duration, rate=100.0):
+        step = 1.0 / rate
+        t = 0.0
+        while t <= duration + 1e-9:
+            integrator.add(self._sample(t, accel_mg))
+            t += step
+
+    def test_at_rest_nothing_moves(self) -> None:
+        integrator = self.ImuIntegrator(up_sensor=(0.0, 0.0, 1.0))
+        self._feed(integrator, (0.0, 0.0, 1000.0), 2.0)
+        segment = integrator.cut()
+        self.assertAlmostEqual(segment["distance_m"], 0.0, places=6)
+        self.assertAlmostEqual(segment["speed_ms"], 0.0, places=6)
+        self.assertAlmostEqual(segment["dt_s"], 2.0, places=2)
+
+    def test_gravity_is_removed_using_the_measured_direction(self) -> None:
+        # Sensor mounted so that "up" is its -X axis: gravity shows on X, and
+        # a datasheet-derived assumption about which axis is vertical would
+        # produce a metre per second of phantom motion here.
+        integrator = self.ImuIntegrator(up_sensor=(-1.0, 0.0, 0.0))
+        self._feed(integrator, (-1000.0, 0.0, 0.0), 1.0)
+        self.assertAlmostEqual(integrator.cut()["distance_m"], 0.0, places=6)
+
+    def test_constant_acceleration_matches_the_closed_form(self) -> None:
+        # 0.5 m/s^2 for 1 s -> 0.25 m travelled, 0.5 m/s reached.
+        integrator = self.ImuIntegrator(up_sensor=(0.0, 0.0, 1.0))
+        extra_mg = 0.5 / self.G * 1000.0
+        self._feed(integrator, (extra_mg, 0.0, 1000.0), 1.0)
+        segment = integrator.cut()
+        self.assertAlmostEqual(segment["distance_m"], 0.25, delta=0.01)
+        self.assertAlmostEqual(segment["speed_ms"], 0.5, delta=0.01)
+
+    def test_realistic_interval_error_is_millimetres(self) -> None:
+        """The number the whole approach rests on: a 0.2 deg gravity error
+        over one keyframe interval must stay far below the motion itself."""
+        integrator = self.ImuIntegrator(up_sensor=(0.0, 0.0, 1.0))
+        tilt = np.radians(0.2)
+        leaked = (np.sin(tilt) * 1000.0, 0.0, np.cos(tilt) * 1000.0)
+        self._feed(integrator, leaked, 0.4)
+        drift = integrator.cut()["distance_m"]
+        self.assertLess(drift, 0.005)          # millimetres, not centimetres
+        self.assertLess(drift, 0.05 * 0.12)    # under 5% of a ~12 cm step
+
+    def test_no_reference_means_no_integration(self) -> None:
+        integrator = self.ImuIntegrator(up_sensor=None)
+        self._feed(integrator, (0.0, 0.0, 1000.0), 1.0)
+        segment = integrator.cut()
+        self.assertEqual(segment["samples"], 0)
+        self.assertEqual(segment["distance_m"], 0.0)
+
+    def test_a_long_gap_is_not_integrated_across(self) -> None:
+        # A dropped USB connection must not turn into a metre of phantom
+        # motion when samples resume.
+        integrator = self.ImuIntegrator(up_sensor=(0.0, 0.0, 1.0))
+        extra_mg = 1.0 / self.G * 1000.0
+        integrator.add(self._sample(0.0, (extra_mg, 0.0, 1000.0)))
+        integrator.add(self._sample(30.0, (extra_mg, 0.0, 1000.0)))
+        self.assertEqual(integrator.cut()["samples"], 0)
+
+    def test_cut_resets_but_keeps_continuity(self) -> None:
+        integrator = self.ImuIntegrator(up_sensor=(0.0, 0.0, 1.0))
+        self._feed(integrator, (0.0, 0.0, 1000.0), 0.5)
+        integrator.cut()
+        second = integrator.cut()
+        self.assertEqual(second["samples"], 0)
+        self.assertEqual(second["dt_s"], 0.0)
+
+    def test_peak_acceleration_is_reported_for_shake_rejection(self) -> None:
+        integrator = self.ImuIntegrator(up_sensor=(0.0, 0.0, 1.0))
+        integrator.add(self._sample(0.00, (0.0, 0.0, 1000.0)))
+        integrator.add(self._sample(0.01, (0.0, 0.0, 1000.0)))
+        integrator.add(self._sample(0.02, (500.0, 0.0, 1000.0)))  # a jolt
+        integrator.add(self._sample(0.03, (0.0, 0.0, 1000.0)))
+        self.assertGreater(integrator.cut()["peak_linear_accel_ms2"], 4.0)

@@ -591,17 +591,30 @@ class SceneRecorder:
             "timestamp_ns": int(now * 1e9),
             "detections": meta_dets,
         }
-        # IMU seam. `self.gravity_source` is None until the accelerometer is
-        # fitted; when it exists it returns the gravity vector in the CAMERA
-        # frame (pointing down), and the Mac side is already waiting for it —
-        # SceneSession.imu_up_vector() rotates it into world space and
-        # occupancy.estimate_gravity() prefers it over the floor fit. Adding
-        # the sensor is therefore a change to this one attribute, not to the
-        # pipeline, and old sessions without the field keep working.
+        # Everything the IMU has to say about this keyframe. Two consumers:
+        #
+        #   `gravity` — down in the camera frame. SceneSession.imu_up_vector()
+        #   rotates it into world space and occupancy.estimate_gravity()
+        #   prefers it over the floor-plane fit.
+        #
+        #   `imu.segment` — motion preintegrated since the previous keyframe.
+        #   Its displacement magnitude is a METRIC measurement of how far the
+        #   rig moved, which is the one thing vision cannot supply on its own:
+        #   COLMAP recovers motion only up to a scale factor, and the pipeline
+        #   currently pins that factor with monocular depth that carries its
+        #   own scale error. Comparing the two over many intervals grounds the
+        #   scale in m/s^2 instead. Magnitudes only, so the rotation about
+        #   gravity — which a robot that drives in-plane can never observe —
+        #   never enters the answer.
+        #
+        # Sessions recorded without an IMU simply lack both fields.
         if self.gravity_source is not None:
-            gravity = self.gravity_source.read()
-            if gravity is not None:
-                meta["gravity"] = [round(float(v), 5) for v in gravity]
+            motion = self.gravity_source.read_motion()
+            if motion is not None:
+                gravity = motion.pop("gravity_camera", None)
+                if gravity is not None:
+                    meta["gravity"] = gravity
+                meta["imu"] = motion
 
         sent = False
         if self.uplink is not None:

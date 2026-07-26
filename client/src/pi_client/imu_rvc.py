@@ -215,6 +215,114 @@ def load_calibration(path: Path) -> dict[str, Any] | None:
         return None
 
 
+G_MS2 = 9.80665
+
+
+class ImuIntegrator:
+    """Preintegrates motion between keyframes.
+
+    Inertial position diverges when nothing corrects it — the error grows as
+    0.5*a*t^2, so a residual acceleration of a few hundredths of a m/s^2
+    becomes tens of metres over a minute. That is why inertial-only
+    navigation does not exist. It is *not* why the accelerometer is useless:
+    over the fraction of a second between two keyframes the same error is
+    millimetres, and the next camera frame resets it. This is the mechanism
+    every visual-inertial system runs on.
+
+    Concretely, with gravity known in the sensor frame to ~0.2 deg (what the
+    calibration achieves here), the leaked acceleration is
+    9.81*sin(0.2 deg) = 0.034 m/s^2, giving 2.7 mm over 0.4 s against a
+    typical inter-keyframe motion of ~12 cm — about 2%.
+
+    What that buys, and why it matters more than a drawn trajectory:
+    **metric scale**. Vision recovers motion only up to an unknown factor,
+    which the pipeline currently pins with monocular depth that carries its
+    own scale error. The accelerometer measures metres. The ratio of the two
+    displacement magnitudes over many intervals is the scale factor — and
+    magnitudes are enough, so this works in `reference` mode without knowing
+    the rotation about gravity.
+
+    Gravity is removed using the direction measured at calibration rather
+    than any datasheet axis convention. Everything is accumulated in the
+    SENSOR frame; only lengths are consumed downstream, which is exactly
+    what keeps the unobservable spin about gravity out of the answer.
+    """
+
+    def __init__(self, up_sensor: tuple[float, float, float] | None = None) -> None:
+        self.up_sensor = up_sensor
+        self.reset()
+
+    def reset(self) -> None:
+        self._dt = 0.0
+        self._samples = 0
+        self._dv = [0.0, 0.0, 0.0]     # velocity change, sensor frame, m/s
+        self._dp = [0.0, 0.0, 0.0]     # position change, sensor frame, m
+        self._vel = [0.0, 0.0, 0.0]    # running velocity within this segment
+        self._peak_linear = 0.0        # m/s^2, for shake/blur rejection
+        self._sum_linear = 0.0
+        self._last: ImuSample | None = None
+
+    def set_reference(self, up_sensor: tuple[float, float, float] | None) -> None:
+        self.up_sensor = up_sensor
+
+    def linear_accel(self, sample: ImuSample) -> tuple[float, float, float] | None:
+        """Acceleration with gravity removed, in m/s^2, sensor frame."""
+        if self.up_sensor is None:
+            return None
+        ux, uy, uz = self.up_sensor
+        # Specific force in m/s^2; at rest this is +1 g along `up`.
+        ax = sample.accel_mg[0] / 1000.0 * G_MS2
+        ay = sample.accel_mg[1] / 1000.0 * G_MS2
+        az = sample.accel_mg[2] / 1000.0 * G_MS2
+        return (ax - ux * G_MS2, ay - uy * G_MS2, az - uz * G_MS2)
+
+    def add(self, sample: ImuSample) -> None:
+        previous = self._last
+        self._last = sample
+        if previous is None:
+            return
+        dt = sample.monotonic - previous.monotonic
+        # Guard against a stalled or rewound clock, and against a gap so long
+        # that integrating across it is meaningless.
+        if not (0.0 < dt < 0.5):
+            return
+        linear = self.linear_accel(sample)
+        if linear is None:
+            return
+
+        magnitude = math.sqrt(sum(v * v for v in linear))
+        self._peak_linear = max(self._peak_linear, magnitude)
+        self._sum_linear += magnitude
+        self._samples += 1
+        self._dt += dt
+        for k in range(3):
+            # Trapezoid on position: using the mid-segment velocity rather
+            # than the end value keeps a steady acceleration from being
+            # over-counted by a full 0.5*a*dt^2 every step.
+            self._dp[k] += self._vel[k] * dt + 0.5 * linear[k] * dt * dt
+            self._vel[k] += linear[k] * dt
+            self._dv[k] += linear[k] * dt
+
+    def cut(self) -> dict[str, Any]:
+        """Take the segment accumulated so far and start a new one."""
+        segment = {
+            "dt_s": round(self._dt, 4),
+            "samples": self._samples,
+            "delta_p_m": [round(v, 5) for v in self._dp],
+            "delta_v_ms": [round(v, 5) for v in self._dv],
+            "distance_m": round(math.sqrt(sum(v * v for v in self._dp)), 5),
+            "speed_ms": round(math.sqrt(sum(v * v for v in self._vel)), 5),
+            "peak_linear_accel_ms2": round(self._peak_linear, 4),
+            "mean_linear_accel_ms2": round(
+                self._sum_linear / self._samples if self._samples else 0.0, 4
+            ),
+        }
+        last = self._last
+        self.reset()
+        self._last = last  # continuity: the next segment starts where this ended
+        return segment
+
+
 class RvcReader:
     """Background reader keeping a short window of recent samples.
 
@@ -242,6 +350,10 @@ class RvcReader:
         self._frames_ok = 0
         self._frames_bad = 0
         self._suppressed = 0  # reads withheld because the rig left its reference pose
+        reference_up = (self.calibration or {}).get("up_imu_reference")
+        self.integrator = ImuIntegrator(
+            tuple(reference_up) if reference_up else None
+        )
 
     # ------------------------------------------------------------ lifecycle
 
@@ -307,6 +419,12 @@ class RvcReader:
                 self._samples.extend(samples)
                 cutoff = now - self.window_s
                 self._samples = [s for s in self._samples if s.monotonic >= cutoff]
+                # Integration has to happen here, on every sample: the
+                # rolling window only keeps 0.5 s, but a keyframe interval can
+                # be several seconds, and motion between keyframes is exactly
+                # what the scale estimate needs.
+                for sample in samples:
+                    self.integrator.add(sample)
 
     # ---------------------------------------------------------------- reads
 
@@ -345,6 +463,32 @@ class RvcReader:
         if norm < 1e-6:
             return None
         return (axes[0] / norm, axes[1] / norm, axes[2] / norm)
+
+    def read_motion(self) -> dict[str, Any] | None:
+        """Everything the IMU knows about this keyframe, and closes the
+        preintegration segment that ended with it.
+
+        Deliberately raw: the segment's displacement magnitude, the attitude,
+        and the shake statistics all travel to the Mac, where they are fused
+        with the poses. The Pi does not try to decide anything from them.
+        """
+        sample = self.latest()
+        if sample is None:
+            return None
+        with self._lock:
+            segment = self.integrator.cut()
+        motion: dict[str, Any] = {
+            "yaw_deg": round(sample.yaw_deg, 2),
+            "pitch_deg": round(sample.pitch_deg, 2),
+            "roll_deg": round(sample.roll_deg, 2),
+            "tilt_deg": round(sample.accel_tilt_deg(), 2),
+            "accel_mg": [round(v, 1) for v in sample.accel_mg],
+            "segment": segment,
+        }
+        gravity = self.read()
+        if gravity is not None:
+            motion["gravity_camera"] = [round(v, 5) for v in gravity]
+        return motion
 
     def read(self) -> list[float] | None:
         """Gravity (pointing DOWN) in the CAMERA frame, or None.
