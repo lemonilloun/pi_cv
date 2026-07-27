@@ -499,13 +499,28 @@ def main() -> int:
                         cost_at_5deg)
             logger.info("  measured mounting differs from the described one "
                         "(accel X forward, Y left) by %.1f deg.", payload["off_nominal_deg"])
+    else:
+        payload["mode"] = "reference"
+        logger.info("Attitude spread was %.1f deg (need %.0f for cam_from_imu's 3D rotation "
+                    "fit) — writing a REFERENCE calibration for gravity. That is the expected "
+                    "outcome for a robot that drives level: gravity in the camera frame is a "
+                    "constant, and this is a direct measurement of it. The recorder will emit "
+                    "it for every keyframe and withhold it if the rig ever tilts more than "
+                    "%.0f deg off this pose.",
+                    spread, FULL_MODE_SPREAD_DEG, args.tilt_tolerance_deg)
 
-        # Independent of cam_from_imu: this is the fix for the metric-scale
-        # bug (docs/scene3d.md, poses_step.imu_scale_samples) — a live
-        # tilt->gravity model fit from the same multi-attitude data, so
-        # ImuIntegrator can stop assuming the rig never leaves the pose
-        # gravity was measured in. Gated on its own residual, independent of
-        # whether cam_from_imu above was good enough to keep.
+    # Independent of cam_from_imu and of the 8 deg full-mode gate above:
+    # this is the fix for the metric-scale bug (docs/scene3d.md,
+    # poses_step.imu_scale_samples) — a live tilt->gravity model fit from
+    # the same multi-attitude data. It's a much lower bar than
+    # cam_from_imu's 3D rotation (a 2D linear regression, not a Wahba
+    # solve), so it doesn't need FULL_MODE_SPREAD_DEG of spread — just
+    # enough that pitch and roll both varied a little (fit_tilt_model's own
+    # rank check catches "not enough", e.g. the rig only ever pitched and
+    # never rolled). A few seconds of the rig gently rocking in front of
+    # the board — the same small wobble it actually does while driving —
+    # is exactly the right input, and is usually well under 8 deg.
+    if len(up_camera) > args.reference_views:
         reference_pitch_deg, reference_roll_deg = np.mean(
             pitch_roll[: args.reference_views], axis=0
         )
@@ -513,10 +528,11 @@ def main() -> int:
             pitch_roll, up_imu, reference_pitch_deg, reference_roll_deg, reference_imu
         )
         if tilt_model is None:
-            logger.warning("Not enough independent attitude spread to fit a tilt model "
-                            "(need the rig propped up in at least two different directions, "
-                            "e.g. front then side) — ImuIntegrator will keep using the static "
-                            "reference vector.")
+            logger.warning("Not enough independent attitude spread to fit a tilt model — "
+                            "need the rig's pitch AND roll to both vary a little (not just "
+                            "one of them), e.g. gently rock it in front of the board rather "
+                            "than tilting it the same way every time. ImuIntegrator will keep "
+                            "using the static reference vector.")
         elif tilt_model["fit_residual_deg_mean"] <= GOOD_RESIDUAL_DEG:
             payload["tilt_model"] = tilt_model
             logger.info("Tilt model: residual mean %.2f deg, max %.2f deg over %d attitudes — "
@@ -532,13 +548,9 @@ def main() -> int:
                             "ImuIntegrator will keep using the static reference vector.",
                             tilt_model["fit_residual_deg_mean"])
     else:
-        payload["mode"] = "reference"
-        logger.info("Attitude spread was %.1f deg (need %.0f for tilt tracking) — writing a "
-                    "REFERENCE calibration. That is the expected outcome for a robot that "
-                    "drives level: gravity in the camera frame is a constant, and this is a "
-                    "direct measurement of it. The recorder will emit it for every keyframe "
-                    "and withhold it if the rig ever tilts more than %.0f deg off this pose.",
-                    spread, FULL_MODE_SPREAD_DEG, args.tilt_tolerance_deg)
+        logger.info("Only the %d reference views were collected (all the same pose) — "
+                    "no rocking/tilting happened, so there's nothing to fit a tilt model from.",
+                    len(up_camera))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
