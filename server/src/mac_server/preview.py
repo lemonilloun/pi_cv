@@ -90,8 +90,6 @@ class MjpegPreviewServer:
         room_store: Any | None = None,
         monitor_controller: Any | None = None,
         scene_pipeline: Any | None = None,
-        imu_telemetry_store: Any | None = None,
-        cv_reset_map: Any | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -107,8 +105,6 @@ class MjpegPreviewServer:
                 room_store,
                 monitor_controller,
                 scene_pipeline,
-                imu_telemetry_store,
-                cv_reset_map,
             ),
         )
         self._thread: threading.Thread | None = None
@@ -143,8 +139,6 @@ def _make_handler(
     room_store: Any | None = None,
     monitor_controller: Any | None = None,
     scene_pipeline: Any | None = None,
-    imu_telemetry_store: Any | None = None,
-    cv_reset_map: Any | None = None,
 ) -> type[server.BaseHTTPRequestHandler]:
     class StreamingHandler(server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -163,9 +157,6 @@ def _make_handler(
                 return
             if parsed.path == "/api/telemetry":
                 self._serve_telemetry(parsed.query)
-                return
-            if parsed.path == "/api/imu":
-                self._serve_imu(parsed.query)
                 return
             if parsed.path == "/api/rooms":
                 self._serve_rooms()
@@ -251,9 +242,6 @@ def _make_handler(
                 return
             if parsed.path == "/api/scene3d/rename":
                 self._handle_scene_rename()
-                return
-            if parsed.path == "/api/imu/reset_map":
-                self._handle_imu_reset_map()
                 return
             self._send_json({"error": "not found"}, status=404)
 
@@ -881,39 +869,6 @@ def _make_handler(
                 for device_id in device_ids
             }
             self._send_json({"devices": history, "seconds": seconds})
-
-        def _serve_imu(self, query: str) -> None:
-            """Live IMU history for the panel's IMU tab — same shape as
-            /api/telemetry (device_id -> list of samples), polled on its
-            own faster cadence since imu_telemetry arrives at ~10 Hz."""
-            if imu_telemetry_store is None:
-                self._send_json({"devices": {}})
-                return
-
-            params = parse_qs(query)
-            try:
-                seconds = float(params.get("seconds", ["10"])[0])
-            except ValueError:
-                seconds = 10.0
-            seconds = max(1.0, min(120.0, seconds))
-
-            device_ids = params.get("device_id") or imu_telemetry_store.device_ids()
-            history = {
-                device_id: imu_telemetry_store.recent(device_id, seconds)
-                for device_id in device_ids
-            }
-            self._send_json({"devices": history, "seconds": seconds})
-
-        def _handle_imu_reset_map(self) -> None:
-            """Panel's "Reset map" button — clears the live map's
-            accumulated pose/trail/explored cells (cv_worker.reset_live_map)
-            so the next frame starts fresh, same idea as starting a new
-            game level."""
-            if cv_reset_map is None:
-                self._send_json({"error": "server CV is not enabled"}, status=503)
-                return
-            cv_reset_map()
-            self._send_json({"ok": True})
 
         def _handle_mode_post(self) -> None:
             if registry is None:

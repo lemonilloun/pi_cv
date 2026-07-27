@@ -12,7 +12,6 @@ TCP server core stays stdlib-only when CV is disabled or unavailable.
 from __future__ import annotations
 
 import logging
-import math
 import sys
 import threading
 import time
@@ -142,43 +141,13 @@ class ServerCvWorker:
         frame_hub: FrameStoreHub,
         config: dict[str, Any],
         repo_root: Path,
-        mapping_config: dict[str, Any] | None = None,
     ) -> None:
         self._pi_store = pi_store
         self._depth_view_store = frame_hub.get("depth")
-        # Rendered occupancy-grid image (dark unknown / light free / dark
-        # walls — same visual language as scene3d's floor_plan.png), so the
-        # panel can just <img src="/stream.mjpg?view=livemap"> instead of
-        # redrawing a point cloud client-side.
-        self._livemap_view_store = frame_hub.get("livemap")
         self.depth_store = LatestItemStore()
         self.objects_store = LatestItemStore()
         self._config = config
         self._repo_root = repo_root
-        # Physical constants (camera height, wall height band) come from the
-        # shared `mapping` config section — same room, same camera, whether
-        # the consumer is the paused wall-scanner or this live wall/obstacle
-        # scatter (docs/scene3d.md IMU section; the new panel tab).
-        self._mapping_config = mapping_config or {}
-        # Live map (IMU tab): frame-to-frame 2D ICP scan matching
-        # (mapping/scan_match.py) accumulates a running pose and a trail;
-        # each tick's wall points are ray-carved into a persistent
-        # occupancy grid (mac_server.scene3d.occupancy — the SAME
-        # free/occupied/unknown carving the offline scene3d floor plan
-        # uses, just fed incrementally instead of from one batch of
-        # poses). A dead-reckoning "fog of war" map, NOT a survey — it
-        # drifts on a long walk. Only the worker thread (_run) mutates any
-        # of this; reset_live_map() (called from an HTTP handler on a
-        # different thread) only sets a flag _run checks, so there is no
-        # lock needed and no risk of tearing state mid-update.
-        self._pose = {"x": 0.0, "y": 0.0, "yaw_rad": 0.0}
-        self._prev_scan_points: Any = None
-        self._last_icp_estimate = {"dx": 0.0, "dy": 0.0, "dyaw_rad": 0.0}
-        self._trail: deque = deque(maxlen=3000)
-        self._occ_spec: dict[str, Any] | None = None
-        self._occ_free_counts: Any = None
-        self._occ_hit_counts: Any = None
-        self._reset_live_map = threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._state = "disabled"
@@ -187,12 +156,6 @@ class ServerCvWorker:
         self._frame_times: deque[float] = deque(maxlen=60)
         self._device = str(config.get("device", "mps"))
         self._latest_objects: dict[str, Any] | None = None
-
-    def reset_live_map(self) -> None:
-        """Requested from the panel's "Reset map" button — clears the
-        accumulated pose/trail/explored cells so the next frame starts a
-        fresh map, same idea as starting a new game level."""
-        self._reset_live_map.set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -258,16 +221,6 @@ class ServerCvWorker:
         last_started = 0.0
 
         while not self._stop_event.is_set():
-            if self._reset_live_map.is_set():
-                self._pose = {"x": 0.0, "y": 0.0, "yaw_rad": 0.0}
-                self._prev_scan_points = None
-                self._last_icp_estimate = {"dx": 0.0, "dy": 0.0, "dyaw_rad": 0.0}
-                self._trail.clear()
-                self._occ_spec = None
-                self._occ_free_counts = None
-                self._occ_hit_counts = None
-                self._reset_live_map.clear()
-
             sequence, frame = self._pi_store.wait_for_next(sequence, timeout=1.0)
             if frame is None or self._stop_event.is_set():
                 continue
@@ -318,28 +271,22 @@ class ServerCvWorker:
             # channel: the Pi runs YOLO on the AI HAT, the Mac contributes
             # meters and camera-frame position). Empty lists are published
             # too: consumers (radar, monitoring tracker) need "nothing in
-            # view" ticks to clear points and to age out tracks. Computed
-            # every depth frame regardless of mode (not just yolo/pipeline)
-            # so wall_points below — the live obstacle/wall scatter for the
-            # IMU debug tab's map — updates during plain stream/depth too.
-            objects = frame.metadata.get("objects") or []
-            try:
-                from mac_server.mapping.geometry import CameraIntrinsics
+            # view" ticks to clear points and to age out tracks.
+            objects = frame.metadata.get("objects")
+            if objects is not None:
+                try:
+                    from mac_server.mapping.geometry import CameraIntrinsics
 
-                intrinsics = CameraIntrinsics.from_fov(width, height, hfov_deg, vfov_deg)
-                scan_points = _wall_points_array(depth_m, intrinsics, np, self._mapping_config)
-                attached_objects = _attach_depth_to_objects(objects, depth_m, np, intrinsics)
-                self._latest_objects = {
-                    "pi_frame_index": frame.metadata.get("frame_index"),
-                    "view": view,
-                    "computed_at": time.time(),
-                    "objects": attached_objects,
-                    "wall_points": [[round(float(x), 2), round(float(z), 2)] for x, z in scan_points],
-                    "live_map": self._update_live_map(scan_points, attached_objects, np, cv2),
-                }
-                self.objects_store.update(self._latest_objects)
-            except Exception as exc:
-                logger.debug("Object depth attachment / wall scatter failed: %s", exc)
+                    intrinsics = CameraIntrinsics.from_fov(width, height, hfov_deg, vfov_deg)
+                    self._latest_objects = {
+                        "pi_frame_index": frame.metadata.get("frame_index"),
+                        "view": view,
+                        "computed_at": time.time(),
+                        "objects": _attach_depth_to_objects(objects, depth_m, np, intrinsics),
+                    }
+                    self.objects_store.update(self._latest_objects)
+                except Exception as exc:
+                    logger.debug("Object depth attachment failed: %s", exc)
 
             heatmap = _depth_to_heatmap_jpeg_fixed(depth_m, display_max_m)
             self._depth_view_store.update(
@@ -357,174 +304,6 @@ class ServerCvWorker:
             )
 
         self._state = "disabled"
-
-    # ------------------------------------------------------------ live map
-
-    def _update_live_map(
-        self, scan_points: Any, current_objects: list[dict[str, Any]], np: Any, cv2: Any,
-    ) -> dict[str, Any]:
-        """Frame-to-frame 2D ICP (mapping/scan_match.py) against the
-        previous scan gives this tick's own motion; composed onto a
-        running pose it's a dead-reckoning "fog of war" map — trail plus
-        every wall/obstacle cell seen so far, in world frame. Explicitly
-        NOT the offline scene3d reconstruction: no bundle adjustment, no
-        loop closure, so it drifts on a long walk. It also does NOT use
-        the IMU for translation — that's exactly the tilt-leak problem
-        documented on `ImuIntegrator` — only ICP's own (independent,
-        already-metric) depth-camera estimate ever moves the pose.
-        """
-        from mac_server.mapping.scan_match import icp_2d
-
-        min_points = int(self._mapping_config.get("live_map_min_points", 15))
-        result = None
-        if (
-            self._prev_scan_points is not None
-            and len(self._prev_scan_points) >= min_points
-            and len(scan_points) >= min_points
-        ):
-            result = icp_2d(
-                self._prev_scan_points,
-                scan_points,
-                initial_yaw_rad=self._last_icp_estimate["dyaw_rad"],
-                initial_translation=(
-                    self._last_icp_estimate["dx"], self._last_icp_estimate["dy"],
-                ),
-                min_points=min_points,
-            )
-        self._prev_scan_points = scan_points
-
-        if result is not None:
-            self._last_icp_estimate = {
-                "dx": result["dx"], "dy": result["dy"], "dyaw_rad": result["dyaw_rad"],
-            }
-            local_dx, local_dy, dyaw = result["dx"], result["dy"], result["dyaw_rad"]
-            source, fitness = "icp", result["fitness"]
-        else:
-            # No trustworthy visual match this tick (too few points, first
-            # frame ever, or the scan barely overlaps the previous one —
-            # e.g. right after a big jump, or a textureless wall). Holding
-            # the pose still is the honest choice: there is no independent
-            # fallback translation source that doesn't have the same
-            # tilt-leak problem ICP exists to avoid in the first place.
-            local_dx, local_dy, dyaw = 0.0, 0.0, 0.0
-            source, fitness = "none", None
-            self._last_icp_estimate = {"dx": 0.0, "dy": 0.0, "dyaw_rad": 0.0}
-
-        yaw_before = self._pose["yaw_rad"]
-        cos_b, sin_b = math.cos(yaw_before), math.sin(yaw_before)
-        self._pose["x"] += cos_b * local_dx - sin_b * local_dy
-        self._pose["y"] += sin_b * local_dx + cos_b * local_dy
-        self._pose["yaw_rad"] = yaw_before + dyaw
-
-        px, py, yaw_now = self._pose["x"], self._pose["y"], self._pose["yaw_rad"]
-        self._trail.append({"x": round(px, 3), "y": round(py, 3)})
-
-        if self._occ_spec is None:
-            self._init_occupancy_grid()
-
-        from mac_server.scene3d import occupancy
-
-        if len(scan_points):
-            cos_n, sin_n = math.cos(yaw_now), math.sin(yaw_now)
-            lateral = scan_points[:, 0]
-            forward = scan_points[:, 1]
-            world_x = px + cos_n * lateral - sin_n * forward
-            world_y = py + sin_n * lateral + cos_n * forward
-            hits_xy = np.stack([world_x, world_y], axis=1)
-            occupancy.carve_rays(
-                np.array([px, py]), hits_xy, self._occ_spec,
-                self._occ_free_counts, self._occ_hit_counts,
-                stop_margin_m=float(self._mapping_config.get("live_map_stop_margin_m", 0.1)),
-            )
-
-        grid = occupancy.occupancy_from_counts(
-            self._occ_free_counts, self._occ_hit_counts,
-            min_hits=int(self._mapping_config.get("min_hits", 3)),
-        )
-        image = self._render_live_map_image(grid, current_objects, np, cv2)
-        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if ok:
-            self._livemap_view_store.update(
-                encoded.tobytes(),
-                {"view": "livemap", "content_type": "image/jpeg", "source": source},
-            )
-
-        return {
-            "pose": {"x": round(px, 3), "y": round(py, 3), "yaw_rad": round(yaw_now, 4)},
-            "source": source,
-            "fitness": fitness,
-        }
-
-    def _init_occupancy_grid(self) -> None:
-        """Fixed-size grid, generous enough for one room's worth of
-        exploration (default 20x20 m at 5 cm/cell): a live map has no
-        natural "final extent" the way an offline scan does, and growing
-        the array on demand is real complexity for a debug feature —
-        exceeding the span just clips new points at the edge rather than
-        crashing."""
-        import numpy as np
-
-        span_m = float(self._mapping_config.get("live_map_span_m", 20.0))
-        grid_m = max(0.01, float(self._mapping_config.get("grid_resolution_m", 0.05)))
-        size = max(8, int(span_m / grid_m))
-        self._occ_spec = {
-            "origin": (-span_m / 2.0, -span_m / 2.0),
-            "width": size,
-            "height": size,
-            "resolution_m": grid_m,
-        }
-        self._occ_free_counts = np.zeros((size, size), dtype=np.uint16)
-        self._occ_hit_counts = np.zeros((size, size), dtype=np.uint16)
-
-    def _world_to_px(self, world_x: float, world_y: float, scale: int) -> tuple[int, int]:
-        """World metres -> image pixels. Row decreases as world_y
-        increases (a world-forward "up" convention, like a normal map)."""
-        ox, oy = self._occ_spec["origin"]
-        res = self._occ_spec["resolution_m"]
-        col = int((world_x - ox) / res * scale)
-        row = int(self._occ_spec["height"] * scale - 1 - (world_y - oy) / res * scale)
-        return col, row
-
-    def _render_live_map_image(
-        self, grid: Any, current_objects: list[dict[str, Any]], np: Any, cv2: Any,
-    ) -> Any:
-        """Occupancy grid -> BGR image with the trail, robot heading, and
-        this frame's tracked objects baked in — the panel just displays it
-        as a plain image (/stream.mjpg?view=livemap), same as the Depth
-        view, rather than redrawing a point cloud in JS."""
-        from mac_server.scene3d import occupancy
-
-        scale = max(1, int(self._mapping_config.get("live_map_render_scale", 3)))
-        base = occupancy.render_plan(grid)
-        h, w = base.shape[:2]
-        image = cv2.resize(base, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
-
-        if len(self._trail) > 1:
-            pts = [self._world_to_px(p["x"], p["y"], scale) for p in self._trail]
-            for a, b in zip(pts, pts[1:]):
-                cv2.line(image, a, b, (201, 133, 0), 2)  # BGR accent blue
-
-        yaw = self._pose["yaw_rad"]
-        nose_world = (
-            self._pose["x"] + -math.sin(yaw) * 0.3,
-            self._pose["y"] + math.cos(yaw) * 0.3,
-        )
-        robot_px = self._world_to_px(self._pose["x"], self._pose["y"], scale)
-        nose_px = self._world_to_px(*nose_world, scale)
-        cv2.circle(image, robot_px, 6, (0, 133, 201), -1)
-        cv2.line(image, robot_px, nose_px, (0, 133, 201), 3)
-
-        cos_n, sin_n = math.cos(yaw), math.sin(yaw)
-        for obj in current_objects:
-            lateral, forward = obj.get("lateral_m"), obj.get("forward_m")
-            if lateral is None or forward is None:
-                continue
-            world_x = self._pose["x"] + cos_n * lateral - sin_n * forward
-            world_y = self._pose["y"] + sin_n * lateral + cos_n * forward
-            color = _class_color_bgr(str(obj.get("class", "")))
-            cv2.circle(image, self._world_to_px(world_x, world_y, scale), 5, color, -1)
-
-        return image
 
     def _load_model(self) -> WarmMetricDepthAnythingV2:
         model_path = Path(str(self._config.get("depth_model_path", "")))
@@ -579,75 +358,6 @@ def _attach_depth_to_objects(
                     entry["forward_m"] = round(forward_m, 3)
         enriched.append(entry)
     return enriched
-
-
-_CLASS_COLORS_BGR = [
-    (229, 135, 57), (112, 158, 25), (0, 133, 201), (0, 131, 0),
-    (77, 176, 218), (149, 191, 0), (43, 66, 219),
-]
-
-
-def _class_color_bgr(class_name: str) -> tuple[int, int, int]:
-    """Deterministic per-class color for the live map's object dots — same
-    hashing idea the panel's classColor() uses client-side for Radar, just
-    a fixed BGR palette since this is baked into a server-rendered image."""
-    index = sum(ord(c) for c in class_name) % len(_CLASS_COLORS_BGR)
-    return _CLASS_COLORS_BGR[index]
-
-
-def _wall_points_array(
-    depth_m: Any,
-    intrinsics: Any,
-    np: Any,
-    mapping_config: dict[str, Any],
-) -> Any:
-    """Single-frame top-down scatter of walls/obstacles at roughly the
-    robot's own height, as a raw (N,2) [lateral_m, forward_m] array —
-    the live-map layer of the IMU debug tab's radar (docs/scene3d.md IMU
-    section). Reuses the same pure-numpy, unit-tested projection the
-    (paused) multi-frame room scanner uses (mapping/geometry.py).
-
-    This one frame's scatter has no ego-motion and therefore no drift to
-    get wrong (same principle as the object Radar view) — it's the RAW
-    material both `_wall_points` (JSON-rounded, for the wire) and the live
-    map's frame-to-frame ICP (mapping/scan_match.py, wants unrounded
-    points) are built from.
-
-    Empty (0, 2) array (not None) when mapping isn't configured, so
-    callers don't need a None-check to iterate or len() it.
-    """
-    if not mapping_config:
-        return np.zeros((0, 2), dtype=np.float64)
-    from mac_server.mapping.geometry import depth_to_points, filter_height_band
-
-    points = depth_to_points(
-        depth_m,
-        intrinsics,
-        stride=int(mapping_config.get("wall_points_stride", 16)),
-        edge_crop_frac=float(mapping_config.get("edge_crop_frac", 0.1)),
-        min_z=0.2,
-        max_z=float(mapping_config.get("max_depth_use_m", 8.0)),
-    )
-    if points.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.float64)
-    xz, _heights = filter_height_band(
-        points,
-        camera_height_m=float(mapping_config.get("camera_height_m", 0.3)),
-        band=tuple(mapping_config.get("height_band_m", [0.1, 2.0])),
-    )
-    return xz
-
-
-def _wall_points(
-    depth_m: Any,
-    intrinsics: Any,
-    np: Any,
-    mapping_config: dict[str, Any],
-) -> list[list[float]]:
-    """`_wall_points_array`, JSON-rounded — kept for callers (and the unit
-    tests) that just want the wire format without touching the array."""
-    xz = _wall_points_array(depth_m, intrinsics, np, mapping_config)
-    return [[round(float(x), 2), round(float(z), 2)] for x, z in xz]
 
 
 def _depth_to_heatmap_jpeg_fixed(depth_m: Any, display_max_m: float) -> bytes:

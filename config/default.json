@@ -40,12 +40,7 @@
     "depth_encoder": "vits",
     "depth_input_size": 392,
     "depth_is_metric": false,
-    "torch_threads": 3,
-    "imu_enabled": true,
-    "imu_port": "/dev/ttyUSB0",
-    "imu_baud": 115200,
-    "imu_calibration": "config/imu_calibration.json",
-    "imu_hz": 10.0
+    "torch_threads": 3
   },
   "server_cv": {
     "enabled": true,
@@ -70,7 +65,6 @@
     "hfov_deg": 102.0,
     "vfov_deg": 67.0,
     "point_stride": 4,
-    "wall_points_stride": 16,
     "edge_crop_frac": 0.1,
     "min_hits": 3,
     "max_depth_use_m": 8.0,
@@ -79,11 +73,7 @@
     "body_offset_m": 0.4,
     "max_room_m": 10.0,
     "min_wall_height_m": 1.6,
-    "depth_scale_correction": 1.0,
-    "live_map_min_points": 15,
-    "live_map_span_m": 20.0,
-    "live_map_render_scale": 3,
-    "live_map_stop_margin_m": 0.1
+    "depth_scale_correction": 1.0
   },
   "scene3d": {
     "sessions_dir": "data/scene_sessions",

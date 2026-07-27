@@ -19,9 +19,7 @@ from shared.messages import Message
 
 logger = logging.getLogger(__name__)
 
-QUIET_MESSAGE_TYPES = {
-    "camera_stream_frame", "system_telemetry", "imu_telemetry", "nav_query", "scene_keyframe",
-}
+QUIET_MESSAGE_TYPES = {"camera_stream_frame", "system_telemetry", "nav_query", "scene_keyframe"}
 
 
 @dataclass
@@ -33,7 +31,6 @@ class SessionContext:
     client_socket: socket.socket
     client_address: tuple[str, int]
     send_lock: threading.Lock
-    imu_telemetry_store: TelemetryStore | None = None
 
 
 def handle_message(
@@ -75,9 +72,6 @@ def handle_message(
 
     if message.type == "system_telemetry" and session_context is not None:
         return _handle_system_telemetry_message(message, session_context)
-
-    if message.type == "imu_telemetry" and session_context is not None:
-        return _handle_imu_telemetry_message(message, session_context)
 
     if message.type == "command_result" and session_context is not None:
         return _handle_command_result_message(message, session_context)
@@ -192,15 +186,6 @@ def _handle_system_telemetry_message(message: Message, context: SessionContext) 
     handle = context.registry.find_by_socket(context.client_socket)
     if handle is not None and message.payload.get("mode"):
         handle.mode = str(message.payload["mode"])
-    return make_ack_response(message)
-
-
-def _handle_imu_telemetry_message(message: Message, context: SessionContext) -> Message:
-    """Live orientation + raw accel for the panel's IMU debug tab — separate
-    store from system_telemetry since it arrives at a different rate and
-    the panel polls it independently (see preview.py's /api/imu)."""
-    if context.imu_telemetry_store is not None:
-        context.imu_telemetry_store.add(message.device_id, message.payload)
     return make_ack_response(message)
 
 

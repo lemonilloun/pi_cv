@@ -36,7 +36,6 @@ from pi_client.network import ClientConnectionError, PiClient
 from pi_client.protocol import (
     make_camera_stream_frame_message,
     make_command_result_message,
-    make_imu_telemetry_message,
     make_session_hello_message,
     make_system_telemetry_message,
 )
@@ -80,11 +79,6 @@ class SessionSettings:
     depth_input_size: int = 392
     depth_is_metric: bool = False
     torch_threads: int = 3
-    imu_enabled: bool = True
-    imu_port: str = "/dev/ttyUSB0"
-    imu_baud: int = 115200
-    imu_calibration: Path = Path("config/imu_calibration.json")
-    imu_hz: float = 10.0
 
 
 class SessionRuntime:
@@ -103,40 +97,10 @@ class SessionRuntime:
         self._warm_yolo: Any = None
         self._warm_depth: Any = None
         self._frame_index = 0
-        # Owns its own serial port + background thread independent of the
-        # TCP connection (like the warm YOLO/depth models), so it survives
-        # reconnects instead of reopening /dev/ttyUSB0 every time.
-        self._imu_reader: Any = self._make_imu_reader() if settings.imu_enabled else None
-
-    def _make_imu_reader(self) -> Any:
-        from pi_client.imu_rvc import RvcReader
-
-        calibration_path = self.settings.imu_calibration
-        if not calibration_path.exists():
-            logger.warning(
-                "IMU calibration missing (%s) — the debug tab will still show live yaw/pitch/"
-                "roll/accel, but no gravity vector. Run ./scripts/run_imu_calibrate.sh.",
-                calibration_path,
-            )
-        reader = RvcReader(
-            port=self.settings.imu_port,
-            baud=self.settings.imu_baud,
-            calibration_path=calibration_path if calibration_path.exists() else None,
-        )
-        if not reader.start():
-            logger.warning(
-                "IMU not available on %s — continuing without it "
-                "(another process may already hold the port).",
-                self.settings.imu_port,
-            )
-            return None
-        return reader
 
     def stop(self) -> None:
         self._stop_event.set()
         self._disconnected.set()
-        if self._imu_reader is not None:
-            self._imu_reader.stop()
 
     # ---------------------------------------------------------------- run
 
@@ -166,10 +130,6 @@ class SessionRuntime:
             telemetry = threading.Thread(target=self._telemetry_loop, daemon=True, name="telemetry")
             receiver.start()
             telemetry.start()
-            imu_thread = None
-            if self._imu_reader is not None:
-                imu_thread = threading.Thread(target=self._imu_loop, daemon=True, name="imu")
-                imu_thread.start()
 
             try:
                 self._worker_loop()
@@ -182,8 +142,6 @@ class SessionRuntime:
                 client.close()
                 receiver.join(timeout=2)
                 telemetry.join(timeout=2)
-                if imu_thread is not None:
-                    imu_thread.join(timeout=2)
                 self._client = None
 
             if not self._stop_event.is_set():
@@ -259,30 +217,6 @@ class SessionRuntime:
                 fps_actual=self._fps_actual(),
             )
             self._send_with_slot(message, b"", slot_timeout=0.2, drop_label="telemetry")
-
-    def _imu_loop(self) -> None:
-        """Live orientation/accel, mode-independent — same rationale as
-        `_telemetry_loop`, but faster (charts need more than 1 Hz) and
-        reading from the always-running IMU reader rather than a fresh
-        sample each tick. `latest()` returns None only before the first
-        frame has arrived; skip quietly and try again next tick."""
-        reader = self._imu_reader
-        assert reader is not None
-        interval = 1.0 / max(self.settings.imu_hz, 0.5)
-        while not self._disconnected.is_set():
-            self._disconnected.wait(timeout=interval)
-            if self._disconnected.is_set():
-                return
-            sample = reader.latest()
-            if sample is None:
-                continue
-            message = make_imu_telemetry_message(
-                device_id=self.settings.device_id,
-                session_id=self.session_id,
-                sample=sample,
-                stats=reader.stats(),
-            )
-            self._send_with_slot(message, b"", slot_timeout=0.2, drop_label="imu")
 
     def _fps_actual(self) -> float | None:
         now = time.monotonic()
