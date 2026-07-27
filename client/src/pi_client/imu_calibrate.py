@@ -519,8 +519,13 @@ def main() -> int:
     # rank check catches "not enough", e.g. the rig only ever pitched and
     # never rolled). A few seconds of the rig gently rocking in front of
     # the board — the same small wobble it actually does while driving —
-    # is exactly the right input, and is usually well under 8 deg.
-    if len(up_camera) > args.reference_views:
+    # is exactly the right input, and is usually well under 8 deg. Uses
+    # every accepted view, including the "reference" ones: if the rig was
+    # already moving a little while those were collected (rather than
+    # perfectly still), that's still usable signal, not just noise to
+    # average away — only fit_tilt_model's own count/rank checks decide
+    # whether there's enough of it.
+    if len(up_camera) >= 3:
         reference_pitch_deg, reference_roll_deg = np.mean(
             pitch_roll[: args.reference_views], axis=0
         )
@@ -548,8 +553,7 @@ def main() -> int:
                             "ImuIntegrator will keep using the static reference vector.",
                             tilt_model["fit_residual_deg_mean"])
     else:
-        logger.info("Only the %d reference views were collected (all the same pose) — "
-                    "no rocking/tilting happened, so there's nothing to fit a tilt model from.",
+        logger.info("Only %d view(s) collected — need at least 3 to fit a tilt model.",
                     len(up_camera))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
