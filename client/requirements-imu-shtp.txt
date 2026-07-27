@@ -1,0 +1,10 @@
+# BNO08x SHTP-over-SPI driver (pi_client/imu_shtp.py): calibrated
+# gyro+accel at high rate, for ORB-SLAM3 mono-inertial. Needs the sensor
+# physically rewired for SPI first (docs/imu_shtp_setup.md) - nothing here
+# works over the existing UART-RVC wiring.
+#
+# The UART-RVC path (imu_rvc.py, just pyserial, already installed) is
+# untouched and keeps working for scene3d's gravity/tilt_model - this is
+# an additional, independent driver, not a replacement.
+adafruit-circuitpython-bno08x>=1.3.0  # >=1.3.0: enable_feature(report_interval=...) is not rate-capped
+adafruit-blinka  # board/busio/digitalio on Linux SBCs
