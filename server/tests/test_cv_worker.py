@@ -33,6 +33,13 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+try:
+    import cv2
+
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
 from test_mapping import make_synthetic_room_depth  # noqa: E402
 
 
@@ -109,7 +116,7 @@ def _make_worker():
     )
 
 
-@unittest.skipUnless(HAS_NUMPY and HAS_SCIPY, "numpy and scipy are required")
+@unittest.skipUnless(HAS_NUMPY and HAS_SCIPY and HAS_CV2, "numpy, scipy and cv2 are required")
 class LiveMapPoseTest(unittest.TestCase):
     """_update_live_map composes each tick's ICP result into a running
     world pose — this is the part test_scan_match.py can't cover on its
@@ -133,13 +140,17 @@ class LiveMapPoseTest(unittest.TestCase):
         for i in range(6):  # tick 0 has no previous scan; 5 real steps follow
             pose_y = i * step
             scan = _world_to_local(self.world_points, 0.0, pose_y, 0.0)
-            live_map = worker._update_live_map(scan, np)
+            live_map = worker._update_live_map(scan, [], np, cv2)
 
         self.assertAlmostEqual(live_map["pose"]["x"], 0.0, delta=0.03)
         self.assertAlmostEqual(live_map["pose"]["y"], 5 * step, delta=0.05)
         self.assertAlmostEqual(live_map["pose"]["yaw_rad"], 0.0, delta=0.02)
-        self.assertEqual(len(live_map["trail"]), 6)
-        self.assertGreater(len(live_map["explored"]), 0)
+        self.assertEqual(len(worker._trail), 6)
+        # Ray-carved occupancy grid (mac_server.scene3d.occupancy) should
+        # have real evidence in it by now: some free cells (the camera
+        # looked through them) and some occupied (the wall it hit).
+        self.assertGreater(int(worker._occ_free_counts.sum()), 0)
+        self.assertGreater(int(worker._occ_hit_counts.sum()), 0)
 
     def test_turning_in_place_accumulates_yaw(self) -> None:
         worker = _make_worker()
@@ -147,7 +158,7 @@ class LiveMapPoseTest(unittest.TestCase):
         for i in range(5):  # tick 0, then 4 turns of step_deg each
             yaw = math.radians(i * step_deg)
             scan = _world_to_local(self.world_points, 0.0, 0.0, yaw)
-            live_map = worker._update_live_map(scan, np)
+            live_map = worker._update_live_map(scan, [], np, cv2)
 
         self.assertAlmostEqual(math.degrees(live_map["pose"]["yaw_rad"]), 4 * step_deg, delta=1.0)
         self.assertAlmostEqual(live_map["pose"]["x"], 0.0, delta=0.03)
@@ -157,8 +168,9 @@ class LiveMapPoseTest(unittest.TestCase):
         worker = _make_worker()
         for i in range(3):
             scan = _world_to_local(self.world_points, 0.0, i * 0.2, 0.0)
-            worker._update_live_map(scan, np)
+            worker._update_live_map(scan, [], np, cv2)
         self.assertGreater(len(worker._trail), 0)
+        self.assertIsNotNone(worker._occ_free_counts)
 
         worker.reset_live_map()
         self.assertTrue(worker._reset_live_map.is_set())
@@ -166,13 +178,15 @@ class LiveMapPoseTest(unittest.TestCase):
         worker._pose = {"x": 0.0, "y": 0.0, "yaw_rad": 0.0}
         worker._prev_scan_points = None
         worker._trail.clear()
-        worker._explored_cells.clear()
+        worker._occ_spec = None
+        worker._occ_free_counts = None
+        worker._occ_hit_counts = None
         worker._reset_live_map.clear()
 
         first_scan = _world_to_local(self.world_points, 0.0, 0.0, 0.0)
-        live_map = worker._update_live_map(first_scan, np)
+        live_map = worker._update_live_map(first_scan, [], np, cv2)
         self.assertEqual(live_map["pose"], {"x": 0.0, "y": 0.0, "yaw_rad": 0.0})
-        self.assertEqual(len(live_map["trail"]), 1)
+        self.assertEqual(len(worker._trail), 1)
 
 
 if __name__ == "__main__":

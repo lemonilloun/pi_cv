@@ -600,22 +600,22 @@
 
   <section class="card video-card" style="padding:14px">
     <div style="display:flex; align-items:baseline; justify-content:space-between">
-      <p class="section-title">Live map — explored walls &amp; trail</p>
+      <p class="section-title">Live map — occupancy floor plan</p>
       <button id="imuMapResetBtn" class="ghost-btn">Reset map</button>
     </div>
     <div class="chart-wrap">
-      <canvas id="imuMapCanvas" style="width:100%; aspect-ratio:1/1; background:#000; border-radius:8px"></canvas>
-      <div class="tooltip" id="imuMapTip"></div>
+      <img id="imuMapImg" style="width:100%; aspect-ratio:1/1; object-fit:contain; background:#000; border-radius:8px"
+        alt="Live occupancy floor plan">
     </div>
-    <div class="legend" id="imuMapLegend" style="margin-top:8px"></div>
     <p class="meta-line" id="imuMapStatusLine" style="opacity:0.75"></p>
     <p class="meta-line" style="opacity:0.75">
-      Fog-of-war style: builds up as the robot moves, using frame-to-frame depth scan
-      matching (2D ICP) for ego-motion — not the IMU, which would hit the same
-      accelerometer/tilt problem as the offline metric scale (see docs/scene3d.md).
-      This is <strong>dead reckoning</strong>: no loop closure, so it drifts on a long
-      walk — that's expected, hit Reset to start over. Needs the Pi in
-      <code>stream</code>, <code>yolo</code>, or <code>pipeline</code> mode with server CV enabled.
+      Same carved-occupancy technique as scene3d's floor_plan.png (light = free,
+      dark = wall, mid-gray = unseen), fed live: frame-to-frame depth scan matching
+      (2D ICP) for ego-motion — not the IMU, which would hit the same accelerometer/tilt
+      problem as the offline metric scale (see docs/scene3d.md). This is
+      <strong>dead reckoning</strong>: no loop closure, so it drifts on a long walk —
+      that's expected, hit Reset to start over. Needs the Pi in <code>stream</code>,
+      <code>yolo</code>, or <code>pipeline</code> mode with server CV enabled.
     </p>
   </section>
 </main>
@@ -1377,11 +1377,8 @@ const IMU_POLL_MS = 400;
 const IMU_MAP_POLL_MS = 250;
 
 state.imuSamples = []; // [{ts, yaw, pitch, roll, ax, ay, az, gravityMode, calibrated}]
-state.liveMap = null; // {pose:{x,y,yaw_rad}, source, fitness, trail:[{x,y}], explored:[[x,y]]}
-state.liveMapObjects = []; // this frame's tracked objects, camera-local — transformed to world at draw time
 let imuPollTimer = null;
 let imuMapPollTimer = null;
-let imuMapHoverTargets = [];
 
 async function pollImu() {
   try {
@@ -1590,15 +1587,26 @@ function stopImuPoll() {
   stopImuMapPoll();
 }
 
-// ---- live map: persistent "fog of war" (explored walls + trail) ----
-// live_map (world-frame pose/trail/explored cells, from frame-to-frame 2D
-// ICP scan matching — mac_server/mapping/scan_match.py) is the persistent
-// layer; tracked objects ride on top of it each frame, transformed from
-// camera-local into world coordinates using the CURRENT pose so they show
-// up in the right place relative to the accumulated map, even though the
-// objects themselves aren't persisted (only this frame's are drawn).
+// ---- live map: occupancy floor plan, rendered server-side ----
+// The Mac ray-carves each tick's wall points into a persistent occupancy
+// grid (mac_server.scene3d.occupancy — same free/occupied/unknown carving
+// scene3d's offline floor_plan.png uses) and renders it to a plain image
+// with the trail/robot/objects baked in, so the panel just displays it
+// like the Depth view — no point-cloud redrawing in JS.
 
-async function pollImuMap() {
+function startImuMapPoll() {
+  if (imuMapPollTimer) return;
+  document.getElementById("imuMapImg").src = "/stream.mjpg?view=livemap&t=" + Date.now();
+  pollImuMapStatus();
+  imuMapPollTimer = setInterval(pollImuMapStatus, IMU_MAP_POLL_MS);
+}
+
+function stopImuMapPoll() {
+  if (imuMapPollTimer) { clearInterval(imuMapPollTimer); imuMapPollTimer = null; }
+  document.getElementById("imuMapImg").src = ""; // release the MJPEG connection while the tab isn't visible
+}
+
+async function pollImuMapStatus() {
   const line = document.getElementById("imuMapStatusLine");
   try {
     const res = await fetch("/api/objects");
@@ -1607,175 +1615,23 @@ async function pollImuMap() {
       line.textContent = data.error || "server CV is not enabled";
       return;
     }
-    state.liveMap = data.live_map || null;
-    state.liveMapObjects = data.objects || [];
-    drawImuMap();
-    if (!state.liveMap) {
+    const map = data.live_map;
+    if (!map) {
       line.textContent = "no live map yet — waiting for depth frames";
     } else {
-      const src = state.liveMap.source === "icp"
-        ? "scan match ok (fitness " + (state.liveMap.fitness || 0).toFixed(2) + ")"
+      const src = map.source === "icp"
+        ? "scan match ok (fitness " + (map.fitness || 0).toFixed(2) + ")"
         : "no scan match this tick (holding position)";
-      line.textContent = state.liveMapObjects.length + " object(s) · " +
-        state.liveMap.explored.length + " explored cell(s) · " + src;
+      line.textContent = (data.objects || []).length + " object(s) · pose (" +
+        map.pose.x.toFixed(2) + ", " + map.pose.y.toFixed(2) + ") · " + src;
     }
   } catch (err) { /* transient network hiccup, next poll retries */ }
-}
-
-function startImuMapPoll() {
-  if (imuMapPollTimer) return;
-  pollImuMap();
-  imuMapPollTimer = setInterval(pollImuMap, IMU_MAP_POLL_MS);
-}
-
-function stopImuMapPoll() {
-  if (imuMapPollTimer) { clearInterval(imuMapPollTimer); imuMapPollTimer = null; }
-  imuMapHoverTargets = [];
 }
 
 document.getElementById("imuMapResetBtn").addEventListener("click", async () => {
   try {
     await fetch("/api/imu/reset_map", { method: "POST" });
-    state.liveMap = null;
-    state.liveMapObjects = [];
-    drawImuMap();
-  } catch (err) { /* the next successful poll will reflect the reset anyway */ }
-});
-
-function drawImuMap() {
-  const canvas = document.getElementById("imuMapCanvas");
-  const ctx = canvas.getContext("2d");
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth, h = canvas.clientHeight;
-  if (!w || !h) return;
-  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-  }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, w, h);
-
-  const map = state.liveMap;
-  if (!map) {
-    ctx.fillStyle = "#898781";
-    ctx.font = "12px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("no live map yet", w / 2, h / 2);
-    document.getElementById("imuMapLegend").innerHTML = "";
-    return;
-  }
-
-  // Auto-framing: fit everything seen so far, centered, uniform scale (no
-  // stretching) — same idea as a game's minimap revealing itself as you
-  // explore, rather than a fixed window that would need re-centering.
-  const pts = map.explored.concat(map.trail.map((p) => [p.x, p.y])).concat([[map.pose.x, map.pose.y]]);
-  let minX = Math.min(...pts.map((p) => p[0])), maxX = Math.max(...pts.map((p) => p[0]));
-  let minY = Math.min(...pts.map((p) => p[1])), maxY = Math.max(...pts.map((p) => p[1]));
-  const pad = 0.6;
-  minX -= pad; maxX += pad; minY -= pad; maxY += pad;
-  const spanX = Math.max(2.0, maxX - minX), spanY = Math.max(2.0, maxY - minY);
-  const centerX = (minX + maxX) / 2, centerY = (minY + maxY) / 2;
-  const margin = 16;
-  const scale = Math.min((w - 2 * margin) / spanX, (h - 2 * margin) / spanY);
-
-  function toScreen(worldX, worldY) {
-    return [w / 2 + (worldX - centerX) * scale, h / 2 - (worldY - centerY) * scale];
-  }
-
-  // Explored wall/obstacle cells: the persistent "fog of war" reveal.
-  ctx.fillStyle = "#555550";
-  map.explored.forEach(([ex, ey]) => {
-    const [sx, sy] = toScreen(ex, ey);
-    ctx.fillRect(sx - 1, sy - 1, 2, 2);
-  });
-
-  // Trail: fading with age, oldest = faintest.
-  if (map.trail.length > 1) {
-    for (let i = 1; i < map.trail.length; i++) {
-      const age = map.trail.length - 1 - i;
-      ctx.globalAlpha = Math.max(0.2, 1 - age * 0.01);
-      ctx.strokeStyle = SERIES_COLORS[0];
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      const [sx0, sy0] = toScreen(map.trail[i - 1].x, map.trail[i - 1].y);
-      const [sx1, sy1] = toScreen(map.trail[i].x, map.trail[i].y);
-      ctx.moveTo(sx0, sy0);
-      ctx.lineTo(sx1, sy1);
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  // Tracked objects: this frame only, transformed from camera-local into
-  // world frame using the CURRENT pose (not persisted/aged — that's what
-  // the Live tab's Radar is for; here they're just placed on the map).
-  const cosYaw = Math.cos(map.pose.yaw_rad), sinYaw = Math.sin(map.pose.yaw_rad);
-  const seenClasses = new Set();
-  imuMapHoverTargets = [];
-  state.liveMapObjects.forEach((obj) => {
-    if (obj.lateral_m === undefined || obj.forward_m === undefined) return;
-    const worldX = map.pose.x + cosYaw * obj.lateral_m - sinYaw * obj.forward_m;
-    const worldY = map.pose.y + sinYaw * obj.lateral_m + cosYaw * obj.forward_m;
-    const [sx, sy] = toScreen(worldX, worldY);
-    seenClasses.add(obj.class);
-    ctx.fillStyle = classColor(obj.class);
-    ctx.beginPath();
-    ctx.arc(sx, sy, 6, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = "#0d0d0d";
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    imuMapHoverTargets.push({ x: sx, y: sy, obj });
-  });
-
-  // Robot: current pose, heading arrow pointing the way it's facing.
-  const [rx, ry] = toScreen(map.pose.x, map.pose.y);
-  ctx.save();
-  ctx.translate(rx, ry);
-  ctx.rotate(-map.pose.yaw_rad); // canvas rotate() is clockwise-positive; yaw here is CCW-positive
-  ctx.fillStyle = map.source === "icp" ? SERIES_COLORS[0] : "#c98500";
-  ctx.beginPath();
-  ctx.moveTo(0, -11);
-  ctx.lineTo(7, 8);
-  ctx.lineTo(-7, 8);
-  ctx.closePath();
-  ctx.fill();
-  ctx.restore();
-
-  const legend = document.getElementById("imuMapLegend");
-  legend.innerHTML = `<span class="chip"><span class="swatch" style="background:#555550"></span>explored</span>` +
-    `<span class="chip"><span class="swatch" style="background:${SERIES_COLORS[0]}"></span>trail / robot</span>` +
-    Array.from(seenClasses).map((c) =>
-      `<span class="chip"><span class="swatch" style="background:${classColor(c)}"></span>${c}</span>`
-    ).join("");
-}
-
-document.getElementById("imuMapCanvas").addEventListener("mousemove", (event) => {
-  const rect = event.target.getBoundingClientRect();
-  const mx = event.clientX - rect.left, my = event.clientY - rect.top;
-  const tip = document.getElementById("imuMapTip");
-  const hit = imuMapHoverTargets.find((t) => Math.hypot(t.x - mx, t.y - my) <= 10);
-  if (!hit) { tip.style.display = "none"; return; }
-  const obj = hit.obj;
-  const range = Math.sqrt(obj.lateral_m * obj.lateral_m + obj.forward_m * obj.forward_m);
-  tip.innerHTML =
-    `<div class="row"><span class="swatch" style="background:${classColor(obj.class)}"></span>${obj.class}` +
-    `<span class="val">${range.toFixed(2)} m</span></div>`;
-  tip.style.display = "block";
-  tip.style.left = Math.min(mx + 12, rect.width - tip.offsetWidth - 4) + "px";
-  tip.style.top = Math.max(4, my - 10) + "px";
-});
-document.getElementById("imuMapCanvas").addEventListener("mouseleave", () => {
-  document.getElementById("imuMapTip").style.display = "none";
-});
-
-window.addEventListener("resize", () => {
-  if (document.getElementById("tabImu").style.display !== "none") {
-    drawImuCharts();
-    drawImuVector();
-    drawImuMap();
-  }
+  } catch (err) { /* the stream will reflect the reset on its own regardless */ }
 });
 
 // ----------------------------------------------------------- monitoring
