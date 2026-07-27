@@ -91,6 +91,7 @@ class MjpegPreviewServer:
         monitor_controller: Any | None = None,
         scene_pipeline: Any | None = None,
         imu_telemetry_store: Any | None = None,
+        cv_reset_map: Any | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -107,6 +108,7 @@ class MjpegPreviewServer:
                 monitor_controller,
                 scene_pipeline,
                 imu_telemetry_store,
+                cv_reset_map,
             ),
         )
         self._thread: threading.Thread | None = None
@@ -142,6 +144,7 @@ def _make_handler(
     monitor_controller: Any | None = None,
     scene_pipeline: Any | None = None,
     imu_telemetry_store: Any | None = None,
+    cv_reset_map: Any | None = None,
 ) -> type[server.BaseHTTPRequestHandler]:
     class StreamingHandler(server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -248,6 +251,9 @@ def _make_handler(
                 return
             if parsed.path == "/api/scene3d/rename":
                 self._handle_scene_rename()
+                return
+            if parsed.path == "/api/imu/reset_map":
+                self._handle_imu_reset_map()
                 return
             self._send_json({"error": "not found"}, status=404)
 
@@ -897,6 +903,17 @@ def _make_handler(
                 for device_id in device_ids
             }
             self._send_json({"devices": history, "seconds": seconds})
+
+        def _handle_imu_reset_map(self) -> None:
+            """Panel's "Reset map" button — clears the live map's
+            accumulated pose/trail/explored cells (cv_worker.reset_live_map)
+            so the next frame starts fresh, same idea as starting a new
+            game level."""
+            if cv_reset_map is None:
+                self._send_json({"error": "server CV is not enabled"}, status=503)
+                return
+            cv_reset_map()
+            self._send_json({"ok": True})
 
         def _handle_mode_post(self) -> None:
             if registry is None:

@@ -69,6 +69,7 @@ class MacServer:
                 telemetry_store=self.telemetry_store,
                 imu_telemetry_store=self.imu_telemetry_store,
                 cv_status_provider=(self.cv_worker.status if self.cv_worker is not None else None),
+                cv_reset_map=(self.cv_worker.reset_live_map if self.cv_worker is not None else None),
                 scan_controller=self.scan_controller,
                 room_store=self.room_store,
                 monitor_controller=self.monitor_controller,

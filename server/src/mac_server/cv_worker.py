@@ -12,6 +12,7 @@ TCP server core stays stdlib-only when CV is disabled or unavailable.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import time
@@ -154,6 +155,19 @@ class ServerCvWorker:
         # the consumer is the paused wall-scanner or this live wall/obstacle
         # scatter (docs/scene3d.md IMU section; the new panel tab).
         self._mapping_config = mapping_config or {}
+        # Live map (IMU tab): frame-to-frame 2D ICP scan matching
+        # (mapping/scan_match.py) accumulates a running pose, a trail, and
+        # a deduped set of explored wall/obstacle cells — a dead-reckoning
+        # "fog of war" map, NOT a survey. Only the worker thread (_run)
+        # mutates this; reset_live_map() (called from an HTTP handler on a
+        # different thread) only sets a flag _run checks, so there is no
+        # lock needed and no risk of tearing state mid-update.
+        self._pose = {"x": 0.0, "y": 0.0, "yaw_rad": 0.0}
+        self._prev_scan_points: Any = None
+        self._last_icp_estimate = {"dx": 0.0, "dy": 0.0, "dyaw_rad": 0.0}
+        self._trail: deque = deque(maxlen=3000)
+        self._explored_cells: set = set()
+        self._reset_live_map = threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._state = "disabled"
@@ -162,6 +176,12 @@ class ServerCvWorker:
         self._frame_times: deque[float] = deque(maxlen=60)
         self._device = str(config.get("device", "mps"))
         self._latest_objects: dict[str, Any] | None = None
+
+    def reset_live_map(self) -> None:
+        """Requested from the panel's "Reset map" button — clears the
+        accumulated pose/trail/explored cells so the next frame starts a
+        fresh map, same idea as starting a new game level."""
+        self._reset_live_map.set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -227,6 +247,14 @@ class ServerCvWorker:
         last_started = 0.0
 
         while not self._stop_event.is_set():
+            if self._reset_live_map.is_set():
+                self._pose = {"x": 0.0, "y": 0.0, "yaw_rad": 0.0}
+                self._prev_scan_points = None
+                self._last_icp_estimate = {"dx": 0.0, "dy": 0.0, "dyaw_rad": 0.0}
+                self._trail.clear()
+                self._explored_cells.clear()
+                self._reset_live_map.clear()
+
             sequence, frame = self._pi_store.wait_for_next(sequence, timeout=1.0)
             if frame is None or self._stop_event.is_set():
                 continue
@@ -286,12 +314,14 @@ class ServerCvWorker:
                 from mac_server.mapping.geometry import CameraIntrinsics
 
                 intrinsics = CameraIntrinsics.from_fov(width, height, hfov_deg, vfov_deg)
+                scan_points = _wall_points_array(depth_m, intrinsics, np, self._mapping_config)
                 self._latest_objects = {
                     "pi_frame_index": frame.metadata.get("frame_index"),
                     "view": view,
                     "computed_at": time.time(),
                     "objects": _attach_depth_to_objects(objects, depth_m, np, intrinsics),
-                    "wall_points": _wall_points(depth_m, intrinsics, np, self._mapping_config),
+                    "wall_points": [[round(float(x), 2), round(float(z), 2)] for x, z in scan_points],
+                    "live_map": self._update_live_map(scan_points, np),
                 }
                 self.objects_store.update(self._latest_objects)
             except Exception as exc:
@@ -313,6 +343,85 @@ class ServerCvWorker:
             )
 
         self._state = "disabled"
+
+    # ------------------------------------------------------------ live map
+
+    def _update_live_map(self, scan_points: Any, np: Any) -> dict[str, Any]:
+        """Frame-to-frame 2D ICP (mapping/scan_match.py) against the
+        previous scan gives this tick's own motion; composed onto a
+        running pose it's a dead-reckoning "fog of war" map — trail plus
+        every wall/obstacle cell seen so far, in world frame. Explicitly
+        NOT the offline scene3d reconstruction: no bundle adjustment, no
+        loop closure, so it drifts on a long walk. It also does NOT use
+        the IMU for translation — that's exactly the tilt-leak problem
+        documented on `ImuIntegrator` — only ICP's own (independent,
+        already-metric) depth-camera estimate ever moves the pose.
+        """
+        from mac_server.mapping.scan_match import icp_2d
+
+        min_points = int(self._mapping_config.get("live_map_min_points", 15))
+        result = None
+        if (
+            self._prev_scan_points is not None
+            and len(self._prev_scan_points) >= min_points
+            and len(scan_points) >= min_points
+        ):
+            result = icp_2d(
+                self._prev_scan_points,
+                scan_points,
+                initial_yaw_rad=self._last_icp_estimate["dyaw_rad"],
+                initial_translation=(
+                    self._last_icp_estimate["dx"], self._last_icp_estimate["dy"],
+                ),
+                min_points=min_points,
+            )
+        self._prev_scan_points = scan_points
+
+        if result is not None:
+            self._last_icp_estimate = {
+                "dx": result["dx"], "dy": result["dy"], "dyaw_rad": result["dyaw_rad"],
+            }
+            local_dx, local_dy, dyaw = result["dx"], result["dy"], result["dyaw_rad"]
+            source, fitness = "icp", result["fitness"]
+        else:
+            # No trustworthy visual match this tick (too few points, first
+            # frame ever, or the scan barely overlaps the previous one —
+            # e.g. right after a big jump, or a textureless wall). Holding
+            # the pose still is the honest choice: there is no independent
+            # fallback translation source that doesn't have the same
+            # tilt-leak problem ICP exists to avoid in the first place.
+            local_dx, local_dy, dyaw = 0.0, 0.0, 0.0
+            source, fitness = "none", None
+            self._last_icp_estimate = {"dx": 0.0, "dy": 0.0, "dyaw_rad": 0.0}
+
+        yaw_before = self._pose["yaw_rad"]
+        cos_b, sin_b = math.cos(yaw_before), math.sin(yaw_before)
+        self._pose["x"] += cos_b * local_dx - sin_b * local_dy
+        self._pose["y"] += sin_b * local_dx + cos_b * local_dy
+        self._pose["yaw_rad"] = yaw_before + dyaw
+
+        px, py, yaw_now = self._pose["x"], self._pose["y"], self._pose["yaw_rad"]
+        self._trail.append({"x": round(px, 3), "y": round(py, 3)})
+
+        grid_m = max(0.01, float(self._mapping_config.get("grid_resolution_m", 0.05)))
+        max_cells = int(self._mapping_config.get("live_map_max_cells", 8000))
+        cos_n, sin_n = math.cos(yaw_now), math.sin(yaw_now)
+        for lateral, forward in scan_points:
+            cell = (
+                round((px + cos_n * lateral - sin_n * forward) / grid_m),
+                round((py + sin_n * lateral + cos_n * forward) / grid_m),
+            )
+            if cell not in self._explored_cells and len(self._explored_cells) >= max_cells:
+                continue
+            self._explored_cells.add(cell)
+
+        return {
+            "pose": {"x": round(px, 3), "y": round(py, 3), "yaw_rad": round(yaw_now, 4)},
+            "source": source,
+            "fitness": fitness,
+            "trail": list(self._trail),
+            "explored": [[round(cx * grid_m, 2), round(cy * grid_m, 2)] for cx, cy in self._explored_cells],
+        }
 
     def _load_model(self) -> WarmMetricDepthAnythingV2:
         model_path = Path(str(self._config.get("depth_model_path", "")))
@@ -369,25 +478,29 @@ def _attach_depth_to_objects(
     return enriched
 
 
-def _wall_points(
+def _wall_points_array(
     depth_m: Any,
     intrinsics: Any,
     np: Any,
     mapping_config: dict[str, Any],
-) -> list[list[float]]:
+) -> Any:
     """Single-frame top-down scatter of walls/obstacles at roughly the
-    robot's own height — the live-map layer of the IMU debug tab's radar
-    (docs/scene3d.md IMU section). Reuses the same pure-numpy,
-    unit-tested projection the (paused) multi-frame room scanner uses
-    (mapping/geometry.py), just for one frame with no accumulation, no
-    ego-motion, and therefore no drift to get wrong — same principle as
-    the existing object Radar view.
+    robot's own height, as a raw (N,2) [lateral_m, forward_m] array —
+    the live-map layer of the IMU debug tab's radar (docs/scene3d.md IMU
+    section). Reuses the same pure-numpy, unit-tested projection the
+    (paused) multi-frame room scanner uses (mapping/geometry.py).
 
-    Empty list (not None) when mapping isn't configured, so callers don't
-    need a None-check to iterate it.
+    This one frame's scatter has no ego-motion and therefore no drift to
+    get wrong (same principle as the object Radar view) — it's the RAW
+    material both `_wall_points` (JSON-rounded, for the wire) and the live
+    map's frame-to-frame ICP (mapping/scan_match.py, wants unrounded
+    points) are built from.
+
+    Empty (0, 2) array (not None) when mapping isn't configured, so
+    callers don't need a None-check to iterate or len() it.
     """
     if not mapping_config:
-        return []
+        return np.zeros((0, 2), dtype=np.float64)
     from mac_server.mapping.geometry import depth_to_points, filter_height_band
 
     points = depth_to_points(
@@ -399,12 +512,24 @@ def _wall_points(
         max_z=float(mapping_config.get("max_depth_use_m", 8.0)),
     )
     if points.shape[0] == 0:
-        return []
+        return np.zeros((0, 2), dtype=np.float64)
     xz, _heights = filter_height_band(
         points,
         camera_height_m=float(mapping_config.get("camera_height_m", 0.3)),
         band=tuple(mapping_config.get("height_band_m", [0.1, 2.0])),
     )
+    return xz
+
+
+def _wall_points(
+    depth_m: Any,
+    intrinsics: Any,
+    np: Any,
+    mapping_config: dict[str, Any],
+) -> list[list[float]]:
+    """`_wall_points_array`, JSON-rounded — kept for callers (and the unit
+    tests) that just want the wire format without touching the array."""
+    xz = _wall_points_array(depth_m, intrinsics, np, mapping_config)
     return [[round(float(x), 2), round(float(z), 2)] for x, z in xz]
 
 
