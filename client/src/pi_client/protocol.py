@@ -9,6 +9,7 @@ import sys
 import time
 
 from pi_client.camera import CameraFrame
+from pi_client.imu_rvc import ImuSample
 from shared.messages import Message, make_message
 
 
@@ -147,6 +148,32 @@ def make_system_telemetry_message(
         device_id=device_id,
         message_type="system_telemetry",
         payload=payload,
+    )
+
+
+def make_imu_telemetry_message(
+    device_id: str,
+    session_id: str,
+    sample: ImuSample,
+    stats: dict[str, object],
+) -> Message:
+    """Live orientation + raw accel, mode-independent — the debug-tab
+    counterpart of `system_telemetry` (docs/scene3d.md's IMU section).
+    Deliberately raw, same philosophy as `RvcReader.read_motion`: no gravity
+    removal, no preintegration here (that stays scene3d-recording-only via
+    `ImuIntegrator.cut()`) — just what the sensor measured, at a rate a
+    live chart can use."""
+    return make_message(
+        device_id=device_id,
+        message_type="imu_telemetry",
+        payload={
+            "session_id": session_id,
+            "yaw_deg": round(sample.yaw_deg, 2),
+            "pitch_deg": round(sample.pitch_deg, 2),
+            "roll_deg": round(sample.roll_deg, 2),
+            "accel_mg": [round(v, 1) for v in sample.accel_mg],
+            "stats": stats,
+        },
     )
 
 

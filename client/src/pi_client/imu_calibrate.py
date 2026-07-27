@@ -73,6 +73,7 @@ from pi_client.imu_rvc import (
     DEFAULT_PORT,
     RvcReader,
     angle_between_deg,
+    fit_tilt_model,
     kabsch_rotation,
 )
 from pi_client.scene_calibrate import CANDIDATE_PATTERNS, PreviewUplink, find_board
@@ -303,6 +304,7 @@ def main() -> int:
 
     up_camera: list[np.ndarray] = []
     up_imu: list[np.ndarray] = []
+    pitch_roll: list[tuple[float, float]] = []
     pattern: tuple[int, int] | None = None
     source = None
 
@@ -371,7 +373,8 @@ def main() -> int:
                 ok, rvec, _tvec = cv2.solvePnP(objp, corners, camera_matrix, dist)
                 cam_up, reason = board_up_camera(rvec) if ok else (None, "pose failed")
                 imu_up = reader.averaged_up_sensor()
-                if cam_up is not None and imu_up is not None:
+                imu_attitude = reader.averaged_pitch_roll_deg()
+                if cam_up is not None and imu_up is not None and imu_attitude is not None:
                     imu_vec = np.asarray(imu_up, dtype=np.float64)
                     novelty = min(
                         (angle_between_deg(imu_vec, prev) for prev in up_imu),
@@ -380,6 +383,7 @@ def main() -> int:
                     if novelty >= MIN_NEW_ANGLE_DEG or len(up_camera) < args.reference_views:
                         up_camera.append(cam_up)
                         up_imu.append(imu_vec)
+                        pitch_roll.append(imu_attitude)
                         last_accept = time.monotonic()
                         message = (f"view {len(up_camera)} accepted "
                                    f"(attitude {novelty:.1f} deg from the nearest earlier one)")
@@ -495,6 +499,38 @@ def main() -> int:
                         cost_at_5deg)
             logger.info("  measured mounting differs from the described one "
                         "(accel X forward, Y left) by %.1f deg.", payload["off_nominal_deg"])
+
+        # Independent of cam_from_imu: this is the fix for the metric-scale
+        # bug (docs/scene3d.md, poses_step.imu_scale_samples) — a live
+        # tilt->gravity model fit from the same multi-attitude data, so
+        # ImuIntegrator can stop assuming the rig never leaves the pose
+        # gravity was measured in. Gated on its own residual, independent of
+        # whether cam_from_imu above was good enough to keep.
+        reference_pitch_deg, reference_roll_deg = np.mean(
+            pitch_roll[: args.reference_views], axis=0
+        )
+        tilt_model = fit_tilt_model(
+            pitch_roll, up_imu, reference_pitch_deg, reference_roll_deg, reference_imu
+        )
+        if tilt_model is None:
+            logger.warning("Not enough independent attitude spread to fit a tilt model "
+                            "(need the rig propped up in at least two different directions, "
+                            "e.g. front then side) — ImuIntegrator will keep using the static "
+                            "reference vector.")
+        elif tilt_model["fit_residual_deg_mean"] <= GOOD_RESIDUAL_DEG:
+            payload["tilt_model"] = tilt_model
+            logger.info("Tilt model: residual mean %.2f deg, max %.2f deg over %d attitudes — "
+                        "good. ImuIntegrator will now track gravity dynamically instead of "
+                        "assuming a constant.", tilt_model["fit_residual_deg_mean"],
+                        tilt_model["fit_residual_deg_max"], tilt_model["attitudes_used"])
+        elif tilt_model["fit_residual_deg_mean"] <= USABLE_RESIDUAL_DEG:
+            payload["tilt_model"] = tilt_model
+            logger.info("Tilt model: residual mean %.2f deg (ideal < %.0f) — usable.",
+                        tilt_model["fit_residual_deg_mean"], GOOD_RESIDUAL_DEG)
+        else:
+            logger.warning("Tilt model: residual mean %.2f deg is too high to trust — "
+                            "ImuIntegrator will keep using the static reference vector.",
+                            tilt_model["fit_residual_deg_mean"])
     else:
         payload["mode"] = "reference"
         logger.info("Attitude spread was %.1f deg (need %.0f for tilt tracking) — writing a "

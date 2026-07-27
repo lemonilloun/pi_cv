@@ -90,6 +90,7 @@ class MjpegPreviewServer:
         room_store: Any | None = None,
         monitor_controller: Any | None = None,
         scene_pipeline: Any | None = None,
+        imu_telemetry_store: Any | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -105,6 +106,7 @@ class MjpegPreviewServer:
                 room_store,
                 monitor_controller,
                 scene_pipeline,
+                imu_telemetry_store,
             ),
         )
         self._thread: threading.Thread | None = None
@@ -139,6 +141,7 @@ def _make_handler(
     room_store: Any | None = None,
     monitor_controller: Any | None = None,
     scene_pipeline: Any | None = None,
+    imu_telemetry_store: Any | None = None,
 ) -> type[server.BaseHTTPRequestHandler]:
     class StreamingHandler(server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -157,6 +160,9 @@ def _make_handler(
                 return
             if parsed.path == "/api/telemetry":
                 self._serve_telemetry(parsed.query)
+                return
+            if parsed.path == "/api/imu":
+                self._serve_imu(parsed.query)
                 return
             if parsed.path == "/api/rooms":
                 self._serve_rooms()
@@ -866,6 +872,28 @@ def _make_handler(
             device_ids = params.get("device_id") or telemetry_store.device_ids()
             history = {
                 device_id: telemetry_store.recent(device_id, seconds)
+                for device_id in device_ids
+            }
+            self._send_json({"devices": history, "seconds": seconds})
+
+        def _serve_imu(self, query: str) -> None:
+            """Live IMU history for the panel's IMU tab — same shape as
+            /api/telemetry (device_id -> list of samples), polled on its
+            own faster cadence since imu_telemetry arrives at ~10 Hz."""
+            if imu_telemetry_store is None:
+                self._send_json({"devices": {}})
+                return
+
+            params = parse_qs(query)
+            try:
+                seconds = float(params.get("seconds", ["10"])[0])
+            except ValueError:
+                seconds = 10.0
+            seconds = max(1.0, min(120.0, seconds))
+
+            device_ids = params.get("device_id") or imu_telemetry_store.device_ids()
+            history = {
+                device_id: imu_telemetry_store.recent(device_id, seconds)
                 for device_id in device_ids
             }
             self._send_json({"devices": history, "seconds": seconds})

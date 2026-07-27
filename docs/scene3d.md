@@ -71,11 +71,25 @@ processes it — no real-time constraint (2-3 fps recording is the target).
    (displacement accumulates in the rotating sensor frame, so turning
    shortens it) and speed is plausible; survivors go through the same
    MAD-rejecting median as the depth scale. `poses.scale_source`
-   (`auto`|`depth`|`imu`, default `auto`) takes the IMU when it has
-   `min_imu_intervals` (20) and a spread under `max_imu_scale_iqr` (0.25),
-   else depth. Both land in the report as `scale_depth` / `scale_imu`, and a
-   disagreement over 20% is warned about — they are independent, so a gap
-   means one of them is wrong.
+   (`auto`|`depth`|`imu`, **default `depth`** — see below) takes the IMU
+   when set to `auto` or `imu` and it has `min_imu_intervals` (20) and a
+   spread under `max_imu_scale_iqr` (0.25), else depth. Both land in the
+   report as `scale_depth` / `scale_imu`, and a disagreement over 20% is
+   warned about — they are independent, so a gap means one of them is
+   wrong.
+
+   **Why the default is `depth`, not `auto`, despite the IMU measuring
+   metres.** Measured on session_20260726_193117: preintegrated velocity
+   ran to 78 m/s over 215 s of driving. Not sensor noise — the chassis
+   swings ~3 deg (peaking at 10.8 deg) around the pose the gravity
+   reference was captured in, and subtracting a *constant* gravity vector
+   from a rig that is actually tilting leaks 9.81*sin(3 deg) = 0.52 m/s²,
+   14x the design budget. The fix (`imu_rvc.ImuIntegrator.tilt_model`,
+   fitted by `imu_calibrate.py`'s `full` mode from the sensor's own fused
+   pitch/roll) is implemented, but needs one `full`-mode calibration run
+   with real attitude spread to activate — see the IMU section below.
+   Until a recording with it enabled has been checked against a real
+   measurement, `scale_source` stays `depth`.
 3. `tsdf` — depth hygiene, then Open3D ScalableTSDFVolume (voxel 2 cm) →
    `room_mesh.ply` + carved `floor_plan.png` + `occupancy.npz`:
    - **filtering** (`depth_filter.py`) writes `derived/depth_filtered/` once,
@@ -355,6 +369,25 @@ Two calibration modes result:
   (a later 5° tilt typically maps with well under 1° of error). Ctrl+C
   before that just writes `reference` rather than a badly-conditioned
   rotation that would look authoritative.
+
+**`full` mode also fits `tilt_model`, the metric-scale fix.** The same
+multi-attitude data used for `cam_from_imu` above pairs each attitude's
+fused (pitch, roll) with the accelerometer's own measured `up` at that
+attitude, and fits a small-angle regression (Δpitch, Δroll) → Δup
+(`imu_rvc.fit_tilt_model`). This is what `ImuIntegrator.linear_accel` needs
+to stop assuming the chassis never leaves the pose gravity was measured
+in — see "Metric scale has two independent sources" above for why a static
+reference alone isn't enough while driving. It is fit and gated
+independently of `cam_from_imu`'s own residual (propping the rig up
+constrains this regardless of whether the board pose was also good enough
+to trust for `cam_from_imu`), needs attitude spread in **two different
+directions** (front tilt only can't separate pitch sensitivity from roll —
+prop a different side each time), and is written to the calibration file
+as `tilt_model` only when its own residual is good; otherwise
+`ImuIntegrator` keeps using the static reference vector, exactly as before.
+The current `config/imu_calibration.json` on the Pi is `mode: reference`
+with `spread_deg: 0.0` (a single held-still measurement) — a `full`-mode
+run has not been done yet, so this is implemented but not yet active.
 
 Guards throughout: a rest stage (|accel| must be ~1 g and both tilt
 estimates must agree), rejection of a board that is not on a vertical

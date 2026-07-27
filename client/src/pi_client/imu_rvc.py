@@ -194,6 +194,66 @@ def kabsch_rotation(source: Any, target: Any) -> Any:
     return vt.T @ correction @ u.T
 
 
+def fit_tilt_model(
+    pitch_roll_deg: Any,
+    up_sensor: Any,
+    reference_pitch_deg: float,
+    reference_roll_deg: float,
+    reference_up: Any,
+) -> dict[str, Any] | None:
+    """Small-angle linear fit: (Δpitch, Δroll) [rad] -> Δ(accelerometer's up).
+
+    This is the piece `ImuIntegrator.current_up_sensor` needs to track a
+    chassis that is actually tilting instead of assuming it stays at the
+    pose gravity was measured in — see its docstring for why. It uses the
+    SAME multi-attitude data `imu_calibrate.py`'s `full` mode already
+    collects for `cam_from_imu` (measured directions in, measured
+    directions out) rather than assuming any particular relationship
+    between the fused Euler frame and the raw accelerometer's — the two
+    are demonstrably not the same axes.
+
+    `pitch_roll_deg` and `up_sensor` must be the same length and in the
+    same attitude order. Returns None when there isn't enough independent
+    attitude spread to fit both a pitch and a roll sensitivity (propping
+    the rig up the same way twice constrains only one direction).
+    """
+    import numpy as np
+
+    pr = np.asarray(pitch_roll_deg, dtype=np.float64).reshape(-1, 2)
+    up = np.asarray(up_sensor, dtype=np.float64).reshape(-1, 3)
+    if len(pr) < 3 or len(pr) != len(up):
+        return None
+
+    reference = np.array([reference_pitch_deg, reference_roll_deg], dtype=np.float64)
+    d_pr = np.radians(pr - reference)
+    ref_up = np.asarray(reference_up, dtype=np.float64)
+    d_up = up - ref_up
+
+    # A robot propped only ever the same way leaves d_pr rank-1: any fit
+    # would be extrapolating along an axis nothing measured.
+    singular_values = np.linalg.svd(d_pr, compute_uv=False)
+    if len(singular_values) < 2 or singular_values[1] < 1e-3:
+        return None
+
+    sensitivity, *_ = np.linalg.lstsq(d_pr, d_up, rcond=None)  # (2, 3)
+
+    predicted_up = ref_up + d_pr @ sensitivity
+    norms = np.linalg.norm(predicted_up, axis=1, keepdims=True)
+    predicted_up = predicted_up / np.clip(norms, 1e-9, None)
+    cos_residual = np.clip(np.sum(predicted_up * up, axis=1), -1.0, 1.0)
+    residual_deg = np.degrees(np.arccos(cos_residual))
+
+    return {
+        "pitch_ref_deg": float(reference_pitch_deg),
+        "roll_ref_deg": float(reference_roll_deg),
+        "up_ref": [float(v) for v in ref_up],
+        "sensitivity": [[float(v) for v in row] for row in sensitivity],
+        "fit_residual_deg_mean": round(float(np.mean(residual_deg)), 3),
+        "fit_residual_deg_max": round(float(np.max(residual_deg)), 3),
+        "attitudes_used": int(len(pr)),
+    }
+
+
 def angle_between_deg(a: Any, b: Any) -> float:
     import numpy as np
 
@@ -215,6 +275,26 @@ def load_calibration(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def tilt_model_from_calibration(calibration: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Unpack the `tilt_model` block `imu_calibrate.py`'s `full` mode writes
+    (see `ImuIntegrator.current_up_sensor`). Absent on `reference`-mode
+    calibrations, or on `full`-mode ones from before this fit existed —
+    both fall back to the static reference vector, same as always."""
+    model = (calibration or {}).get("tilt_model")
+    if not model:
+        return None
+    try:
+        return {
+            "pitch_ref_deg": float(model["pitch_ref_deg"]),
+            "roll_ref_deg": float(model["roll_ref_deg"]),
+            "up_ref": [float(v) for v in model["up_ref"]],
+            "sensitivity": [[float(v) for v in row] for row in model["sensitivity"]],
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning("Malformed tilt_model in IMU calibration, ignoring: %s", exc)
+        return None
+
+
 G_MS2 = 9.80665
 
 
@@ -227,29 +307,60 @@ class ImuIntegrator:
     navigation does not exist. It is *not* why the accelerometer is useless:
     over the fraction of a second between two keyframes the same error is
     millimetres, and the next camera frame resets it. This is the mechanism
-    every visual-inertial system runs on.
-
-    Concretely, with gravity known in the sensor frame to ~0.2 deg (what the
-    calibration achieves here), the leaked acceleration is
-    9.81*sin(0.2 deg) = 0.034 m/s^2, giving 2.7 mm over 0.4 s against a
-    typical inter-keyframe motion of ~12 cm — about 2%.
+    every visual-inertial system runs on — PROVIDED gravity is removed
+    correctly at every sample, which is the one thing this class got wrong
+    until now (see `tilt_model` below).
 
     What that buys, and why it matters more than a drawn trajectory:
     **metric scale**. Vision recovers motion only up to an unknown factor,
     which the pipeline currently pins with monocular depth that carries its
     own scale error. The accelerometer measures metres. The ratio of the two
     displacement magnitudes over many intervals is the scale factor — and
-    magnitudes are enough, so this works in `reference` mode without knowing
-    the rotation about gravity.
+    magnitudes are enough, so this works without knowing the rotation about
+    gravity (yaw never enters it).
 
-    Gravity is removed using the direction measured at calibration rather
-    than any datasheet axis convention. Everything is accumulated in the
-    SENSOR frame; only lengths are consumed downstream, which is exactly
-    what keeps the unobservable spin about gravity out of the answer.
+    **Why a single static reference vector was not enough.** A rig that
+    genuinely never tilted could subtract one constant gravity vector
+    forever. Measured on a real drive (session_20260726_193117): the chassis
+    swings ~3 deg (p10..p90, peaking at 10.8 deg) around the pose the
+    reference was captured in — acceleration/braking pitch, floor bumps.
+    Subtracting a *constant* from a rig that is actually tilting leaks
+    9.81*sin(3 deg) = 0.52 m/s^2 into "linear" acceleration, fourteen times
+    the budget this design was sized against; over 215 s that integrated to
+    a 78 m/s "velocity". Removing a bigger constant does not help — the leak
+    tracks the chassis, not a fixed offset.
+
+    **The fix: `tilt_model`.** The one independent tilt signal this sensor
+    offers is its own fused pitch/roll — it uses the on-chip gyroscope
+    internally, so (unlike the raw accelerometer) it is not fooled by
+    linear acceleration into reporting the wrong tilt. The fused Euler
+    frame and the raw-accelerometer frame are demonstrably NOT the same
+    axes (imu_calibrate.py's rest check sees the same physical tilt as two
+    different vectors), so pitch/roll cannot be rotated into the
+    accelerometer frame by assumption — `imu_calibrate.py`'s `full` mode
+    fits that relationship empirically instead (a small-angle linear
+    regression from measured (Δpitch, Δroll) to the accelerometer's own
+    measured Δup, across the same multi-attitude data it already collects
+    for `cam_from_imu`). `tilt_model`, when present, is that fit: it lets
+    `linear_accel` rebuild gravity's current direction from live pitch/roll
+    instead of assuming the rig never left the pose gravity was measured
+    in. Without it (mode=`reference`, no book-propping run yet), behaviour
+    is unchanged: the static reference vector, and the honest 78 m/s result
+    is why `poses.scale_source` still defaults to `depth`.
+
+    Gravity is removed using directions measured at calibration rather than
+    any datasheet axis convention. Everything is accumulated in the SENSOR
+    frame; only lengths are consumed downstream, which is exactly what
+    keeps the unobservable spin about gravity out of the answer.
     """
 
-    def __init__(self, up_sensor: tuple[float, float, float] | None = None) -> None:
+    def __init__(
+        self,
+        up_sensor: tuple[float, float, float] | None = None,
+        tilt_model: dict[str, Any] | None = None,
+    ) -> None:
         self.up_sensor = up_sensor
+        self.tilt_model = tilt_model
         self.reset()
 
     def reset(self) -> None:
@@ -272,11 +383,41 @@ class ImuIntegrator:
     def set_reference(self, up_sensor: tuple[float, float, float] | None) -> None:
         self.up_sensor = up_sensor
 
+    def set_tilt_model(self, tilt_model: dict[str, Any] | None) -> None:
+        self.tilt_model = tilt_model
+
+    def current_up_sensor(self, sample: ImuSample) -> tuple[float, float, float] | None:
+        """Gravity's direction in the sensor frame for THIS sample.
+
+        Static reference by default. With `tilt_model` fitted, this instead
+        rebuilds the direction from the sample's own fused pitch/roll — see
+        the class docstring for why that is the only way to track a chassis
+        that is actually tilting instead of assuming it never left the
+        pose the reference was measured in.
+        """
+        if self.tilt_model is None:
+            return self.up_sensor
+        model = self.tilt_model
+        d_pitch = math.radians(sample.pitch_deg - model["pitch_ref_deg"])
+        d_roll = math.radians(sample.roll_deg - model["roll_ref_deg"])
+        sensitivity = model["sensitivity"]  # (2, 3): [d_pitch, d_roll] @ sensitivity -> delta up
+        up_ref = model["up_ref"]
+        delta = [
+            d_pitch * sensitivity[0][k] + d_roll * sensitivity[1][k]
+            for k in range(3)
+        ]
+        candidate = [up_ref[k] + delta[k] for k in range(3)]
+        norm = math.sqrt(sum(v * v for v in candidate))
+        if norm < 1e-6:
+            return self.up_sensor
+        return (candidate[0] / norm, candidate[1] / norm, candidate[2] / norm)
+
     def linear_accel(self, sample: ImuSample) -> tuple[float, float, float] | None:
         """Acceleration with gravity removed, in m/s^2, sensor frame."""
-        if self.up_sensor is None:
+        up = self.current_up_sensor(sample)
+        if up is None:
             return None
-        ux, uy, uz = self.up_sensor
+        ux, uy, uz = up
         # Specific force in m/s^2; at rest this is +1 g along `up`.
         ax = sample.accel_mg[0] / 1000.0 * G_MS2
         ay = sample.accel_mg[1] / 1000.0 * G_MS2
@@ -383,7 +524,8 @@ class RvcReader:
         self._suppressed = 0  # reads withheld because the rig left its reference pose
         reference_up = (self.calibration or {}).get("up_imu_reference")
         self.integrator = ImuIntegrator(
-            tuple(reference_up) if reference_up else None
+            tuple(reference_up) if reference_up else None,
+            tilt_model=tilt_model_from_calibration(self.calibration),
         )
 
     # ------------------------------------------------------------ lifecycle
@@ -475,6 +617,9 @@ class RvcReader:
                 "window": len(self._samples),
                 "calibrated": self.calibration is not None,
                 "mode": (self.calibration or {}).get("mode"),
+                "gravity_mode": (
+                    "dynamic_tilt_model" if self.integrator.tilt_model else "static_reference"
+                ),
                 "suppressed_off_reference": self._suppressed,
             }
 
@@ -494,6 +639,18 @@ class RvcReader:
         if norm < 1e-6:
             return None
         return (axes[0] / norm, axes[1] / norm, axes[2] / norm)
+
+    def averaged_pitch_roll_deg(self) -> tuple[float, float] | None:
+        """Median (pitch, roll) over the current window — same rationale as
+        `averaged_up_sensor`. Used by `imu_calibrate.py`'s `full` mode to
+        pair a steady attitude reading with the accelerometer's `up` at the
+        same instant."""
+        samples = self.window()
+        if not samples:
+            return None
+        pitch = statistics.median(s.pitch_deg for s in samples)
+        roll = statistics.median(s.roll_deg for s in samples)
+        return (pitch, roll)
 
     def read_motion(self) -> dict[str, Any] | None:
         """Everything the IMU knows about this keyframe, and closes the
@@ -515,6 +672,9 @@ class RvcReader:
             "tilt_deg": round(sample.accel_tilt_deg(), 2),
             "accel_mg": [round(v, 1) for v in sample.accel_mg],
             "segment": segment,
+            "gravity_mode": (
+                "dynamic_tilt_model" if self.integrator.tilt_model else "static_reference"
+            ),
         }
         gravity = self.read()
         if gravity is not None:

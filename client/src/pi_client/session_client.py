@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-is-metric", action="store_true")
     parser.add_argument("--torch-threads", type=int)
 
+    parser.add_argument("--no-imu", action="store_true", help="Disable IMU reading even if wired up")
+    parser.add_argument("--imu-port", help="IMU serial port")
+    parser.add_argument("--imu-baud", type=int, help="IMU serial baud rate")
+    parser.add_argument("--imu-calibration", type=Path, help="Path to imu_calibration.json")
+    parser.add_argument("--imu-hz", type=float, help="Live IMU telemetry rate to the Mac")
+
     return parser.parse_args()
 
 
@@ -102,6 +108,12 @@ def build_settings(args: argparse.Namespace) -> SessionSettings:
     synthetic_image = args.synthetic_image or Path(session_config.get("synthetic_image", "data/cat.jpg"))
     if not synthetic_image.is_absolute():
         synthetic_image = REPO_ROOT / synthetic_image
+
+    imu_calibration = args.imu_calibration or Path(
+        session_config.get("imu_calibration", "config/imu_calibration.json")
+    )
+    if not imu_calibration.is_absolute():
+        imu_calibration = REPO_ROOT / imu_calibration
 
     return SessionSettings(
         host=host,
@@ -144,6 +156,11 @@ def build_settings(args: argparse.Namespace) -> SessionSettings:
         depth_input_size=int(pick(args.depth_input_size, "depth_input_size", 392)),
         depth_is_metric=bool(args.depth_is_metric or session_config.get("depth_is_metric", False)),
         torch_threads=int(pick(args.torch_threads, "torch_threads", 3)),
+        imu_enabled=not args.no_imu and bool(session_config.get("imu_enabled", True)),
+        imu_port=str(pick(args.imu_port, "imu_port", "/dev/ttyUSB0")),
+        imu_baud=int(pick(args.imu_baud, "imu_baud", 115200)),
+        imu_calibration=imu_calibration,
+        imu_hz=float(pick(args.imu_hz, "imu_hz", 10.0)),
     )
 
 

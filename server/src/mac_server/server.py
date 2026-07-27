@@ -52,7 +52,11 @@ class MacServer:
         self.preview_store = self.frame_hub.get("pi")
         self.registry = ClientRegistry()
         self.telemetry_store = TelemetryStore()
-        self.cv_worker = self._build_cv_worker(server_cv_config or {})
+        # Separate store: imu_telemetry arrives at ~10 Hz (vs 1 Hz for
+        # system_telemetry) so the panel's IMU tab can poll it on its own
+        # cadence without growing the payload every other view already polls.
+        self.imu_telemetry_store = TelemetryStore(history_limit=1200)
+        self.cv_worker = self._build_cv_worker(server_cv_config or {}, mapping_config or {})
         self.room_store, self.scan_controller = self._build_mapping(mapping_config or {})
         self.monitor_controller = self._build_monitoring(monitoring_config or {})
         self.scene_pipeline = self._build_scene3d(scene3d_config or {})
@@ -63,6 +67,7 @@ class MacServer:
                 self.frame_hub,
                 registry=self.registry,
                 telemetry_store=self.telemetry_store,
+                imu_telemetry_store=self.imu_telemetry_store,
                 cv_status_provider=(self.cv_worker.status if self.cv_worker is not None else None),
                 scan_controller=self.scan_controller,
                 room_store=self.room_store,
@@ -75,7 +80,7 @@ class MacServer:
         self._socket: socket.socket | None = None
         self._stop_event = threading.Event()
 
-    def _build_cv_worker(self, cv_config: dict[str, Any]):
+    def _build_cv_worker(self, cv_config: dict[str, Any], mapping_config: dict[str, Any]):
         if not cv_config.get("enabled", False):
             return None
         try:
@@ -88,6 +93,7 @@ class MacServer:
             frame_hub=self.frame_hub,
             config=cv_config,
             repo_root=REPO_ROOT,
+            mapping_config=mapping_config,
         )
 
     def _build_mapping(self, mapping_config: dict[str, Any]):
@@ -251,6 +257,7 @@ class MacServer:
             client_socket=client_socket,
             client_address=address,
             send_lock=send_lock,
+            imu_telemetry_store=self.imu_telemetry_store,
         )
         try:
             with client_socket:

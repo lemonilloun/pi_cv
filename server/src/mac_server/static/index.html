@@ -347,6 +347,7 @@
   <nav class="tabs" id="tabs">
     <button data-tab="live" class="active">Live</button>
     <button data-tab="scene">Scene</button>
+    <button data-tab="imu">IMU</button>
   </nav>
   <span class="conn offline" id="conn"><span class="dot"></span><span id="connText">connecting…</span></span>
   <span class="conn" id="deviceInfo" style="margin-left:auto"></span>
@@ -553,6 +554,67 @@
   </section>
 </main>
 
+<main id="tabImu" style="display:none; grid-template-columns: minmax(360px, 1fr) minmax(380px, 1.1fr);">
+  <section>
+    <div class="card">
+      <p class="section-title">Orientation</p>
+      <div class="chart-wrap">
+        <canvas id="imuVectorCanvas" style="height:240px"></canvas>
+      </div>
+      <div class="legend" style="margin-top:6px">
+        <span class="chip"><span class="swatch" style="background:#3987e5"></span>heading (yaw)</span>
+        <span class="chip"><span class="swatch" style="background:#c98500"></span>accel vector (forward/lateral)</span>
+      </div>
+      <p class="meta-line" id="imuStatusLine">waiting for IMU data…</p>
+      <p class="meta-line" style="opacity:0.75">
+        Yaw is a <strong>relative</strong> heading — UART-RVC has no magnetometer, so 0°
+        means "wherever it was pointed on power-up", not compass north. Pitch/roll are the
+        sensor's own fused attitude, not a raw gyroscope reading — this protocol exposes no
+        raw gyro or magnetometer at all, only the already-fused output below. Assumed mounting:
+        accelerometer X = forward, Y = left (verify against reality here — that is this tab's job).
+      </p>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="chart-head">
+        <span class="title">Accelerometer, g</span>
+        <span class="legend" id="imuAccelLegend"></span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="imuAccelChart"></canvas>
+        <div class="tooltip" id="imuAccelTip"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="chart-head">
+        <span class="title">Fused orientation, deg</span>
+        <span class="legend" id="imuOrientLegend"></span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="imuOrientChart"></canvas>
+        <div class="tooltip" id="imuOrientTip"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card video-card" style="padding:14px">
+    <p class="section-title">Live map — walls &amp; objects</p>
+    <div class="chart-wrap">
+      <canvas id="imuMapCanvas" style="width:100%; aspect-ratio:1/1; background:#000; border-radius:8px"></canvas>
+      <div class="tooltip" id="imuMapTip"></div>
+    </div>
+    <div class="legend" id="imuMapLegend" style="margin-top:8px"></div>
+    <p class="meta-line" id="imuMapStatusLine" style="opacity:0.75"></p>
+    <p class="meta-line" style="opacity:0.75">
+      Single depth frame projected top-down — dim dots are wall/obstacle surface points,
+      colored dots are tracked objects (same data the Radar view on the Live tab uses).
+      No scanning motion, so nothing here can drift — needs the Pi in
+      <code>stream</code>, <code>yolo</code>, or <code>pipeline</code> mode with server CV enabled.
+    </p>
+  </section>
+</main>
+
 <script>
 "use strict";
 
@@ -653,8 +715,13 @@ function makeChart(canvasId, tipId, opts) {
   const tip = document.getElementById(tipId);
   const ctx = canvas.getContext("2d");
   let hoverIndex = null;
+  // Defaults preserve the original behavior (system-telemetry charts);
+  // the IMU tab's charts pass their own samples array + window so this
+  // one factory serves both without duplicating the drawing code.
+  const windowSize = opts.window || WINDOW_SAMPLES;
+  const getSamples = opts.getSamples || (() => state.samples);
 
-  function seriesList() { return opts.series(state.samples); }
+  function seriesList() { return opts.series(getSamples()); }
 
   function draw() {
     const dpr = window.devicePixelRatio || 1;
@@ -668,7 +735,7 @@ function makeChart(canvasId, tipId, opts) {
 
     const padL = 30, padR = 6, padT = 6, padB = 4;
     const plotW = w - padL - padR, plotH = h - padT - padB;
-    const samples = state.samples;
+    const samples = getSamples();
     const list = seriesList();
 
     let [yMin, yMax] = opts.range(samples);
@@ -694,8 +761,8 @@ function makeChart(canvasId, tipId, opts) {
 
     if (samples.length < 2) return;
 
-    const x = (i) => padL + plotW * i / (WINDOW_SAMPLES - 1 || 1);
-    const offset = WINDOW_SAMPLES - samples.length;
+    const x = (i) => padL + plotW * i / (windowSize - 1 || 1);
+    const offset = windowSize - samples.length;
     const y = (v) => padT + plotH - plotH * (v - yMin) / (yMax - yMin);
 
     list.forEach((series) => {
@@ -740,11 +807,11 @@ function makeChart(canvasId, tipId, opts) {
     const rect = canvas.getBoundingClientRect();
     const padL = 30, padR = 6;
     const plotW = rect.width - padL - padR;
-    const samples = state.samples;
+    const samples = getSamples();
     if (samples.length < 2) return;
-    const offset = WINDOW_SAMPLES - samples.length;
+    const offset = windowSize - samples.length;
     const frac = (event.clientX - rect.left - padL) / plotW;
-    let idx = Math.round(frac * (WINDOW_SAMPLES - 1)) - offset;
+    let idx = Math.round(frac * (windowSize - 1)) - offset;
     idx = Math.max(0, Math.min(samples.length - 1, idx));
     hoverIndex = idx;
 
@@ -1293,6 +1360,389 @@ document.getElementById("radarCanvas").addEventListener("mouseleave", () => {
 
 window.addEventListener("resize", () => { if (state.currentView === "radar") drawRadar(); });
 
+// -------------------------------------------------------------- IMU tab
+// Live orientation + raw accel (imu_telemetry, ~10 Hz from the Pi's
+// persistent session — see pi_client/session.py._imu_loop) plus a
+// single-frame depth/object top-down map. Independent of the Live tab's
+// Radar view: separate canvases, separate poll loops, only running while
+// this tab is visible.
+const IMU_WINDOW_SAMPLES = 150;
+const IMU_HISTORY_SECONDS = 15;
+const IMU_POLL_MS = 400;
+const IMU_MAP_POLL_MS = 250;
+const IMU_MAP_HISTORY_MAX = 3;
+
+state.imuSamples = []; // [{ts, yaw, pitch, roll, ax, ay, az, gravityMode, calibrated}]
+state.imuMapHistory = []; // ring buffer of {objects, wallPoints}
+let imuPollTimer = null;
+let imuMapPollTimer = null;
+let imuMapHoverTargets = [];
+
+async function pollImu() {
+  try {
+    const res = await fetch("/api/imu?seconds=" + IMU_HISTORY_SECONDS);
+    if (!res.ok) return;
+    const data = await res.json();
+    const deviceIds = Object.keys(data.devices || {});
+    const list = deviceIds.length ? data.devices[deviceIds[0]] : [];
+    state.imuSamples = list.map((s) => {
+      const accel = Array.isArray(s.accel_mg) ? s.accel_mg : [null, null, null];
+      return {
+        ts: s.received_at,
+        yaw: numOrNull(s.yaw_deg), pitch: numOrNull(s.pitch_deg), roll: numOrNull(s.roll_deg),
+        ax: numOrNull(accel[0]) !== null ? accel[0] / 1000 : null,
+        ay: numOrNull(accel[1]) !== null ? accel[1] / 1000 : null,
+        az: numOrNull(accel[2]) !== null ? accel[2] / 1000 : null,
+        gravityMode: s.stats && s.stats.gravity_mode,
+        calibrated: !!(s.stats && s.stats.calibrated),
+      };
+    });
+    if (state.imuSamples.length > IMU_WINDOW_SAMPLES) {
+      state.imuSamples.splice(0, state.imuSamples.length - IMU_WINDOW_SAMPLES);
+    }
+    drawImuCharts();
+    drawImuVector();
+    updateImuStatusLine(deviceIds.length === 0);
+  } catch (err) { /* transient network hiccup, next poll retries */ }
+}
+
+function updateImuStatusLine(noDevice) {
+  const line = document.getElementById("imuStatusLine");
+  const latest = state.imuSamples[state.imuSamples.length - 1];
+  if (noDevice || !latest) {
+    line.textContent = "no session client streaming IMU data (needs pi_client.session with the IMU wired up)";
+    return;
+  }
+  const parts = [
+    "yaw " + fmtOrDash(latest.yaw, "°", 1),
+    "pitch " + fmtOrDash(latest.pitch, "°", 1),
+    "roll " + fmtOrDash(latest.roll, "°", 1),
+  ];
+  if (latest.ax !== null && latest.ay !== null && latest.az !== null) {
+    const mag = Math.sqrt(latest.ax * latest.ax + latest.ay * latest.ay + latest.az * latest.az);
+    parts.push("|a| " + mag.toFixed(2) + " g");
+  }
+  parts.push(latest.calibrated
+    ? "gravity: " + (latest.gravityMode || "static_reference")
+    : "uncalibrated (run ./scripts/run_imu_calibrate.sh)");
+  line.textContent = parts.join(" · ");
+}
+
+const imuAccelChart = makeChart("imuAccelChart", "imuAccelTip", {
+  getSamples: () => state.imuSamples,
+  window: IMU_WINDOW_SAMPLES,
+  series() {
+    return [
+      { name: "ax (fwd)", color: SERIES_COLORS[0], value: (s) => s.ax },
+      { name: "ay (left)", color: SERIES_COLORS[1], value: (s) => s.ay },
+      { name: "az (up)", color: SERIES_COLORS[2], value: (s) => s.az },
+    ];
+  },
+  range(samples) {
+    const vals = samples.flatMap((s) => [s.ax, s.ay, s.az]).filter((v) => v !== null && v !== undefined);
+    if (!vals.length) return [-1, 1];
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const pad = Math.max(0.05, (hi - lo) * 0.15);
+    return [lo - pad, hi + pad];
+  },
+  fmt: (v) => v.toFixed(2) + "g",
+});
+
+const imuOrientChart = makeChart("imuOrientChart", "imuOrientTip", {
+  getSamples: () => state.imuSamples,
+  window: IMU_WINDOW_SAMPLES,
+  series() {
+    return [
+      { name: "yaw", color: SERIES_COLORS[0], value: (s) => s.yaw },
+      { name: "pitch", color: SERIES_COLORS[1], value: (s) => s.pitch },
+      { name: "roll", color: SERIES_COLORS[2], value: (s) => s.roll },
+    ];
+  },
+  range(samples) {
+    const vals = samples.flatMap((s) => [s.yaw, s.pitch, s.roll]).filter((v) => v !== null && v !== undefined);
+    if (!vals.length) return [-10, 10];
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const pad = Math.max(2, (hi - lo) * 0.15);
+    return [lo - pad, hi + pad];
+  },
+  fmt: (v) => v.toFixed(1) + "°",
+});
+
+function drawImuCharts() {
+  imuAccelChart.draw();
+  imuOrientChart.draw();
+}
+
+document.getElementById("imuAccelLegend").innerHTML =
+  ["ax (fwd)", "ay (left)", "az (up)"].map((n, i) =>
+    `<span class="chip"><span class="swatch" style="background:${SERIES_COLORS[i]}"></span>${n}</span>`
+  ).join("");
+document.getElementById("imuOrientLegend").innerHTML =
+  ["yaw", "pitch", "roll"].map((n, i) =>
+    `<span class="chip"><span class="swatch" style="background:${SERIES_COLORS[i]}"></span>${n}</span>`
+  ).join("");
+
+function drawImuVector() {
+  const canvas = document.getElementById("imuVectorCanvas");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+
+  const cx = w / 2, cy = h / 2;
+  const radius = Math.min(w, h) / 2 - 22;
+
+  ctx.strokeStyle = "#2c2c2a";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = "#898781";
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("0° (heading at session start)", cx, cy - radius - 8);
+
+  const latest = state.imuSamples[state.imuSamples.length - 1];
+  if (!latest) {
+    ctx.fillText("no IMU data", cx, cy);
+    return;
+  }
+
+  const yawRad = ((latest.yaw || 0) * Math.PI) / 180;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(yawRad);
+
+  // Robot body (triangle, nose = forward) and a long heading arrow out its
+  // front — both rotate together with yaw, so the icon always points the
+  // way the chassis is actually facing relative to the start heading.
+  ctx.fillStyle = SERIES_COLORS[0];
+  ctx.beginPath();
+  ctx.moveTo(0, -22);
+  ctx.lineTo(12, 16);
+  ctx.lineTo(-12, 16);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = SERIES_COLORS[0];
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -radius + 8);
+  ctx.stroke();
+
+  // Acceleration vector, drawn in the SAME body-local frame before the
+  // rotate() above so it comes out correctly oriented relative to the
+  // chassis: ax is forward (screen -Y locally), ay is left (screen -X
+  // locally) under the assumed accel X=forward/Y=left mounting.
+  if (latest.ax !== null && latest.ay !== null) {
+    const pxPerG = 90;
+    let localX = -(latest.ay || 0) * pxPerG;
+    let localY = -(latest.ax || 0) * pxPerG;
+    const len = Math.hypot(localX, localY);
+    const maxLen = radius - 12;
+    if (len > maxLen && len > 1e-6) {
+      const k = maxLen / len;
+      localX *= k; localY *= k;
+    }
+    if (len > 2) { // skip drawing a near-zero vector, just noise
+      ctx.strokeStyle = SERIES_COLORS[2];
+      ctx.fillStyle = SERIES_COLORS[2];
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(localX, localY);
+      ctx.stroke();
+      const ang = Math.atan2(localY, localX);
+      ctx.beginPath();
+      ctx.moveTo(localX, localY);
+      ctx.lineTo(localX - 8 * Math.cos(ang - 0.4), localY - 8 * Math.sin(ang - 0.4));
+      ctx.lineTo(localX - 8 * Math.cos(ang + 0.4), localY - 8 * Math.sin(ang + 0.4));
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+}
+
+function startImuPoll() {
+  if (imuPollTimer) return;
+  pollImu();
+  imuPollTimer = setInterval(pollImu, IMU_POLL_MS);
+  startImuMapPoll();
+}
+
+function stopImuPoll() {
+  if (imuPollTimer) { clearInterval(imuPollTimer); imuPollTimer = null; }
+  stopImuMapPoll();
+}
+
+// ---- live map: walls (dim scatter from depth) + tracked objects ----
+// Same /api/objects endpoint and Cartesian (lateral_m, forward_m) geometry
+// the Live tab's Radar uses (see the radar section above for why it's
+// Cartesian and not polar) — a separate canvas/poll loop so this tab
+// doesn't depend on the Radar view being selected elsewhere.
+
+async function pollImuMap() {
+  const line = document.getElementById("imuMapStatusLine");
+  try {
+    const res = await fetch("/api/objects");
+    const data = await res.json();
+    if (!res.ok) {
+      line.textContent = data.error || "server CV is not enabled";
+      return;
+    }
+    state.imuMapHistory.push({ objects: data.objects || [], wallPoints: data.wall_points || [] });
+    if (state.imuMapHistory.length > IMU_MAP_HISTORY_MAX) state.imuMapHistory.shift();
+    drawImuMap();
+    line.textContent = (data.objects || []).length + " object(s), " +
+      (data.wall_points || []).length + " wall point(s) this frame";
+  } catch (err) { /* transient network hiccup, next poll retries */ }
+}
+
+function startImuMapPoll() {
+  if (imuMapPollTimer) return;
+  pollImuMap();
+  imuMapPollTimer = setInterval(pollImuMap, IMU_MAP_POLL_MS);
+}
+
+function stopImuMapPoll() {
+  if (imuMapPollTimer) { clearInterval(imuMapPollTimer); imuMapPollTimer = null; }
+  state.imuMapHistory = [];
+  imuMapHoverTargets = [];
+}
+
+function drawImuMap() {
+  const canvas = document.getElementById("imuMapCanvas");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+
+  const hfovDeg = state.serverCv.hfov_deg || 102.0;
+  const maxRange = state.serverCv.display_max_m || 8.0;
+  const halfAngleRad = (hfovDeg / 2) * Math.PI / 180;
+  const originX = w / 2, originY = h - 14;
+  const maxLateralAtRange = maxRange * Math.tan(halfAngleRad);
+  const pxPerMeter = Math.min((w / 2 - 12) / maxLateralAtRange, (originY - 10) / maxRange);
+
+  function toScreen(lateralM, forwardM) {
+    return [originX + lateralM * pxPerMeter, originY - forwardM * pxPerMeter];
+  }
+
+  ctx.strokeStyle = "#2c2c2a";
+  ctx.fillStyle = "#898781";
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  const ringStep = maxRange > 4 ? 2 : 1;
+  for (let r = ringStep; r <= maxRange + 1e-6; r += ringStep) {
+    ctx.beginPath();
+    ctx.arc(originX, originY, r * pxPerMeter, -Math.PI / 2 - halfAngleRad, -Math.PI / 2 + halfAngleRad);
+    ctx.stroke();
+    ctx.fillText(r + "m", originX + 4, originY - r * pxPerMeter);
+  }
+
+  ctx.strokeStyle = "#383835";
+  ctx.beginPath();
+  ctx.moveTo(originX, originY);
+  let [ex, ey] = toScreen(-maxLateralAtRange, maxRange);
+  ctx.lineTo(ex, ey);
+  ctx.moveTo(originX, originY);
+  [ex, ey] = toScreen(maxLateralAtRange, maxRange);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+
+  // Walls/obstacles: this frame only (no trail — it's a raw depth scatter,
+  // not a tracked entity, so aging it like objects below would just be
+  // flicker).
+  const latestSnapshot = state.imuMapHistory[state.imuMapHistory.length - 1];
+  if (latestSnapshot) {
+    ctx.fillStyle = "#555550";
+    latestSnapshot.wallPoints.forEach(([lateralM, forwardM]) => {
+      const [sx, sy] = toScreen(lateralM, forwardM);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  ctx.fillStyle = "#c3c2b7";
+  ctx.beginPath();
+  ctx.arc(originX, originY, 4, 0, Math.PI * 2);
+  ctx.fill();
+
+  const seenClasses = new Set();
+  imuMapHoverTargets = [];
+  state.imuMapHistory.forEach((snapshot, idx) => {
+    const age = state.imuMapHistory.length - 1 - idx;
+    const alpha = Math.max(0.15, 1 - age * 0.3);
+    snapshot.objects.forEach((obj) => {
+      if (obj.lateral_m === undefined || obj.forward_m === undefined) return;
+      seenClasses.add(obj.class);
+      const [sx, sy] = toScreen(obj.lateral_m, obj.forward_m);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = classColor(obj.class);
+      ctx.beginPath();
+      ctx.arc(sx, sy, age === 0 ? 6 : 4, 0, Math.PI * 2);
+      ctx.fill();
+      if (age === 0) {
+        ctx.strokeStyle = "#0d0d0d";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        imuMapHoverTargets.push({ x: sx, y: sy, obj });
+      }
+    });
+  });
+  ctx.globalAlpha = 1;
+
+  const legend = document.getElementById("imuMapLegend");
+  legend.innerHTML = Array.from(seenClasses).map((c) =>
+    `<span class="chip"><span class="swatch" style="background:${classColor(c)}"></span>${c}</span>`
+  ).join("") + `<span class="chip"><span class="swatch" style="background:#555550"></span>wall/surface</span>`;
+}
+
+document.getElementById("imuMapCanvas").addEventListener("mousemove", (event) => {
+  const rect = event.target.getBoundingClientRect();
+  const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+  const tip = document.getElementById("imuMapTip");
+  const hit = imuMapHoverTargets.find((t) => Math.hypot(t.x - mx, t.y - my) <= 10);
+  if (!hit) { tip.style.display = "none"; return; }
+  const obj = hit.obj;
+  const range = Math.sqrt(obj.lateral_m * obj.lateral_m + obj.forward_m * obj.forward_m);
+  tip.innerHTML =
+    `<div class="row"><span class="swatch" style="background:${classColor(obj.class)}"></span>${obj.class}` +
+    `<span class="val">${range.toFixed(2)} m</span></div>`;
+  tip.style.display = "block";
+  tip.style.left = Math.min(mx + 12, rect.width - tip.offsetWidth - 4) + "px";
+  tip.style.top = Math.max(4, my - 10) + "px";
+});
+document.getElementById("imuMapCanvas").addEventListener("mouseleave", () => {
+  document.getElementById("imuMapTip").style.display = "none";
+});
+
+window.addEventListener("resize", () => {
+  if (document.getElementById("tabImu").style.display !== "none") {
+    drawImuCharts();
+    drawImuVector();
+    drawImuMap();
+  }
+});
+
 // ----------------------------------------------------------- monitoring
 state.scenes = [];
 state.monitorActive = false;
@@ -1616,10 +2066,12 @@ const sceneState = { selected: null, sessions: [], pollTimer: null, meshLoadedFo
 document.querySelectorAll("#tabs button").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b === btn));
-    const scene = btn.dataset.tab === "scene";
-    document.getElementById("tabLive").style.display = scene ? "none" : "";
-    document.getElementById("tabScene").style.display = scene ? "grid" : "none";
-    if (scene) { refreshSceneSessions(); startNavPolling(); }
+    const tab = btn.dataset.tab;
+    document.getElementById("tabLive").style.display = tab === "live" ? "" : "none";
+    document.getElementById("tabScene").style.display = tab === "scene" ? "grid" : "none";
+    document.getElementById("tabImu").style.display = tab === "imu" ? "grid" : "none";
+    if (tab === "scene") { refreshSceneSessions(); startNavPolling(); }
+    if (tab === "imu") { startImuPoll(); } else { stopImuPoll(); }
   });
 });
 

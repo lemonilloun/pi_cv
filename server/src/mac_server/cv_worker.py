@@ -141,6 +141,7 @@ class ServerCvWorker:
         frame_hub: FrameStoreHub,
         config: dict[str, Any],
         repo_root: Path,
+        mapping_config: dict[str, Any] | None = None,
     ) -> None:
         self._pi_store = pi_store
         self._depth_view_store = frame_hub.get("depth")
@@ -148,6 +149,11 @@ class ServerCvWorker:
         self.objects_store = LatestItemStore()
         self._config = config
         self._repo_root = repo_root
+        # Physical constants (camera height, wall height band) come from the
+        # shared `mapping` config section — same room, same camera, whether
+        # the consumer is the paused wall-scanner or this live wall/obstacle
+        # scatter (docs/scene3d.md IMU section; the new panel tab).
+        self._mapping_config = mapping_config or {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._state = "disabled"
@@ -271,22 +277,25 @@ class ServerCvWorker:
             # channel: the Pi runs YOLO on the AI HAT, the Mac contributes
             # meters and camera-frame position). Empty lists are published
             # too: consumers (radar, monitoring tracker) need "nothing in
-            # view" ticks to clear points and to age out tracks.
-            objects = frame.metadata.get("objects")
-            if objects is not None:
-                try:
-                    from mac_server.mapping.geometry import CameraIntrinsics
+            # view" ticks to clear points and to age out tracks. Computed
+            # every depth frame regardless of mode (not just yolo/pipeline)
+            # so wall_points below — the live obstacle/wall scatter for the
+            # IMU debug tab's map — updates during plain stream/depth too.
+            objects = frame.metadata.get("objects") or []
+            try:
+                from mac_server.mapping.geometry import CameraIntrinsics
 
-                    intrinsics = CameraIntrinsics.from_fov(width, height, hfov_deg, vfov_deg)
-                    self._latest_objects = {
-                        "pi_frame_index": frame.metadata.get("frame_index"),
-                        "view": view,
-                        "computed_at": time.time(),
-                        "objects": _attach_depth_to_objects(objects, depth_m, np, intrinsics),
-                    }
-                    self.objects_store.update(self._latest_objects)
-                except Exception as exc:
-                    logger.debug("Object depth attachment failed: %s", exc)
+                intrinsics = CameraIntrinsics.from_fov(width, height, hfov_deg, vfov_deg)
+                self._latest_objects = {
+                    "pi_frame_index": frame.metadata.get("frame_index"),
+                    "view": view,
+                    "computed_at": time.time(),
+                    "objects": _attach_depth_to_objects(objects, depth_m, np, intrinsics),
+                    "wall_points": _wall_points(depth_m, intrinsics, np, self._mapping_config),
+                }
+                self.objects_store.update(self._latest_objects)
+            except Exception as exc:
+                logger.debug("Object depth attachment / wall scatter failed: %s", exc)
 
             heatmap = _depth_to_heatmap_jpeg_fixed(depth_m, display_max_m)
             self._depth_view_store.update(
@@ -358,6 +367,45 @@ def _attach_depth_to_objects(
                     entry["forward_m"] = round(forward_m, 3)
         enriched.append(entry)
     return enriched
+
+
+def _wall_points(
+    depth_m: Any,
+    intrinsics: Any,
+    np: Any,
+    mapping_config: dict[str, Any],
+) -> list[list[float]]:
+    """Single-frame top-down scatter of walls/obstacles at roughly the
+    robot's own height — the live-map layer of the IMU debug tab's radar
+    (docs/scene3d.md IMU section). Reuses the same pure-numpy,
+    unit-tested projection the (paused) multi-frame room scanner uses
+    (mapping/geometry.py), just for one frame with no accumulation, no
+    ego-motion, and therefore no drift to get wrong — same principle as
+    the existing object Radar view.
+
+    Empty list (not None) when mapping isn't configured, so callers don't
+    need a None-check to iterate it.
+    """
+    if not mapping_config:
+        return []
+    from mac_server.mapping.geometry import depth_to_points, filter_height_band
+
+    points = depth_to_points(
+        depth_m,
+        intrinsics,
+        stride=int(mapping_config.get("wall_points_stride", 16)),
+        edge_crop_frac=float(mapping_config.get("edge_crop_frac", 0.1)),
+        min_z=0.2,
+        max_z=float(mapping_config.get("max_depth_use_m", 8.0)),
+    )
+    if points.shape[0] == 0:
+        return []
+    xz, _heights = filter_height_band(
+        points,
+        camera_height_m=float(mapping_config.get("camera_height_m", 0.3)),
+        band=tuple(mapping_config.get("height_band_m", [0.1, 2.0])),
+    )
+    return [[round(float(x), 2), round(float(z), 2)] for x, z in xz]
 
 
 def _depth_to_heatmap_jpeg_fixed(depth_m: Any, display_max_m: float) -> bytes:
