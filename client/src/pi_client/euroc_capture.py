@@ -32,9 +32,22 @@ increasing relative time, not real wall-clock/epoch alignment.
 ~20 fps camera vs ~50-90 Hz IMU, reading it once per camera frame would
 silently drop most IMU samples (2-4x more IMU updates happen between
 frames than that). A dedicated thread polls `latest()` frequently and
-logs each new sample (by comparing its `.monotonic` timestamp to the last
-one logged) as soon as it appears - lightweight since `latest()` itself
-is just a lock + tuple copy, not a read from the port.
+logs each new sample as soon as it appears - lightweight since `latest()`
+itself is just a lock + tuple copy, not a read from the port.
+
+**Why dedup on the reconstructed parse time, not `sample.monotonic`**:
+`ShtpUartReader.latest()` stamps `.monotonic` with the time *you called
+it*, not the time the reading was actually parsed off the wire (that's
+the whole point of its `.accel_age_s`/`.gyro_age_s` fields - see its own
+docstring). A first version of this poller compared `.monotonic` between
+polls to decide "is this new data", which is always true when polling
+faster than the data actually arrives - it logged the SAME stale reading
+repeatedly with fabricated, evenly-spaced timestamps (caught because the
+result was a suspicious ~485 Hz, far above this driver's documented
+~50-90 Hz ceiling; the real distinct-sample count matched that ceiling
+exactly). The correct dedup key is the reconstructed parse time
+(`sample.monotonic - sample.*_age_s`), which only changes when the
+underlying value genuinely updates.
 """
 
 from __future__ import annotations
@@ -58,15 +71,23 @@ def _imu_poll_loop(
     stop: threading.Event,
     poll_interval_s: float = 0.002,
 ) -> None:
-    last_seen_monotonic: float | None = None
+    last_accel_parse_t: float | None = None
+    last_gyro_parse_t: float | None = None
     while not stop.is_set():
         sample = imu.latest()
-        if sample is not None and sample.monotonic != last_seen_monotonic:
-            last_seen_monotonic = sample.monotonic
-            t_ns = int(sample.monotonic * 1e9)
-            gx, gy, gz = sample.gyro_rads
-            ax, ay, az = sample.accel_ms2
-            rows.append((t_ns, gx, gy, gz, ax, ay, az))
+        if sample is not None:
+            # Reconstruct when each axis was ACTUALLY parsed (not "now",
+            # which is what sample.monotonic is - see module docstring for
+            # why that distinction matters here).
+            accel_parse_t = sample.monotonic - sample.accel_age_s
+            gyro_parse_t = sample.monotonic - sample.gyro_age_s
+            if accel_parse_t != last_accel_parse_t or gyro_parse_t != last_gyro_parse_t:
+                last_accel_parse_t = accel_parse_t
+                last_gyro_parse_t = gyro_parse_t
+                t_ns = int(max(accel_parse_t, gyro_parse_t) * 1e9)
+                gx, gy, gz = sample.gyro_rads
+                ax, ay, az = sample.accel_ms2
+                rows.append((t_ns, gx, gy, gz, ax, ay, az))
         time.sleep(poll_interval_s)
 
 
