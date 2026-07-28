@@ -165,7 +165,21 @@ def record(
             "a_RS_S_z [m s^-2]\n"
         )
         for t_ns, gx, gy, gz, ax, ay, az in imu_rows:
-            f.write(f"{t_ns},{gx},{gy},{gz},{ax},{ay},{az}\n")
+            # Sign fix, not a units/axis relabel: the physical mounting is
+            # X-forward/Y-right/Z-up, but the user confirmed rotation about
+            # Z reads positive CLOCKWISE-from-above (imu_shtp_uart.py's
+            # decode_vec3 docstring / AxisConventionTests) - i.e. LEFT-handed.
+            # (Forward, Right, Up) with a right-hand-rule Z would need
+            # Forward x Right = Down (standard aerospace NED), not Up; a
+            # CW-positive Z is what you get instead. ORB-SLAM3's IMU
+            # preintegration assumes a standard right-handed body frame
+            # (its Tbc extrinsic below is a proper SO(3) rotation, det=+1,
+            # which only makes sense for one), so gyro_z is negated here -
+            # for THIS consumer only, not a claim about the driver's "true"
+            # sign - to turn the reported CW-positive Z into the CCW-positive
+            # convention the rest of this project's math (imu_rvc.py yaw,
+            # mapping/geometry.py) and ORB-SLAM3 both assume.
+            f.write(f"{t_ns},{gx},{gy},{-gz},{ax},{ay},{az}\n")
 
     summary = {
         "frames": len(cam_timestamps),

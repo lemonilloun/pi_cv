@@ -1,0 +1,87 @@
+%YAML:1.0
+
+# ORB-SLAM3 monocular-INERTIAL settings for THIS project's Camera Module 3
+# + BNO08x (SHTP-over-UART, imu_shtp_uart.py). Camera intrinsics are real
+# (config/scene_intrinsics.json). Everything IMU-side below is a
+# first-order estimate, not a measured calibration (see docs/orb_slam3_setup.md/
+# real-time vio_slam.md for why: a proper Kalibr camera-IMU calibration is
+# still the honest next step if this run looks promising) - do not trust
+# absolute scale/pose accuracy from a v1 run using these.
+
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+Camera1.fx: 534.457036517278
+Camera1.fy: 536.2956168300261
+Camera1.cx: 732.1537333394199
+Camera1.cy: 499.9620314844453
+
+Camera1.k1: 0.013957237534293941
+Camera1.k2: -0.023766177090027624
+Camera1.p1: -0.0032201566613762112
+Camera1.p2: 0.0009024025586573795
+
+Camera.width: 1536
+Camera.height: 864
+Camera.fps: 20
+Camera.RGB: 0
+
+# Transformation from camera frame to body(IMU) frame.
+#
+# Derived from the STATED physical mounting (not measured): camera frame
+# is the standard CV convention (X right, Y down, Z forward - right-handed).
+# IMU frame is X forward, Y right, Z up PER THE ACCELEROMETER axes, but
+# euroc_capture.py already negates gyro_z to fix a left-handed rotation
+# sign (see its comment) - so the body frame ORB-SLAM3 actually sees is
+# (X forward, Y right, Z DOWN), the standard right-handed NED-like
+# convention, matching how the corrected gyro is written. This matrix
+# assumes the two sensors are mounted with those axes cleanly aligned
+# (no tilt between camera and IMU boards) and a negligible baseline
+# (translation left at 0) - both are approximations a real Kalibr
+# camera-IMU calibration would replace.
+IMU.T_b_c1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [0.0, 0.0, 1.0, 0.0,
+          1.0, 0.0, 0.0, 0.0,
+          0.0, 1.0, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0]
+
+# IMU noise: no Allan-variance calibration exists for this specific BNO08x
+# yet, so these are the EuRoC/ADIS16448-class generic MEMS defaults
+# (ORB-SLAM3's own EuRoC.yaml) as a starting point, NOT measured for our
+# sensor. IMU.Frequency is set to our REAL measured rate (~37-50 Hz,
+# euroc_capture.py's reported imu_hz_actual) rather than the usual 200,
+# since that number affects ORB-SLAM3's own windowing/initialization
+# heuristics - see docs/imu_shtp_uart.md for why this sensor doesn't reach
+# 200 Hz on this UART link.
+IMU.NoiseGyro: 1.7e-4
+IMU.NoiseAcc: 2.0000e-3
+IMU.GyroWalk: 1.9393e-05
+IMU.AccWalk: 3.0000e-03
+IMU.Frequency: 40.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 1000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0

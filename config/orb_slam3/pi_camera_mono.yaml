@@ -1,0 +1,54 @@
+%YAML:1.0
+
+# ORB-SLAM3 monocular (no IMU) settings for THIS project's Camera Module 3,
+# using the real calibration in config/scene_intrinsics.json (lens_position
+# 1.0 - euroc_capture.py records at the same lens position, or the
+# intrinsics below don't apply). k3 (5th distortion term) is dropped -
+# ORB-SLAM3's PinHole model only takes k1/k2/p1/p2.
+
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+Camera1.fx: 534.457036517278
+Camera1.fy: 536.2956168300261
+Camera1.cx: 732.1537333394199
+Camera1.cy: 499.9620314844453
+
+Camera1.k1: 0.013957237534293941
+Camera1.k2: -0.023766177090027624
+Camera1.p1: -0.0032201566613762112
+Camera1.p2: 0.0009024025586573795
+
+Camera.width: 1536
+Camera.height: 864
+
+# Camera frames per second (nominal - actual timestamps come from the
+# times file regardless; euroc_capture.py measured ~18-20 fps actual)
+Camera.fps: 20
+
+# euroc_capture.py writes grayscale PNGs directly (cv2.IMREAD_GRAYSCALE)
+Camera.RGB: 0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 1000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
