@@ -32,7 +32,6 @@ external/
 *.pth
 *_ncnn_model/
 
-CLAUDE.md
 
 .ven-da3/
 config/imu_calibration.json
