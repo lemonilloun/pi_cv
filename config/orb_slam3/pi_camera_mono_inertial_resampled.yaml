@@ -1,0 +1,70 @@
+%YAML:1.0
+
+# Same as pi_camera_mono_inertial.yaml, but for the PCHIP-resampled IMU
+# stream (see scratchpad analysis this session): the raw ~40-111 Hz
+# irregular stream is resampled onto a uniform 150 Hz grid using
+# shape-preserving PCHIP interpolation (NOT linear, NOT natural cubic
+# spline - plain cubic spline overshot the real data range by >2x on this
+# noisy/irregular input, e.g. gyro_z hit -70 rad/s where the real sensor
+# never exceeded -32 rad/s; PCHIP is constructed specifically to never
+# produce a value outside the local min/max of its neighbouring real
+# samples). Only IMU.Frequency changes from the raw-stream settings file;
+# camera intrinsics/Tbc/noise are identical since only the IMU CSV changed,
+# not the camera or the sensor itself.
+
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+Camera1.fx: 534.457036517278
+Camera1.fy: 536.2956168300261
+Camera1.cx: 732.1537333394199
+Camera1.cy: 499.9620314844453
+
+Camera1.k1: 0.013957237534293941
+Camera1.k2: -0.023766177090027624
+Camera1.p1: -0.0032201566613762112
+Camera1.p2: 0.0009024025586573795
+
+Camera.width: 1536
+Camera.height: 864
+Camera.fps: 20
+Camera.RGB: 0
+
+IMU.T_b_c1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [0.0, 0.0, 1.0, 0.0,
+          1.0, 0.0, 0.0, 0.0,
+          0.0, 1.0, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0]
+
+IMU.NoiseGyro: 1.7e-4
+IMU.NoiseAcc: 2.0000e-3
+IMU.GyroWalk: 1.9393e-05
+IMU.AccWalk: 3.0000e-03
+IMU.Frequency: 150.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 1000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0

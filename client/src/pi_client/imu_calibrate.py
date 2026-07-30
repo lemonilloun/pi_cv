@@ -76,6 +76,7 @@ from pi_client.imu_rvc import (
     fit_tilt_model,
     kabsch_rotation,
 )
+from pi_client.imu_shtp_motion import ShtpMotionReader
 from pi_client.scene_calibrate import CANDIDATE_PATTERNS, PreviewUplink, find_board
 from shared.config import load_config
 
@@ -113,10 +114,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure gravity in the camera frame from a plumb wall board"
     )
-    parser.add_argument("--output", type=Path, default=REPO_ROOT / "config/imu_calibration.json")
+    parser.add_argument("--driver", choices=["shtp", "rvc"], default="shtp",
+                        help="shtp: imu_shtp_motion.ShtpMotionReader (real gyro, "
+                             "3 Mbaud UART-SHTP - current hardware jumper state). "
+                             "rvc: imu_rvc.RvcReader (115200 UART-RVC). Mutually "
+                             "exclusive on the physical sensor - a calibration "
+                             "measured with one driver's accelerometer sign "
+                             "convention must not be fed to the other (confirmed "
+                             "this session: RVC reads ~+1g at rest, SHTP ~-1g).")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="default: config/imu_calibration.json (rvc) or "
+                             "config/imu_calibration_shtp.json (shtp)")
     parser.add_argument("--intrinsics", type=Path, default=REPO_ROOT / "config/scene_intrinsics.json")
-    parser.add_argument("--port", default=DEFAULT_PORT)
-    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("--port", default=None)
+    parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--width", type=int, default=1536)
     parser.add_argument("--height", type=int, default=864)
     parser.add_argument("--cols", type=int, default=None, help="Inner corners per row (default: auto)")
@@ -247,6 +258,52 @@ def measure_rest(reader: RvcReader, seconds: float) -> dict[str, Any] | None:
     }
 
 
+def measure_rest_shtp(reader: ShtpMotionReader, seconds: float) -> dict[str, Any] | None:
+    """SHTP equivalent of measure_rest() above. Raw accel here is m/s^2, not
+    milli-g (RVC's unit), and there is no independent on-chip fused Euler to
+    cross-check against — SHTP mode as used by this project only has raw
+    accel+gyro reports enabled (see imu_shtp_uart.py), not the onboard
+    Rotation Vector — so this reports accel-only tilt and skips the
+    RVC-style two-estimate agreement check rather than fake one."""
+    logger.info("Rest check: leave the robot still for %.0f s ...", seconds)
+    deadline = time.monotonic() + seconds
+    seen: dict[float, tuple[float, float, float]] = {}
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        for t, accel in reader.window():
+            seen[t] = accel
+    samples = [seen[k] for k in sorted(seen)]
+    if len(samples) < 10:
+        logger.error("No IMU data (%d samples) — is %s the right port?", len(samples), reader.port)
+        return None
+
+    axes = np.asarray(samples, dtype=np.float64)
+    magnitude = float(np.median(np.linalg.norm(axes, axis=1)))
+    noise = [float(np.std(axes[:, k])) for k in range(3)]
+    vertical = np.max(np.abs(axes), axis=1)
+    accel_tilt = float(np.median(np.degrees(np.arccos(
+        np.clip(vertical / np.maximum(np.linalg.norm(axes, axis=1), 1e-9), -1.0, 1.0)
+    ))))
+
+    logger.info("  |accel| = %.2f m/s^2 (expect ~9.81), per-axis noise %.3f %.3f %.3f m/s^2",
+                magnitude, *noise)
+    logger.info("  tilt from level (accel only, no independent fused-euler cross-check "
+                "under SHTP): %.2f deg", accel_tilt)
+    if not 9.0 <= magnitude <= 10.6:
+        logger.error("  |accel| is %.2f m/s^2, not ~9.81 — the scale or the frame decode is wrong.",
+                     magnitude)
+        return None
+    if max(noise) > 0.5:
+        logger.warning("  noisy (%.2f m/s^2) — vibration widens the result but does not stop it.",
+                       max(noise))
+    return {
+        "accel_magnitude_ms2": round(magnitude, 3),
+        "noise_ms2": [round(v, 4) for v in noise],
+        "tilt_accel_deg": round(accel_tilt, 2),
+        "samples": len(samples),
+    }
+
+
 def draw_status(cv2, frame, views: int, target: int, spread: float, message: str) -> None:
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w, 96), (0, 0, 0), -1)
@@ -266,6 +323,20 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     logging.getLogger("pi_client.network").setLevel(logging.WARNING)
     args = parse_args()
+    if args.driver == "shtp":
+        if args.output is None:
+            args.output = REPO_ROOT / "config/imu_calibration_shtp.json"
+        if args.port is None:
+            args.port = "/dev/ttyUSB0"
+        if args.baud is None:
+            args.baud = 3_000_000
+    else:
+        if args.output is None:
+            args.output = REPO_ROOT / "config/imu_calibration.json"
+        if args.port is None:
+            args.port = DEFAULT_PORT
+        if args.baud is None:
+            args.baud = DEFAULT_BAUD
 
     if not args.intrinsics.exists():
         logger.error("No camera intrinsics at %s — run ./scripts/run_scene_calibrate.sh first. "
@@ -290,7 +361,10 @@ def main() -> int:
     device_id = str(config.get("client", {}).get("device_id", "raspberry_pi_01"))
     preview = None if args.no_preview else PreviewUplink(host, tcp_port, device_id)
 
-    reader = RvcReader(port=args.port, baud=args.baud)
+    if args.driver == "shtp":
+        reader = ShtpMotionReader(port=args.port, baud=args.baud)
+    else:
+        reader = RvcReader(port=args.port, baud=args.baud)
     if not reader.start():
         return 2
 
@@ -310,7 +384,10 @@ def main() -> int:
 
     try:
         time.sleep(1.0)  # let the sample window fill
-        rest = measure_rest(reader, args.rest_seconds)
+        rest = (
+            measure_rest_shtp(reader, args.rest_seconds) if args.driver == "shtp"
+            else measure_rest(reader, args.rest_seconds)
+        )
         if rest is None:
             return 2
 
@@ -429,6 +506,7 @@ def main() -> int:
     spread = spread_deg(up_imu) if len(up_imu) > 1 else 0.0
 
     payload: dict[str, Any] = {
+        "driver": args.driver,
         "up_camera_reference": [float(v) for v in reference_cam],
         "up_imu_reference": [float(v) for v in reference_imu],
         "tilt_tolerance_deg": args.tilt_tolerance_deg,

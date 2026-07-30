@@ -96,12 +96,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--no-imu", action="store_true",
                         help="Ignore the IMU even if it is connected and calibrated")
+    parser.add_argument("--imu-driver", choices=["shtp", "rvc"], default="shtp",
+                        help="shtp: imu_shtp_motion.ShtpMotionReader (real gyro, "
+                             "3 Mbaud UART-SHTP - current hardware jumper state). "
+                             "rvc: imu_rvc.RvcReader (no real gyro, 115200 UART-RVC). "
+                             "The two modes are mutually exclusive on the physical "
+                             "sensor - check the jumpers before switching this flag.")
     parser.add_argument("--imu-port", default="/dev/ttyUSB0")
     parser.add_argument("--zupt-shift-px", type=float, default=2.0,
                         help="Image shift below which the rig counts as stopped, "
                              "so the IMU's velocity is pinned back to zero")
-    parser.add_argument("--imu-calibration", type=Path,
-                        default=REPO_ROOT / "config/imu_calibration.json")
+    parser.add_argument("--imu-calibration", type=Path, default=None,
+                        help="default: config/imu_calibration.json (rvc) or "
+                             "config/imu_calibration_shtp.json (shtp) - the two "
+                             "drivers read the accelerometer with different sign "
+                             "conventions (confirmed this session), so a "
+                             "calibration measured with one driver must not be "
+                             "reused with the other.")
     parser.add_argument("--offline", action="store_true",
                         help="No uplink: write everything locally (old behavior)")
     parser.add_argument("--no-preview", action="store_true",
@@ -388,21 +399,38 @@ class SceneRecorder:
         # IMU. Optional by design: no sensor, no calibration, or an unplugged
         # cable all degrade to the Mac's floor-plane gravity fit rather than
         # stopping a recording. `read()` returns gravity (down) in the camera
-        # frame — see imu_rvc.RvcReader and _emit_keyframe.
+        # frame — see imu_rvc.RvcReader/imu_shtp_motion.ShtpMotionReader and
+        # _emit_keyframe. Driver choice matters: RVC and SHTP-UART are
+        # mutually exclusive on the physical sensor (mode pins) — see
+        # --imu-driver's help text.
         self.gravity_source = None
         if not args.no_imu:
-            from pi_client.imu_rvc import RvcReader
+            imu_calibration = args.imu_calibration
+            if imu_calibration is None:
+                imu_calibration = REPO_ROOT / (
+                    "config/imu_calibration.json" if args.imu_driver == "rvc"
+                    else "config/imu_calibration_shtp.json"
+                )
 
-            reader = RvcReader(
-                port=args.imu_port, calibration_path=args.imu_calibration
+            if args.imu_driver == "rvc":
+                from pi_client.imu_rvc import RvcReader as ImuReaderCls
+                default_port, default_baud = "/dev/ttyUSB0", 115200
+            else:
+                from pi_client.imu_shtp_motion import ShtpMotionReader as ImuReaderCls
+                default_port, default_baud = "/dev/ttyUSB0", 3_000_000
+
+            reader = ImuReaderCls(
+                port=args.imu_port or default_port,
+                baud=default_baud,
+                calibration_path=imu_calibration,
             )
-            if not args.imu_calibration.exists():
+            if not imu_calibration.exists():
                 logger.warning(
                     "IMU calibration missing (%s) — gravity will NOT be recorded. "
-                    "Run ./scripts/run_imu_calibrate.sh; without it the sensor's "
-                    "orientation relative to the camera is unknown and a guessed "
-                    "gravity vector would be worse than none.",
-                    args.imu_calibration,
+                    "Run ./scripts/run_imu_calibrate.sh --driver %s; without it the "
+                    "sensor's orientation relative to the camera is unknown and a "
+                    "guessed gravity vector would be worse than none.",
+                    imu_calibration, args.imu_driver,
                 )
             elif reader.start():
                 self.gravity_source = reader
