@@ -1,14 +1,21 @@
-"""Optional vision captioning for monitoring events, via a local Ollama
-multimodal model (e.g. Gemma 4 E4B).
+"""Optional vision captioning for monitoring events.
 
-This is deliberately separate from `agent.py` (apfel): apfel is text-only, so
-image-grounded descriptions need a different local model. Captioning only
-happens on event OPEN transitions for configured event types (sparse — a
-handful of calls per hour, not per frame), so a 6 GB resident model spinning
-up on demand (via Ollama's `keep_alive`) is a reasonable trade for an 8 GB
-Mac: `keep_alive: "0s"` unloads it immediately after each call, trading
-latency (the caption arrives a few seconds after the event, asynchronously)
-for not holding multiple GB resident between calls.
+Two backends, same `.caption(jpeg_bytes, prompt) -> str | None` interface
+(controller.py's `_caption_worker` doesn't care which is configured):
+
+- `OllamaVisionClient` — a local Ollama multimodal model (e.g. Gemma 4
+  E4B). Historically the only option, since apfel (agent.py) is text-only
+  and on an 8 GB Mac a resident multimodal model wasn't affordable
+  alongside everything else — hence `keep_alive: "0s"` trading latency for
+  not holding multiple GB resident between calls. Still useful standalone
+  (no GPU-service dependency, works offline).
+- `QwenVisionClient` — the same Qwen/Qwen3.5-9B vLLM instance agent.py now
+  talks to by default (confirmed multimodal: it correctly described a real
+  test photo when sent as an OpenAI `image_url` content part), reached the
+  same way (direct network, not through the gpu_service SSH tunnel). Since
+  it's one already-running model serving both digests and captions, no
+  per-call cold-load tax applies here, and `monitoring.vision.backend` in
+  config/default.json defaults to this now that it's available.
 
 Degrades gracefully exactly like ApfelClient: monitoring never depends on
 this being available.
@@ -133,6 +140,89 @@ class OllamaVisionClient:
             return text or None
         except Exception as exc:
             logger.warning("Ollama vision caption failed: %s", exc)
+            self.healthy = False
+            self._last_failure = time.monotonic()
+            return None
+
+
+class QwenVisionClient:
+    """Same interface as OllamaVisionClient, OpenAI-compatible wire format
+    (`/v1/chat/completions` with an `image_url` content part) instead of
+    Ollama's native `/api/chat`. No call-serializing lock: this hits an
+    already-running, request-queuing vLLM server rather than a cold-loading
+    local model on shared Mac RAM, so there's no reason to drop overlapping
+    requests the way OllamaVisionClient does."""
+
+    def __init__(
+        self,
+        base_url: str = "http://172.25.6.176:8000",
+        model: str = "Qwen/Qwen3.5-9B",
+        timeout_s: float = 30.0,
+        cooldown_s: float = 60.0,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_s = timeout_s
+        self.cooldown_s = cooldown_s
+        self.chat_template_kwargs = chat_template_kwargs
+        self.healthy = True
+        self._last_failure = 0.0
+
+    def caption(self, jpeg_bytes: bytes, prompt: str = CAPTION_PROMPT) -> str | None:
+        return self.ask([jpeg_bytes], prompt, max_tokens=80)
+
+    def ask(self, images: list[bytes], prompt: str,
+            max_tokens: int = 200) -> str | None:
+        """One prompt over one or more images.
+
+        Multi-image is what makes this useful beyond captioning: showing the
+        model two crops and asking "same physical object?" is a far better
+        arbiter for a borderline merge than a cosine threshold, and describing
+        an object from three views beats describing it from its blurriest one.
+
+        Note this vLLM belongs to another user of the GPU box. It queues
+        requests rather than loading per call, so overlapping requests are
+        fine, but the cooldown below still matters: when it is down or busy we
+        back off for a minute instead of hammering someone else's service.
+        """
+        if not self.healthy and time.monotonic() - self._last_failure < self.cooldown_s:
+            return None
+        if not images:
+            return None
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for jpeg_bytes in images:
+            image_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+            })
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            # A free-running answer can otherwise spend far more than the
+            # short reply these prompts ask for.
+            "max_tokens": max_tokens,
+        }
+        if self.chat_template_kwargs:
+            payload["chat_template_kwargs"] = self.chat_template_kwargs
+        body = json.dumps(payload).encode("utf-8")
+
+        try:
+            request = urllib.request.Request(
+                f"{self.base_url}/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            message = response_payload["choices"][0]["message"]
+            text = message.get("content") or message.get("reasoning")
+            self.healthy = True
+            return text.strip() if text else None
+        except Exception as exc:
+            logger.warning("Qwen vision caption failed: %s", exc)
             self.healthy = False
             self._last_failure = time.monotonic()
             return None

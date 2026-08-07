@@ -26,6 +26,7 @@ calibrated LensPosition) — drifting intrinsics would hurt COLMAP.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import signal
@@ -53,7 +54,7 @@ from pi_client.protocol import (
     make_scene_session_end_message,
     make_scene_session_start_message,
 )
-from pi_client.seg_postprocess import yolov8_seg_postprocess
+from pi_client.seg_postprocess import SEG_ARCHS, letterbox, yolov8_seg_postprocess
 from shared.config import load_config
 
 # Pure-python tracker shared with the Mac monitoring stack (no server
@@ -69,12 +70,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data/scene_sessions",
                         help="Local FALLBACK dir (used only when the uplink is down)")
     parser.add_argument("--intrinsics", type=Path, default=REPO_ROOT / "config/scene_intrinsics.json")
-    parser.add_argument("--seg-hef", type=Path, default=REPO_ROOT / "models/yolov8m_seg_h8.hef",
-                        help="yolov8m_seg (40.1 mask mAP); pass models/yolov8s_seg_h8.hef for speed")
+    parser.add_argument("--seg-hef", type=Path,
+                        default=REPO_ROOT / "models/indoor_yolo11l_seg.hef",
+                        help="Default is the indoor fine-tune (31 room classes). "
+                             "Measured against the old COCO hef on the same 53 "
+                             "keyframes: 112 detections vs 16, 91 ms vs 72. Pass "
+                             "models/yolov8m_seg_h8.hef with --seg-arch yolov8_seg "
+                             "to reproduce an old session.")
+    parser.add_argument("--seg-arch", choices=sorted(SEG_ARCHS), default="indoor_ade20k",
+                        help="Output layout of --seg-hef. Verify a new hef with "
+                             "scripts/probe_hef.py before trusting this flag: it "
+                             "derives the arch from the blobs, and a mismatch here "
+                             "is caught loudly by order_endnodes rather than "
+                             "producing wrong boxes quietly.")
+    parser.add_argument("--seg-classes", type=Path,
+                        default=REPO_ROOT / "config/seg_classes_indoor.json",
+                        help="Class names for a fine-tuned --seg-arch, in the "
+                             "order baked into the weights. Ignored for the "
+                             "COCO and class-agnostic archs.")
     parser.add_argument("--clip-hef", type=Path, default=REPO_ROOT / "models/clip_resnet_50x4_h8.hef")
     parser.add_argument("--no-clip", action="store_true", help="Skip CLIP embeddings")
-    parser.add_argument("--source", choices=["camera", "synthetic"], default="camera")
+    parser.add_argument("--source", choices=["camera", "synthetic", "replay"], default="camera")
     parser.add_argument("--synthetic-image", type=Path, default=REPO_ROOT / "data/cat.jpg")
+    parser.add_argument("--replay-session", type=Path, default=None,
+                        help="With --source replay: a recorded session dir whose "
+                             "keyframes are re-fed through the pipeline. Fixed "
+                             "pixels make perception changes comparable without "
+                             "a robot; note the frames are the saved JPEGs, so "
+                             "near-threshold detections will not match the "
+                             "original run exactly.")
     parser.add_argument("--width", type=int, default=1536)
     parser.add_argument("--height", type=int, default=864)
     parser.add_argument("--fps", type=float, default=3.0, help="Capture/inference loop rate")
@@ -87,8 +111,32 @@ def parse_args() -> argparse.Namespace:
                         help="Median feature displacement (in a 480x270 image) "
                              "that counts as a genuinely new viewpoint")
     parser.add_argument("--blur-threshold", type=float, default=100.0, help="Variance-of-Laplacian gate")
-    parser.add_argument("--confidence", type=float, default=0.4)
+    parser.add_argument("--confidence", type=float, default=0.4,
+                        help="Proposal score gate. One value used to drive both "
+                             "this and the tracker; see --track-min-confidence.")
+    parser.add_argument("--track-min-confidence", type=float, default=None,
+                        help="Separate gate for the tracker (default: --confidence). "
+                             "They are different jobs: a proposal worth embedding "
+                             "and reconstructing can be far weaker than one worth "
+                             "asserting an identity about across frames — and with "
+                             "a class-agnostic arch, every proposal scores ~1.0, so "
+                             "a shared value silently stops gating anything.")
     parser.add_argument("--max-detections", type=int, default=30)
+    # Proposal gates. Inert for COCO (a detector that fires at all fires on
+    # something bounded), and load-bearing for class-agnostic proposals, which
+    # happily return the wall, the floor, and a 4-pixel speck.
+    parser.add_argument("--min-mask-area-frac", type=float, default=0.0,
+                        help="Reject masks below this fraction of the frame")
+    parser.add_argument("--max-mask-area-frac", type=float, default=1.0,
+                        help="Reject masks above this fraction of the frame — a "
+                             "proposal covering most of the view is a wall or "
+                             "floor, not an object")
+    parser.add_argument("--reject-edge-count", type=int, default=0,
+                        help="Reject a box touching at least this many frame "
+                             "edges; 0 = off. A box on 3+ edges is usually "
+                             "background the segmenter wrapped a rectangle "
+                             "around. Note 2 is legitimate — a cabinet in a "
+                             "corner touches two.")
     parser.add_argument("--lens-position", type=float, default=None,
                         help="Manual focus (1/m); default: from intrinsics.json")
     parser.add_argument("--max-keyframes", type=int, default=2000)
@@ -96,12 +144,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--no-imu", action="store_true",
                         help="Ignore the IMU even if it is connected and calibrated")
-    parser.add_argument("--imu-driver", choices=["shtp", "rvc"], default="shtp",
-                        help="shtp: imu_shtp_motion.ShtpMotionReader (real gyro, "
-                             "3 Mbaud UART-SHTP - current hardware jumper state). "
-                             "rvc: imu_rvc.RvcReader (no real gyro, 115200 UART-RVC). "
-                             "The two modes are mutually exclusive on the physical "
-                             "sensor - check the jumpers before switching this flag.")
+    parser.add_argument("--imu-driver", choices=["rvc", "shtp"], default="rvc",
+                        help="rvc: imu_rvc.RvcReader (115200 UART-RVC, on-chip fused "
+                             "attitude, no raw gyro) - the current hardware jumper state "
+                             "and the measured-healthy link (100.2 Hz, 0 resyncs, 0 "
+                             "dropped frames). shtp: imu_shtp_motion.ShtpMotionReader "
+                             "(raw gyro, 3 Mbaud UART-SHTP) - kept for the case the "
+                             "jumpers are flipped back, but that link measured ~25% "
+                             "well-formed frames on this adapter. The two modes are "
+                             "mutually exclusive on the physical sensor - check the "
+                             "jumpers before switching this flag.")
     parser.add_argument("--imu-port", default="/dev/ttyUSB0")
     parser.add_argument("--zupt-shift-px", type=float, default=2.0,
                         help="Image shift below which the rig counts as stopped, "
@@ -128,6 +180,85 @@ def load_intrinsics(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError) as exc:
         logger.warning("Unreadable intrinsics %s: %s", path, exc)
         return None
+
+
+def load_class_names(path: Path, expected: int) -> list[str]:
+    """Class names for a fine-tuned arch, in the order baked into the weights.
+
+    Refuses on a count mismatch rather than padding or truncating. A names list
+    one entry short of the model's class count does not fail — it silently
+    relabels everything past that point, and the output stays perfectly
+    plausible ("door" where the model said "window"), so nothing downstream can
+    catch it.
+    """
+    config = json.loads(path.read_text(encoding="utf-8"))
+    names = [str(entry["name"]) for entry in config["classes"]]
+    if len(names) != expected:
+        raise ValueError(
+            f"{path} lists {len(names)} classes but the architecture has "
+            f"{expected}; the weights and this file disagree, so every label "
+            f"past the first difference would be wrong")
+    return names
+
+
+def gate_proposals(
+    detections: list[dict[str, Any]],
+    masks: np.ndarray | None,
+    frame_shape: tuple[int, int],
+    *,
+    min_area_frac: float = 0.0,
+    max_area_frac: float = 1.0,
+    reject_edge_count: int = 0,   # 0 = off; 1..4 = reject at that many edges
+    edge_tol_px: float = 2.0,
+) -> tuple[list[int], dict[str, int]]:
+    """Which proposals are worth spending the rest of the pipeline on.
+
+    Returns the indices to keep and a count per rejection reason. The counts
+    are the point: a gate that quietly discards half the proposals is
+    indistinguishable from a detector that never found them, and the two call
+    for opposite fixes. They are summed into `session_meta.json`.
+
+    Area is measured on the mask, not the box — a box is a rectangle around
+    something that may be a thin diagonal sliver, and it is the mask that gets
+    reconstructed. Edge contact is measured on the box, because a mask can
+    legitimately touch an edge (a table running out of frame) while a box
+    pinned to three or four edges means the segmenter drew a rectangle around
+    the background.
+
+    Defaults are inert (0.0 / 1.0 / 4), so turning this on is an explicit act.
+    """
+    reasons: dict[str, int] = {}
+    keep: list[int] = []
+    frame_h, frame_w = float(frame_shape[0]), float(frame_shape[1])
+
+    def reject(reason: str) -> None:
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    for idx, det in enumerate(detections):
+        if masks is not None and idx < len(masks):
+            mask = masks[idx]
+            area_frac = float((mask > 0.5).sum()) / float(mask.shape[0] * mask.shape[1])
+            if area_frac < min_area_frac:
+                reject("mask_too_small")
+                continue
+            if area_frac > max_area_frac:
+                reject("mask_too_large")
+                continue
+
+        bbox = det.get("bbox_xyxy")
+        if bbox and len(bbox) == 4 and reject_edge_count > 0:
+            x0, y0, x1, y1 = (float(v) for v in bbox)
+            edges = (
+                x0 <= edge_tol_px,
+                y0 <= edge_tol_px,
+                x1 >= frame_w - edge_tol_px,
+                y1 >= frame_h - edge_tol_px,
+            )
+            if sum(edges) >= reject_edge_count:
+                reject("touches_frame_edges")
+                continue
+        keep.append(idx)
+    return keep, reasons
 
 
 def variance_of_laplacian(gray: np.ndarray) -> float:
@@ -359,21 +490,43 @@ class SceneRecorder:
             autofocus_speed="normal",
             lens_position=lens_position,
         )
+        if args.source == "replay" and args.replay_session is None:
+            raise SystemExit("--source replay requires --replay-session <dir>")
         self.source = make_capture_source(
             args.source,
             CaptureSettings(
                 width=args.width, height=args.height, fps=args.fps,
                 jpeg_quality=95, focus_options=focus,
             ),
-            args.synthetic_image,
+            args.replay_session if args.source == "replay" else args.synthetic_image,
         )
 
         self.hailo: HailoMultiModel | None = None
         self.seg = None
+        self.seg_arch = SEG_ARCHS[args.seg_arch]
         self.clip = None
         if args.source == "camera" or args.seg_hef.exists():
             self.hailo = HailoMultiModel()
             self.seg = self.hailo.load("seg", str(args.seg_hef))
+            # Take the input shape from the hef rather than the arch default.
+            # The decoder's grid geometry is derived from it, so a hef that is
+            # not 640x640 would otherwise decode into the wrong coordinate
+            # space silently — no exception, just wrong boxes and masks.
+            self.seg_arch = dataclasses.replace(
+                self.seg_arch, input_shape=tuple(self.seg.input_shape[:2])
+            )
+            logger.info("Seg arch: %s, input %s, %d classes",
+                        self.seg_arch.name, self.seg_arch.input_shape,
+                        self.seg_arch.num_classes)
+        # Fine-tuned archs carry their own vocabulary; COCO archs use the
+        # built-in list. Loaded once, at startup, so a mismatch stops the run
+        # before it records a whole session of wrong labels.
+        self.class_names: list[str] | None = None
+        if self.seg_arch.num_classes not in (1, len(COCO80_CLASS_NAMES)):
+            self.class_names = load_class_names(
+                args.seg_classes, self.seg_arch.num_classes)
+            logger.info("Class names from %s: %s ...",
+                        args.seg_classes, ", ".join(self.class_names[:6]))
             if not args.no_clip and args.clip_hef.exists():
                 self.clip = self.hailo.load("clip", str(args.clip_hef))
             elif not args.no_clip:
@@ -381,7 +534,9 @@ class SceneRecorder:
 
         self.tracker = GreedyTracker(
             TrackerConfig(
-                min_confidence=args.confidence,
+                min_confidence=(args.track_min_confidence
+                                if args.track_min_confidence is not None
+                                else args.confidence),
                 confirm_hits=2,
                 lost_after_s=2.0,
                 end_after_s=6.0,
@@ -442,6 +597,7 @@ class SceneRecorder:
         self._last_keyframe_at = 0.0
         self._last_keyframe_gray: np.ndarray | None = None
         self._select_reasons: dict[str, int] = {}
+        self._gate_reasons: dict[str, int] = {}
         self._frame_index = 0
         self._started_at = time.time()
         self._stop = False
@@ -467,15 +623,56 @@ class SceneRecorder:
                 if self._keyframe_index >= self.args.max_keyframes:
                     logger.info("Max keyframes reached")
                     break
+                if getattr(self.source, "exhausted", False):
+                    logger.info("Replay finished: %d source frames consumed",
+                                self._frame_index)
+                    break
                 elapsed = time.monotonic() - tick
                 if elapsed < interval:
-                    time.sleep(interval - elapsed)
+                    # A replay is not rate-limited by a sensor; sleeping to the
+                    # capture fps would make a 53-frame session take 18 s for
+                    # no reason.
+                    if self.args.source != "replay":
+                        time.sleep(interval - elapsed)
         finally:
             self._finalize()
         return 0
 
     def stop(self) -> None:
         self._stop = True
+
+    def _apply_gates(
+        self, detections: list[dict[str, Any]], masks: np.ndarray | None,
+        frame_shape: tuple[int, int],
+    ) -> tuple[list[dict[str, Any]], np.ndarray | None]:
+        keep, reasons = gate_proposals(
+            detections, masks, frame_shape,
+            min_area_frac=self.args.min_mask_area_frac,
+            max_area_frac=self.args.max_mask_area_frac,
+            reject_edge_count=self.args.reject_edge_count,
+        )
+        for reason, count in reasons.items():
+            self._gate_reasons[reason] = self._gate_reasons.get(reason, 0) + count
+        if len(keep) == len(detections):
+            return detections, masks
+        kept_masks = masks[keep] if masks is not None and len(masks) else masks
+        return [detections[i] for i in keep], kept_masks
+
+    def _class_name(self, class_id: int) -> str:
+        """The name for a class index, per the arch actually in use.
+
+        A class-agnostic arch (FastSAM) emits class 0 for everything, and
+        indexing COCO80 with it would label every proposal "person" — a wrong
+        label that reads as a real detection all the way through the graph.
+        The honest name is "object", and downstream code that keys off COCO
+        names then sees a word that is not in the list and can react.
+        """
+        if self.seg_arch.num_classes == 1:
+            return "object"
+        names = self.class_names if self.class_names is not None else COCO80_CLASS_NAMES
+        if 0 <= class_id < len(names):
+            return names[class_id]
+        return str(class_id)
 
     def _process_frame(self) -> None:
         cv2 = self._cv2
@@ -488,38 +685,50 @@ class SceneRecorder:
         masks_640 = None
         if self.seg is not None:
             in_h, in_w = self.seg.input_shape[:2]
-            rgb_in = cv2.cvtColor(cv2.resize(bgr, (in_w, in_h)), cv2.COLOR_BGR2RGB)
+            # Letterbox, NOT a plain resize: the model was trained on aspect-
+            # preserved input, and squashing 16:9 into a square measurably
+            # costs detections (see seg_postprocess.Letterbox).
+            padded, lb = letterbox(bgr, (in_h, in_w))
+            rgb_in = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
             raw = self.seg.infer(rgb_in)
             decoded = yolov8_seg_postprocess(
                 raw,
                 score_threshold=self.args.confidence,
                 max_det=self.args.max_detections,
+                arch=self.seg_arch,
             )
-            sx, sy = w / in_w, h / in_h
+            boxes_frame = lb.box_to_frame(decoded["boxes_xyxy"])
             for i in range(len(decoded["scores"])):
-                x0, y0, x1, y1 = decoded["boxes_xyxy"][i]
+                x0, y0, x1, y1 = boxes_frame[i]
                 cls = int(decoded["classes"][i])
                 detections.append(
                     {
-                        "class": COCO80_CLASS_NAMES[cls] if cls < 80 else str(cls),
+                        "class": self._class_name(cls),
                         "class_id": cls,
                         "confidence": float(decoded["scores"][i]),
                         "bbox_xyxy": [
-                            float(np.clip(x0 * sx, 0, w)), float(np.clip(y0 * sy, 0, h)),
-                            float(np.clip(x1 * sx, 0, w)), float(np.clip(y1 * sy, 0, h)),
+                            float(np.clip(x0, 0, w)), float(np.clip(y0, 0, h)),
+                            float(np.clip(x1, 0, w)), float(np.clip(y1, 0, h)),
                         ],
                     }
                 )
-            masks_640 = decoded["masks"]
+            # Strip the padding band so the stored mask grid stays proportional
+            # to the frame; every reader can then scale it without knowing
+            # letterboxing ever happened.
+            masks_640 = lb.crop_masks(decoded["masks"])
+            # Gate BEFORE tracking and before CLIP: a rejected proposal should
+            # cost neither an NPU call nor a track id.
+            detections, masks_640 = self._apply_gates(detections, masks_640, (h, w))
 
-        self.tracker.update(detections, now)
-        track_by_bbox = {
-            tuple(round(v, 1) for v in t.bbox): t.track_id
-            for t in self.tracker.tracks.values()
-        }
+        # `assignments` is positionally aligned to `detections`. It replaces a
+        # reverse lookup keyed on the rounded bbox, which silently merged two
+        # detections whose boxes rounded the same — harmless at 14 detections
+        # per session, wrong as soon as proposals are dense and nested.
+        updates = self.tracker.update(detections, now)
+        track_ids = updates.assignments
 
         if self._is_keyframe(bgr, now):
-            self._emit_keyframe(bgr, detections, masks_640, track_by_bbox, now)
+            self._emit_keyframe(bgr, detections, masks_640, track_ids, now)
 
         if self.uplink is not None and not self.args.no_preview:
             self._send_preview(bgr, detections)
@@ -587,7 +796,7 @@ class SceneRecorder:
         bgr: np.ndarray,
         detections: list[dict[str, Any]],
         masks_640: np.ndarray | None,
-        track_by_bbox: dict[tuple, int],
+        track_ids: list[int | None],
         now: float,
     ) -> None:
         cv2 = self._cv2
@@ -595,22 +804,43 @@ class SceneRecorder:
         self._last_keyframe_at = now
         h, w = bgr.shape[:2]
 
-        instance_map = np.zeros((h, w), dtype=np.uint16)
+        # Masks go out as `stack_v1`: the per-instance binary masks stacked
+        # vertically, at INFERENCE resolution, still named masks.png.
+        #
+        # The old format was a single uint16 label image, which cannot
+        # represent overlap — `instance_map[mask] = id` means the last
+        # detection written wins every shared pixel. That was tolerable while
+        # detections were a handful of disjoint COCO objects. It is wrong for
+        # class-agnostic proposals, which produce NESTED masks by design
+        # (a cabinet and its drawer, a table and the objects on it): the inner
+        # mask punches a hole through the outer one, and nothing downstream can
+        # tell that from a real occlusion.
+        #
+        # Inference resolution, not frame resolution, because that is the
+        # resolution the mask was actually computed at — upsampling to
+        # 1536x864 before storage would multiply the bytes by ~3 while adding
+        # no information.
+        mask_shape: list[int] | None = None
+        if masks_640 is not None and masks_640.shape[0] > 0:
+            binary = (masks_640[:len(detections)] > 0.5).astype(np.uint8) * 255
+            mask_shape = [int(binary.shape[1]), int(binary.shape[2])]
+            mask_image = binary.reshape(-1, binary.shape[2])
+            mask_count = int(binary.shape[0])
+        else:
+            # cv2 cannot encode a zero-row image, and a keyframe with no
+            # detections is a normal outcome worth recording as such.
+            mask_image = np.zeros((1, 1), dtype=np.uint8)
+            mask_count = 0
+
         meta_dets: list[dict[str, Any]] = []
         for idx, det in enumerate(detections):
             instance_id = idx + 1
-            if masks_640 is not None and idx < masks_640.shape[0]:
-                mask_full = cv2.resize(
-                    (masks_640[idx] > 0.5).astype(np.uint8), (w, h),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                instance_map[mask_full > 0] = instance_id
-
             entry: dict[str, Any] = {
                 "instance_id": instance_id,
-                "track_id": track_by_bbox.get(
-                    tuple(round(v, 1) for v in det["bbox_xyxy"]), -1
-                ),
+                # -1 = the tracker declined this detection (below its
+                # confidence gate, or an excluded anchor class), not "unknown".
+                "track_id": (track_ids[idx] if idx < len(track_ids)
+                             and track_ids[idx] is not None else -1),
                 "class_coco": det["class"],
                 "confidence": round(det["confidence"], 3),
                 "bbox_xyxy": [round(v, 1) for v in det["bbox_xyxy"]],
@@ -622,7 +852,7 @@ class SceneRecorder:
             meta_dets.append(entry)
 
         ok_rgb, rgb_encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        ok_masks, masks_encoded = cv2.imencode(".png", instance_map)
+        ok_masks, masks_encoded = cv2.imencode(".png", mask_image)
         if not ok_rgb or not ok_masks:
             logger.error("Keyframe %06d encode failed — dropped", self._keyframe_index)
             return
@@ -630,6 +860,17 @@ class SceneRecorder:
             "frame_idx": self._keyframe_index,
             "source_frame": self._frame_index,
             "timestamp_ns": int(now * 1e9),
+            # Per keyframe, not only in session_meta.json: what "class" means
+            # depends entirely on this, and a session must stay self-describing
+            # after the config that produced it has moved on. Absent field =
+            # yolov8_seg, which is what every existing session is.
+            "seg_arch": self.seg_arch.name,
+            # Absent = the legacy uint16 label image; readers must keep
+            # supporting it, since every already-recorded session is that.
+            "masks_format": "stack_v1",
+            "mask_shape": mask_shape,       # [h, w] of ONE mask
+            "mask_count": mask_count,
+            "frame_shape": [h, w],
             "detections": meta_dets,
         }
         # Everything the IMU has to say about this keyframe. Two consumers:
@@ -750,12 +991,23 @@ class SceneRecorder:
             "frames_seen": self._frame_index,
             "record_size": [self.args.width, self.args.height],
             "seg_model": str(self.args.seg_hef.name),
+            "seg_arch": self.seg_arch.name,
+            "seg_input_shape": list(self.seg_arch.input_shape),
+            "seg_num_classes": self.seg_arch.num_classes,
             "clip_model": str(self.args.clip_hef.name) if self.clip is not None else None,
             "confidence": self.args.confidence,
             "fps_target": self.args.fps,
             "keyframes_local_fallback": self._local_keyframes,
             "imu": self.gravity_source is not None,
             "keyframe_selection": dict(self._select_reasons),
+            # Empty when the gates are at their inert defaults. Recorded
+            # either way, so "the gates dropped it" is never confused with
+            # "the model never proposed it".
+            "proposal_gates": dict(self._gate_reasons),
+            "track_min_confidence": (self.args.track_min_confidence
+                                     if self.args.track_min_confidence is not None
+                                     else self.args.confidence),
+            "masks_format": "stack_v1",
         }
         sent_end = False
         if self.uplink is not None:

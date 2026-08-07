@@ -80,6 +80,16 @@ class Track:
 class TrackUpdates:
     confirmed_new: list[Track] = field(default_factory=list)  # just became confirmed
     ended: list[Track] = field(default_factory=list)  # just ended
+    # Track id per INPUT detection, positionally aligned to the list handed to
+    # update() — including the ones filtered out by class or confidence, which
+    # get None. Purely additive; nothing existing reads it.
+    #
+    # It exists because the alternative is a reverse lookup keyed on the bbox,
+    # and two detections that round to the same box silently collapse into one
+    # entry. That is rare at 14 detections per session and routine at the
+    # hundreds a class-agnostic proposal model produces, where nested and
+    # near-duplicate boxes are the normal case rather than a coincidence.
+    assignments: list[int | None] = field(default_factory=list)
 
 
 def iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
@@ -133,14 +143,19 @@ class GreedyTracker:
         cfg = self.config
         updates = TrackUpdates()
 
-        candidates = [
-            det
-            for det in detections
+        kept = [
+            (i, det)
+            for i, det in enumerate(detections)
             if det.get("class") not in self.excluded_classes
             and float(det.get("confidence", 0.0)) >= cfg.min_confidence
             and isinstance(det.get("bbox_xyxy"), list)
             and len(det["bbox_xyxy"]) == 4
         ]
+        candidates = [det for _, det in kept]
+        # Candidate index -> index in the caller's list, so assignments can be
+        # reported against what the caller actually passed in.
+        source_index = [i for i, _ in kept]
+        updates.assignments = [None] * len(detections)
 
         alive = [t for t in self.tracks.values() if t.state != "ended"]
         unmatched_dets = list(range(len(candidates)))
@@ -164,6 +179,7 @@ class GreedyTracker:
             self._apply_match(self.tracks[track_id], candidates[di], now, updates)
             unmatched_tracks.discard(track_id)
             matched_dets.add(di)
+            updates.assignments[source_index[di]] = track_id
 
         # Pass 2: centroid distance for leftovers.
         gate_px = cfg.centroid_gate_frac * cfg.frame_diag
@@ -188,6 +204,7 @@ class GreedyTracker:
             self._apply_match(self.tracks[track_id], candidates[di], now, updates)
             unmatched_tracks.discard(track_id)
             matched_dets.add(di)
+            updates.assignments[source_index[di]] = track_id
 
         # New tentative tracks for unmatched detections.
         for di in range(len(candidates)):
@@ -208,6 +225,7 @@ class GreedyTracker:
             )
             self._record_position(track, det, now)
             self.tracks[self._next_id] = track
+            updates.assignments[source_index[di]] = track.track_id
             self._next_id += 1
 
         # Age out unmatched tracks.

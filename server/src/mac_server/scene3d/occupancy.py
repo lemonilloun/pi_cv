@@ -78,7 +78,14 @@ def fit_plane_ransac(
         # least-squares refit on those points picks the right plane.
         inlier_points = points[best_inliers]
         centroid = inlier_points.mean(axis=0)
-        _, _, vt = np.linalg.svd(inlier_points - centroid)
+        # full_matrices=False: with a large inlier count (tens of thousands
+        # of floor points, not just the few hundred this was originally
+        # exercised with), the default full_matrices=True computes a
+        # U of shape (n_inliers, n_inliers) — quadratic memory, effectively
+        # hung for ~70k inliers (measured: 90s+ and climbing on a real
+        # session, vs. instant with this flag). Same normal either way —
+        # only the discarded U differs in shape.
+        _, _, vt = np.linalg.svd(inlier_points - centroid, full_matrices=False)
         best_normal = vt[-1] / np.linalg.norm(vt[-1])
         best_offset = -float(best_normal @ centroid)
     return best_normal, best_offset, best_inliers

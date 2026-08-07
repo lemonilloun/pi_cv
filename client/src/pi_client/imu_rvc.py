@@ -1,7 +1,8 @@
-"""BNO08x UART-RVC driver: gravity direction for scene reconstruction.
+"""BNO08x UART-RVC driver: attitude for navigation, gravity for reconstruction.
 
-The sensor is on a CH340 USB-serial bridge (`/dev/ttyUSB0`, 115200 8N1) and
-streams **UART-RVC**, not SHTP — a fixed 19-byte frame at 100 Hz:
+The sensor is on a CH340 USB-serial bridge (`/dev/ttyUSB0`, 115200 8N1,
+stable path `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`) and streams
+**UART-RVC**, not SHTP — a fixed 19-byte frame at 100 Hz:
 
     0  0xAA          header
     1  0xAA
@@ -16,7 +17,25 @@ streams **UART-RVC**, not SHTP — a fixed 19-byte frame at 100 Hz:
    18  checksum      sum(bytes 2..17) & 0xFF
 
 Verified against the real device: 200/200 captured frames checksum-clean,
-100 Hz, |accel| = 997 mg at rest, per-axis noise ~2 mg.
+100 Hz, |accel| = 997 mg at rest, per-axis noise ~2 mg. Re-measured after
+the 2026-08-01 rewiring (sensor pins straight to the CH340, straight to
+USB): 501 frames in 5.0 s (100.2 Hz), **zero** checksum resyncs, **zero**
+gaps in the frame index, |accel| median 1002 mg (998-1006). For contrast,
+the SHTP-over-UART link this replaced was delivering ~25% well-formed
+frames at the end — the numbers above are the reason this driver, not that
+one, is now the default everywhere.
+
+**What this link is good for: attitude.** Yaw/pitch/roll are fused on-chip
+at the sensor's full internal rate, and measured on this device the yaw
+drifts **0.03 deg/min** with the rig stationary (90 s, 9011 samples;
+pitch/roll jitter +/-0.05 deg). `read_orientation()` is the interface for
+that, and `ekf_localization.Ekf2DHeading` is what consumes it.
+
+**What it is not good for: metres.** RVC reports no raw gyroscope, and
+double-integrating this accelerometer for displacement was measured at 78x
+too large on this rig (see `ekf_localization.Ekf2DVio`). `ImuIntegrator`
+below still exists for the scene3d metric-scale experiment, but live
+navigation deliberately does not dead-reckon position from it.
 
 **Why gravity comes from the accelerometer and not from pitch/roll.** The
 RVC report carries both, and they disagree by an axis permutation — measured
@@ -60,6 +79,26 @@ DEFAULT_PORT = "/dev/ttyUSB0"
 DEFAULT_BAUD = 115200
 SAMPLE_RATE_HZ = 100.0
 SAMPLE_WINDOW_S = 0.5  # low-pass window for gravity; 50 samples at 100 Hz
+
+# RVC reports yaw as a COMPASS heading: clockwise-positive seen from above.
+# The plan frame is right-handed and counter-clockwise-positive (see
+# navindex._heading_deg, which is an atan2 in the standard maths sense), so
+# the two disagree in sign and the driver normalizes here rather than leaving
+# every consumer to remember.
+#
+# MEASURED, not assumed (2026-08-03, imu_orientation_test.py): two full
+# turns, one in each direction, against a floor mark.
+#     turn left  +360 deg true -> -358.41 deg reported, gain -0.996
+#     turn right -360 deg true -> +360.97 deg reported, gain -1.003
+# The two agree with each other to 0.7% and both are within 0.4% of unit
+# magnitude, so this is a clean sign convention and not a scale problem.
+#
+# Why it had to be measured: an additive datum offset (Ekf2DHeading's `b`)
+# can absorb any constant, but it cannot absorb a SIGN. With the sign wrong
+# the filter steers its heading estimate the wrong way on every turn, and
+# nothing in the gravity calibration can detect that — rotation about
+# gravity leaves the gravity vector unchanged.
+YAW_SIGN = -1.0
 
 
 @dataclass(frozen=True)
@@ -145,28 +184,38 @@ def parse_frame(frame: bytes, monotonic: float | None = None) -> ImuSample | Non
     )
 
 
-def iter_frames(buffer: bytes) -> tuple[list[ImuSample], bytes]:
-    """Pull every complete valid frame out of `buffer`; return the rest.
+def iter_frames(buffer: bytes) -> tuple[list[ImuSample], bytes, int]:
+    """Pull every complete valid frame out of `buffer`.
 
-    Resynchronising matters: a USB-serial bridge drops bytes under load, and
-    a decoder that only ever advances by whole frames stays permanently
-    misaligned after a single lost byte. On a checksum failure this advances
-    by ONE byte and looks for the next header, so the stream re-locks within
-    a frame instead of producing garbage forever.
+    Returns `(samples, remainder, resyncs)`. Resynchronising matters: a
+    USB-serial bridge drops bytes under load, and a decoder that only ever
+    advances by whole frames stays permanently misaligned after a single
+    lost byte. On a checksum failure this advances by ONE byte and looks for
+    the next header, so the stream re-locks within a frame instead of
+    producing garbage forever.
+
+    `resyncs` counts those failures. It is the link-health signal: on a
+    healthy RVC link it stays at zero (measured on this rig: 501 frames in
+    5 s, 0 resyncs, 0 gaps in the frame index), so any sustained non-zero
+    rate means the wiring or the adapter is degrading — the exact failure
+    the SHTP link died of, which went unnoticed for a session because
+    nothing counted it.
     """
     samples: list[ImuSample] = []
     cursor = 0
+    resyncs = 0
     length = len(buffer)
     while True:
         start = buffer.find(HEADER, cursor)
         if start < 0:
             # A header may straddle the read boundary — keep the last byte.
-            return samples, buffer[max(cursor, length - 1):]
+            return samples, buffer[max(cursor, length - 1):], resyncs
         if start + FRAME_LEN > length:
-            return samples, buffer[start:]
+            return samples, buffer[start:], resyncs
         sample = parse_frame(buffer[start:start + FRAME_LEN])
         if sample is None:
             cursor = start + 1  # false header, resync
+            resyncs += 1
             continue
         samples.append(sample)
         cursor = start + FRAME_LEN
@@ -521,6 +570,12 @@ class RvcReader:
         self._samples: list[ImuSample] = []
         self._frames_ok = 0
         self._frames_bad = 0
+        self._dropped = 0        # frames the sensor sent that never reached us
+        self._last_index: int | None = None
+        self._last_rx = 0.0      # monotonic time of the most recent valid frame
+        self._started_at = 0.0
+        self._yaw_unwrapped: float | None = None
+        self._yaw_last_raw: float | None = None
         self._suppressed = 0  # reads withheld because the rig left its reference pose
         reference_up = (self.calibration or {}).get("up_imu_reference")
         self.integrator = ImuIntegrator(
@@ -530,7 +585,16 @@ class RvcReader:
 
     # ------------------------------------------------------------ lifecycle
 
-    def start(self) -> bool:
+    def start(self, wait_s: float = 2.0) -> bool:
+        """Open the port and confirm the sensor is actually streaming RVC.
+
+        Opening a serial port succeeds against anything — an unpowered
+        sensor, a board left in SHTP mode, the wrong adapter. Returning
+        True on that alone is how a dead IMU gets silently carried into a
+        recording session. This waits for one checksum-valid frame before
+        claiming success; the sensor emits at 100 Hz, so `wait_s` of 2.0 is
+        two hundred chances.
+        """
         try:
             import serial
         except ImportError:
@@ -544,10 +608,23 @@ class RvcReader:
             self._serial = None
             return False
         self._stop.clear()
+        self._started_at = time.monotonic()
         self._thread = threading.Thread(target=self._run, name="imu-rvc", daemon=True)
         self._thread.start()
-        logger.info("IMU reader started on %s @ %d", self.port, self.baud)
-        return True
+
+        deadline = time.monotonic() + max(wait_s, 0.0)
+        while time.monotonic() < deadline:
+            if self.latest() is not None:
+                logger.info("IMU reader started on %s @ %d", self.port, self.baud)
+                return True
+            time.sleep(0.05)
+        logger.error(
+            "No valid RVC frame on %s within %.1fs. The port opened, so the adapter is "
+            "there — check the sensor is powered and its PS1/PS0 jumpers select UART-RVC "
+            "(not SHTP).", self.port, wait_s,
+        )
+        self.stop()
+        return False
 
     def stop(self) -> None:
         self._stop.set()
@@ -581,14 +658,40 @@ class RvcReader:
             if not chunk:
                 continue
             buffer += chunk
-            samples, buffer = iter_frames(buffer)
+            samples, buffer, resyncs = iter_frames(buffer)
             if len(buffer) > 4 * FRAME_LEN:  # nothing parseable — drop the junk
                 buffer = buffer[-FRAME_LEN:]
+            if resyncs:
+                with self._lock:
+                    self._frames_bad += resyncs
             if not samples:
                 continue
             now = time.monotonic()
             with self._lock:
                 self._frames_ok += len(samples)
+                self._last_rx = now
+                for sample in samples:
+                    # The RVC frame index increments by one per frame and
+                    # wraps at 256. Any other step means frames the sensor
+                    # emitted never arrived — a loss the checksum cannot
+                    # see, because each surviving frame is individually
+                    # perfect. Measured healthy on this rig: 500/500 gaps
+                    # of exactly 1.
+                    if self._last_index is not None:
+                        gap = (sample.index - self._last_index) % 256
+                        if gap != 1:
+                            self._dropped += (gap - 1) % 256
+                    self._last_index = sample.index
+                    # Continuous yaw: the wire value wraps at +/-180, and a
+                    # consumer differencing raw values across the wrap sees
+                    # a 360 deg jolt. Unwrapping here means every consumer
+                    # gets it right instead of each re-deriving it.
+                    raw = sample.yaw_deg
+                    if self._yaw_unwrapped is None:
+                        self._yaw_unwrapped = raw
+                    else:
+                        self._yaw_unwrapped += (raw - self._yaw_last_raw + 180.0) % 360.0 - 180.0
+                    self._yaw_last_raw = raw
                 self._samples.extend(samples)
                 cutoff = now - self.window_s
                 self._samples = [s for s in self._samples if s.monotonic >= cutoff]
@@ -611,9 +714,18 @@ class RvcReader:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
+            now = time.monotonic()
+            elapsed = max(now - self._started_at, 1e-6) if self._started_at else 0.0
+            age = (now - self._last_rx) if self._last_rx else float("inf")
+            total = self._frames_ok + self._dropped
             return {
                 "frames_ok": self._frames_ok,
-                "frames_bad": self._frames_bad,
+                "frames_bad": self._frames_bad,     # checksum/resync failures
+                "frames_dropped": self._dropped,    # gaps in the frame index
+                "delivery_frac": round(self._frames_ok / total, 4) if total else 0.0,
+                "rate_hz": round(self._frames_ok / elapsed, 1) if elapsed else 0.0,
+                "age_s": round(age, 3) if math.isfinite(age) else None,
+                "healthy": self._is_healthy(now),
                 "window": len(self._samples),
                 "calibrated": self.calibration is not None,
                 "mode": (self.calibration or {}).get("mode"),
@@ -622,6 +734,53 @@ class RvcReader:
                 ),
                 "suppressed_off_reference": self._suppressed,
             }
+
+    def _is_healthy(self, now: float, max_age_s: float = 0.5) -> bool:
+        """Fresh data, not merely data. Callers of `latest()` otherwise get
+        the last sample forever after the cable is pulled, and a heading
+        that is frozen looks exactly like a heading that is steady."""
+        return bool(self._last_rx) and (now - self._last_rx) <= max_age_s
+
+    def is_healthy(self, max_age_s: float = 0.5) -> bool:
+        with self._lock:
+            return self._is_healthy(time.monotonic(), max_age_s)
+
+    # ---------------------------------------------------------- orientation
+
+    def read_orientation(self, max_age_s: float = 0.5) -> dict[str, Any] | None:
+        """Attitude for navigation: the whole point of this link.
+
+        Returns None when the stream is stale rather than a frozen last
+        value — a navigation filter must be told "no measurement" so its
+        uncertainty grows, not handed a stale one it will treat as fresh
+        evidence.
+
+        `yaw_deg` is CONTINUOUS (unwrapped past +/-180) so consumers can
+        difference it freely; `yaw_wrapped_deg` is the raw wire value.
+        Pitch/roll are the window median, not the instantaneous sample —
+        a single bump would otherwise show up as a tilt spike.
+        """
+        with self._lock:
+            now = time.monotonic()
+            if not self._is_healthy(now, max_age_s) or not self._samples:
+                return None
+            sample = self._samples[-1]
+            yaw_continuous = self._yaw_unwrapped
+            pitch = statistics.median(s.pitch_deg for s in self._samples)
+            roll = statistics.median(s.roll_deg for s in self._samples)
+            age = now - self._last_rx
+        return {
+            # Normalized to the plan frame's convention (CCW positive). This
+            # is the one consumers should use; the raw sensor value is kept
+            # alongside for diagnostics only.
+            "yaw_deg": round(YAW_SIGN * float(yaw_continuous), 3),
+            "yaw_sensor_deg": round(float(yaw_continuous), 3),
+            "yaw_wrapped_deg": round(sample.yaw_deg, 2),
+            "pitch_deg": round(float(pitch), 2),
+            "roll_deg": round(float(roll), 2),
+            "tilt_deg": round(sample.accel_tilt_deg(), 2),
+            "age_s": round(age, 3),
+        }
 
     def averaged_up_sensor(self) -> tuple[float, float, float] | None:
         """Low-passed unit 'up' over the current window.
@@ -661,12 +820,14 @@ class RvcReader:
         with the poses. The Pi does not try to decide anything from them.
         """
         sample = self.latest()
-        if sample is None:
+        if sample is None or not self.is_healthy():
             return None
         with self._lock:
             segment = self.integrator.cut()
         motion: dict[str, Any] = {
-            "yaw_deg": round(sample.yaw_deg, 2),
+            # Same normalization as read_orientation — see YAW_SIGN.
+            "yaw_deg": round(YAW_SIGN * sample.yaw_deg, 2),
+            "yaw_sensor_deg": round(sample.yaw_deg, 2),
             "pitch_deg": round(sample.pitch_deg, 2),
             "roll_deg": round(sample.roll_deg, 2),
             "tilt_deg": round(sample.accel_tilt_deg(), 2),
@@ -679,6 +840,26 @@ class RvcReader:
         gravity = self.read()
         if gravity is not None:
             motion["gravity_camera"] = [round(v, 5) for v in gravity]
+        if segment is not None:
+            # The SAME doubt that withholds gravity has to reach the distance,
+            # and it matters far more there. `read()` returns None when the rig
+            # has tilted outside the pose the calibration was measured in; the
+            # integrator meanwhile keeps subtracting a gravity vector it can no
+            # longer justify, and that residual is integrated TWICE.
+            #
+            # The arithmetic, at this rig's ~1.07 s keyframe interval:
+            #     3 deg of gravity error -> 0.51 m/s^2 -> 0.29 m of phantom
+            #     motion per interval, from standing still.
+            # Measured on session_20260807_171938, where gravity was withheld
+            # for all 143 keyframes: the IMU reported 87.9 m of path around one
+            # 4 x 3.6 m room, median 0.357 m per interval — i.e. the signal was
+            # essentially all gravity-subtraction error, and it inflated the
+            # reconstruction's metric scale by ~17x.
+            #
+            # Orientation is unaffected: yaw comes from the sensor's own fusion
+            # and drifts 0.03 deg/min. Only the doubly-integrated distance is
+            # this fragile.
+            segment["gravity_ok"] = gravity is not None
         return motion
 
     def read(self) -> list[float] | None:

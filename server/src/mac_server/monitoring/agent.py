@@ -1,10 +1,19 @@
-"""Local AI agent layer over apfel (Apple Intelligence, on-device).
+"""AI agent layer over an OpenAI-compatible chat endpoint for scene digests,
+key moments, and free-form Q&A.
 
-apfel runs an OpenAI-compatible HTTP server (default 127.0.0.1:11500). The
-on-device model has a 4096-token context and is text-only, so this module is
-strict about prompt budgets: graph edges are compressed into one-line
-strings, digests are the compression layer for longer windows, and the
-rolling summary keeps a constant-size running narrative.
+`ApfelClient` talks to any OpenAI-compatible `/v1/chat/completions` server —
+the name is historical (this originally wrapped apfel, Apple Intelligence
+on-device, 127.0.0.1:11500, 4096-token context, text-only). Since the GPU-
+service migration (see CLAUDE.md / gpu_service/), the default is the
+already-running Qwen/Qwen3.5-9B vLLM instance on pdfserver (32768-token
+context — 8x apfel's — reached directly over the network, not through the
+gpu_service SSH tunnel, since that vLLM already listens on a reachable
+port). Prompt budgets below (max_input_tokens/max_output_tokens) are still
+intentionally conservative relative to that 32k ceiling — digests are meant
+to stay compact, not fill the window — not a hard technical limit like
+before. apfel remains a valid local alternative on Apple-Silicon Macs
+(monitoring.agent.base_url/model in config/default.json); this class works
+with either unchanged.
 
 v2 semantics: no persistent numbering — subjects are plain class labels
 ("person", "laptop", "person_2" only during concurrency). Digests speak in
@@ -13,8 +22,12 @@ the model also picks 0-3 key moments per digest cycle (they get participant
 snapshots), and free-form questions are answered over the graph slice
 (`ask`) instead of the old one-button summary.
 
-Everything degrades gracefully: when apfel is down, `healthy` flips false
-(with a cooldown before retrying) and monitoring continues without digests.
+Everything degrades gracefully: when the agent is down, `healthy` flips
+false (with a cooldown before retrying) and monitoring continues without
+digests. `_maybe_start_service` (controller.py) probes the configured
+base_url before spawning anything — Qwen is already running elsewhere, so
+it's detected as "already listening" and never spawned or killed by this
+process.
 """
 
 from __future__ import annotations
@@ -191,6 +204,7 @@ class ApfelClient:
         max_input_tokens: int = 2500,
         max_output_tokens: int = 400,
         cooldown_s: float = 60.0,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -198,6 +212,18 @@ class ApfelClient:
         self.max_input_chars = max_input_tokens * 4
         self.max_output_tokens = max_output_tokens
         self.cooldown_s = cooldown_s
+        # Qwen3-style "thinking" models default to reasoning before the
+        # final answer, spending the whole max_tokens budget on reasoning
+        # tokens and leaving `content: null` if they don't finish in time
+        # (measured: a 50-token cap produced a populated `reasoning` field
+        # and null content). {"enable_thinking": False} (a vLLM extension,
+        # not standard OpenAI) skips straight to a direct answer, which is
+        # also what digests/key-moments/Q&A actually want here. Passed
+        # through as-is (default None) for backends that don't use it, e.g.
+        # apfel — an unrecognized extra field is expected to be ignored by
+        # a permissive OpenAI-compatible server, not a hard requirement
+        # we've verified against apfel specifically.
+        self.chat_template_kwargs = chat_template_kwargs
         self.healthy = True
         self._last_failure = 0.0
 
@@ -206,17 +232,18 @@ class ApfelClient:
     def chat(self, system: str, user: str, max_tokens: int | None = None) -> str | None:
         if not self.healthy and time.monotonic() - self._last_failure < self.cooldown_s:
             return None
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "max_tokens": max_tokens or self.max_output_tokens,
-                "temperature": 0.3,
-            }
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens or self.max_output_tokens,
+            "temperature": 0.3,
+        }
+        if self.chat_template_kwargs:
+            payload["chat_template_kwargs"] = self.chat_template_kwargs
+        body = json.dumps(payload).encode("utf-8")
 
         for attempt in range(2):
             try:
@@ -227,10 +254,17 @@ class ApfelClient:
                     method="POST",
                 )
                 with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                text = payload["choices"][0]["message"]["content"].strip()
+                    response_payload = json.loads(response.read().decode("utf-8"))
+                message = response_payload["choices"][0]["message"]
+                # A reasoning model can leave `content: null` if it spends
+                # the whole max_tokens budget thinking without finishing
+                # (see chat_template_kwargs above) — fall back to whatever
+                # reasoning it did produce rather than crash on None.strip().
+                text = message.get("content") or message.get("reasoning")
+                if text is None:
+                    raise ValueError(f"Empty response from model: {message!r}")
                 self.healthy = True
-                return text
+                return text.strip()
             except Exception as exc:
                 logger.warning("apfel call failed (attempt %d): %s", attempt + 1, exc)
                 if attempt == 0:

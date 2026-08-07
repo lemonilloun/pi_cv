@@ -1,0 +1,58 @@
+{
+  "name": "indoor_ade20k_v1",
+  "source": "ADE20K SceneParsing (ADEChallengeData2016), 20210 train / 2000 val",
+  "note": [
+    "Class ids are this list's order and are baked into the trained weights,",
+    "the hef, and every keyframe meta.json. NEVER reorder or delete an entry;",
+    "append instead, and bump the name to _v2 if the meaning of an id changes.",
+    "",
+    "Merges are deliberate and do two jobs at once. They match how a room gets",
+    "described out loud (nobody says 'chest of drawers', they say 'шкаф'), and",
+    "they fix thin data: ADE20K has only 380 training images of wardrobe and",
+    "549 of chest of drawers, which is not enough to fine-tune on, while the",
+    "merged cabinet class has ~3800.",
+    "",
+    "wall/floor/ceiling are 'stuff', not objects, and an instance-segmentation",
+    "head is an odd fit for them. They are kept because the robot's actual",
+    "question is spatial - where can I drive, where does the room end - and a",
+    "floor mask answers it directly. Their instances come from connected",
+    "components, so a floor split by furniture arrives as several pieces."
+  ],
+  "classes": [
+    {"name": "wall",         "ade20k": ["wall"],                                          "kind": "structure", "role": "area"},
+    {"name": "floor",        "ade20k": ["floor"],                                         "kind": "structure", "role": "area"},
+    {"name": "ceiling",      "ade20k": ["ceiling"],                                       "kind": "structure", "role": "area"},
+    {"name": "door",         "ade20k": ["door"],                                          "kind": "structure", "role": "object"},
+    {"name": "window",       "ade20k": ["windowpane"],                                    "kind": "structure", "role": "object"},
+    {"name": "stairs",       "ade20k": ["stairs", "stairway", "bannister", "railing"],    "kind": "structure", "role": "object"},
+    {"name": "column",       "ade20k": ["column"],                                        "kind": "structure", "role": "object"},
+
+    {"name": "cabinet",      "ade20k": ["cabinet", "wardrobe", "chest of drawers"],       "kind": "furniture", "role": "object"},
+    {"name": "shelf",        "ade20k": ["shelf", "bookcase"],                             "kind": "furniture", "role": "object"},
+    {"name": "table",        "ade20k": ["table", "coffee table", "desk"],                 "kind": "furniture", "role": "object"},
+    {"name": "chair",        "ade20k": ["chair", "armchair", "swivel chair", "seat", "stool", "ottoman"], "kind": "furniture", "role": "object"},
+    {"name": "sofa",         "ade20k": ["sofa"],                                          "kind": "furniture", "role": "object"},
+    {"name": "bed",          "ade20k": ["bed"],                                           "kind": "furniture", "role": "object"},
+    {"name": "counter",      "ade20k": ["counter", "countertop", "kitchen island", "bar"],"kind": "furniture", "role": "object"},
+    {"name": "fireplace",    "ade20k": ["fireplace"],                                     "kind": "furniture", "role": "object"},
+
+    {"name": "tv",           "ade20k": ["television receiver", "computer", "monitor"],    "kind": "appliance", "role": "object"},
+    {"name": "refrigerator", "ade20k": ["refrigerator"],                                  "kind": "appliance", "role": "object"},
+    {"name": "stove",        "ade20k": ["stove", "oven", "microwave", "dishwasher"],      "kind": "appliance", "role": "object"},
+    {"name": "sink",         "ade20k": ["sink"],                                          "kind": "appliance", "role": "object"},
+    {"name": "toilet",       "ade20k": ["toilet", "bathtub"],                             "kind": "appliance", "role": "object"},
+
+    {"name": "curtain",      "ade20k": ["curtain", "blind"],                              "kind": "decor", "role": "object"},
+    {"name": "painting",     "ade20k": ["painting", "poster"],                            "kind": "decor", "role": "object"},
+    {"name": "mirror",       "ade20k": ["mirror"],                                        "kind": "decor", "role": "object"},
+    {"name": "rug",          "ade20k": ["rug"],                                           "kind": "decor", "role": "object"},
+    {"name": "lamp",         "ade20k": ["lamp", "light", "chandelier", "sconce"],         "kind": "decor", "role": "object"},
+    {"name": "plant",        "ade20k": ["plant", "flower", "pot", "vase"],                "kind": "decor", "role": "object"},
+    {"name": "pillow",       "ade20k": ["cushion", "pillow"],                             "kind": "decor", "role": "object"},
+    {"name": "box",          "ade20k": ["box", "basket", "bag"],                          "kind": "decor", "role": "object"},
+    {"name": "book",         "ade20k": ["book"],                                          "kind": "decor", "role": "object"},
+    {"name": "clock",        "ade20k": ["clock"],                                         "kind": "decor", "role": "object"},
+
+    {"name": "person",       "ade20k": ["person"],                                        "kind": "dynamic", "role": "object"}
+  ]
+}

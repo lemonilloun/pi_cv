@@ -183,28 +183,40 @@ def run_graph_step(
     import numpy as np
 
     graph_cfg = config.get("graph", {})
+    emb_cfg = config.get("embeddings", {})
     objects_data = json.loads(session.objects_path().read_text(encoding="utf-8"))
     objects = objects_data["objects"]
 
     # ------------------------------------------------------ CLIP labels
+    # MUST stay RN50x4/openai regardless of backend — this is compared
+    # against clip_emb vectors the Pi already computed on-device via its
+    # Hailo hef (see module docstring above).
     progress("computing CLIP text embeddings")
+    vocab = list(dict.fromkeys(INDOOR_VOCAB))
     text_embs: dict[str, list[float]] = {}
     try:
-        import open_clip
-        import torch
+        if str(emb_cfg.get("backend", "remote")).lower() == "remote":
+            from mac_server.scene3d.gpu_client import remote_clip_text_embed
 
-        model_name = str(graph_cfg.get("clip_text_model", "RN50x4"))
-        pretrained = str(graph_cfg.get("clip_text_pretrained", "openai"))
-        model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-        tokenizer = open_clip.get_tokenizer(model_name)
-        model.eval()
-        vocab = list(dict.fromkeys(INDOOR_VOCAB))
-        with torch.no_grad():
-            tokens = tokenizer([f"a photo of a {w}" for w in vocab])
-            features = model.encode_text(tokens)
-            features = features / features.norm(dim=-1, keepdim=True)
-        for word, vec in zip(vocab, features):
-            text_embs[word] = [float(v) for v in vec.float().numpy()]
+            vectors = remote_clip_text_embed(
+                str(emb_cfg.get("gpu_service_url", "http://127.0.0.1:8700")),
+                [f"a photo of a {w}" for w in vocab],
+            )
+        else:
+            import open_clip
+            import torch
+
+            model_name = str(graph_cfg.get("clip_text_model", "RN50x4"))
+            pretrained = str(graph_cfg.get("clip_text_pretrained", "openai"))
+            model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+            tokenizer = open_clip.get_tokenizer(model_name)
+            model.eval()
+            with torch.no_grad():
+                tokens = tokenizer([f"a photo of a {w}" for w in vocab])
+                features = model.encode_text(tokens)
+                features = features / features.norm(dim=-1, keepdim=True)
+            vectors = [[float(v) for v in vec] for vec in features.float().numpy()]
+        text_embs = dict(zip(vocab, vectors))
     except Exception as exc:
         logger.warning("CLIP text encoder unavailable (%s) — COCO labels only", exc)
 

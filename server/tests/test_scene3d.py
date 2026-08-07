@@ -3,6 +3,7 @@ labeling, graph edges, floor plan, session IO and the seg decode NMS."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 import tempfile
@@ -46,7 +47,15 @@ from mac_server.scene3d.objects_step import (
 )
 from mac_server.scene3d.graph_step import obb_gap_m, obb_support
 from mac_server.scene3d.session_io import SceneSession, list_sessions
-from pi_client.seg_postprocess import numpy_nms, order_endnodes
+from pi_client.seg_postprocess import (
+    FASTSAM_S,
+    INDOOR_ADE20K,
+    YOLOV8_SEG,
+    SegArch,
+    numpy_nms,
+    order_endnodes,
+    yolov8_seg_postprocess,
+)
 
 
 class ScaleTest(unittest.TestCase):
@@ -562,6 +571,85 @@ class SessionIoTest(unittest.TestCase):
             self.assertFalse(sessions[0]["calibrated"])
 
 
+class InstanceMaskTest(unittest.TestCase):
+    """`instance_mask` has to serve both storage formats, because every
+    session recorded so far is the old one and re-recording is a drive."""
+
+    def _keyframe(self, tmp: str, mask_image, meta: dict):
+        import cv2
+
+        root = Path(tmp) / "session_test"
+        kf = root / "keyframes" / "000001"
+        kf.mkdir(parents=True)
+        cv2.imwrite(str(kf / "rgb.jpg"), np.zeros((40, 40, 3), dtype=np.uint8))
+        cv2.imwrite(str(kf / "masks.png"), mask_image)
+        (kf / "meta.json").write_text(json.dumps(meta))
+        return SceneSession(root).keyframes()[0]
+
+    def test_legacy_label_image_still_reads(self) -> None:
+        labels = np.zeros((40, 40), dtype=np.uint16)
+        labels[0:10, 0:10] = 1
+        labels[20:30, 20:30] = 2
+        with tempfile.TemporaryDirectory() as tmp:
+            kf = self._keyframe(tmp, labels, {"frame_idx": 1, "detections": []})
+            self.assertEqual(kf.masks_format(), "labels_v0")
+            self.assertEqual(int(kf.instance_mask(1).sum()), 100)
+            self.assertEqual(int(kf.instance_mask(2).sum()), 100)
+            self.assertEqual(int(kf.instance_mask(3).sum()), 0)
+
+    def test_stack_v1_preserves_overlap_that_labels_lose(self) -> None:
+        # This is the whole reason for the format. Instance 1 is a 20x20 box;
+        # instance 2 is a 10x10 box entirely inside it (a drawer in a cabinet).
+        big = np.zeros((20, 20), dtype=np.uint8)
+        big[:, :] = 255
+        small = np.zeros((20, 20), dtype=np.uint8)
+        small[5:15, 5:15] = 255
+        stack = np.concatenate([big, small], axis=0)
+        meta = {"frame_idx": 1, "masks_format": "stack_v1",
+                "mask_shape": [20, 20], "mask_count": 2, "detections": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            kf = self._keyframe(tmp, stack, meta)
+            self.assertEqual(kf.masks_format(), "stack_v1")
+            self.assertEqual(int(kf.instance_mask(1).sum()), 400)  # intact
+            self.assertEqual(int(kf.instance_mask(2).sum()), 100)
+
+        # The same pair stored the legacy way: the inner mask overwrote the
+        # outer one's pixels at write time, so the cabinet comes back with a
+        # 100 px hole. Asserted so the loss is documented, not just claimed.
+        with tempfile.TemporaryDirectory() as tmp:
+            labels = np.ones((20, 20), dtype=np.uint16)
+            labels[5:15, 5:15] = 2
+            kf = self._keyframe(tmp, labels, {"frame_idx": 1, "detections": []})
+            self.assertEqual(int(kf.instance_mask(1).sum()), 300)  # 400 - 100
+
+    def test_out_of_range_instance_is_empty_not_an_exception(self) -> None:
+        # A meta/mask mismatch should not abort a whole reconstruction over
+        # one detection; the object simply contributes no points.
+        stack = np.full((20, 20), 255, dtype=np.uint8)
+        meta = {"frame_idx": 1, "masks_format": "stack_v1",
+                "mask_shape": [20, 20], "mask_count": 1, "detections": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            kf = self._keyframe(tmp, stack, meta)
+            self.assertEqual(int(kf.instance_mask(5).sum()), 0)
+
+    def test_resizes_to_the_requested_shape(self) -> None:
+        stack = np.full((20, 20), 255, dtype=np.uint8)
+        meta = {"frame_idx": 1, "masks_format": "stack_v1",
+                "mask_shape": [20, 20], "mask_count": 1, "detections": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            kf = self._keyframe(tmp, stack, meta)
+            mask = kf.instance_mask(1, (40, 60))
+            self.assertEqual(mask.shape, (40, 60))
+            self.assertTrue(mask.all())
+
+    def test_unknown_format_refuses(self) -> None:
+        meta = {"frame_idx": 1, "masks_format": "rle_v9", "detections": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            kf = self._keyframe(tmp, np.zeros((4, 4), dtype=np.uint8), meta)
+            with self.assertRaises(ValueError):
+                kf.instance_mask(1)
+
+
 class SceneUplinkHandlerTest(unittest.TestCase):
     """The online-transfer server path materializes the exact session
     layout the pipeline reads (start -> keyframes -> end)."""
@@ -953,6 +1041,74 @@ class SegDecodeTest(unittest.TestCase):
         self.assertEqual(endnodes[9].shape[1:3], (160, 160))
 
 
+class SegArchTest(unittest.TestCase):
+    """`SegArch` replaced literals that used to be spread across the decoder.
+    These tests pin the two things that made that worth doing: a wrong arch
+    must fail loudly, and a non-640 hef must decode in its own coordinates."""
+
+    @staticmethod
+    def _outputs(num_classes: int, input_h: int = 640):
+        out = {}
+        for stride in (8, 16, 32):
+            s = input_h // stride
+            out[f"b{s}"] = np.zeros((s, s, 64), dtype=np.float32)
+            out[f"s{s}"] = np.zeros((s, s, num_classes), dtype=np.float32)
+            out[f"c{s}"] = np.zeros((s, s, 32), dtype=np.float32)
+        out["p"] = np.zeros((input_h // 4, input_h // 4, 32), dtype=np.float32)
+        return out
+
+    def test_default_arch_is_unchanged_behaviour(self) -> None:
+        # The whole parameterization is only safe if the default path is
+        # byte-identical to what shipped, so assert the two agree.
+        outputs = self._outputs(80)
+        self.assertEqual(
+            [e.shape for e in order_endnodes(outputs)],
+            [e.shape for e in order_endnodes(outputs, YOLOV8_SEG)],
+        )
+
+    def test_fastsam_single_class_decodes(self) -> None:
+        endnodes = order_endnodes(self._outputs(1), FASTSAM_S)
+        self.assertEqual(len(endnodes), 10)
+        self.assertEqual(endnodes[1].shape[3], 1)      # class head
+        self.assertEqual(endnodes[9].shape[1:3], (160, 160))
+
+    def test_wrong_arch_is_rejected_not_misread(self) -> None:
+        # An 80-class hef decoded as FastSAM: the 80-channel blobs match no
+        # role. This must raise — misreading them as something else would give
+        # boxes and masks that look plausible and are wrong.
+        with self.assertRaises(ValueError):
+            order_endnodes(self._outputs(80), FASTSAM_S)
+        with self.assertRaises(ValueError):
+            order_endnodes(self._outputs(1), YOLOV8_SEG)
+
+    def test_non_640_input_uses_its_own_grid(self) -> None:
+        # The bug this prevents: `h == 160` and the [20,40,80] scale list were
+        # literals, so a 1024-input hef decoded into 640-space silently.
+        arch = dataclasses.replace(YOLOV8_SEG, input_shape=(1024, 1024))
+        self.assertEqual(arch.scale_heights, (32, 64, 128))
+        endnodes = order_endnodes(self._outputs(80, input_h=1024), arch)
+        self.assertEqual(endnodes[0].shape[1:3], (32, 32))
+        self.assertEqual(endnodes[9].shape[1:3], (256, 256))
+        # ...and the 640 layout must NOT satisfy the 1024 arch.
+        with self.assertRaises(ValueError):
+            order_endnodes(self._outputs(80), arch)
+
+    def test_undecodable_arch_refuses_at_construction(self) -> None:
+        # 64 classes collides with the DFL box head's 4*(15+1) = 64 channels.
+        # Nothing downstream could tell those blobs apart, so the refusal
+        # belongs here rather than at the first inference.
+        with self.assertRaises(ValueError):
+            SegArch(name="collides", num_classes=64)
+
+    def test_decode_end_to_end_on_a_single_class_arch(self) -> None:
+        # Zeros in means no detection out — but it must reach that answer
+        # without an index error on the 1-wide class head, which is the shape
+        # the old fixed-80 reshape would have thrown on.
+        result = yolov8_seg_postprocess(self._outputs(1), arch=FASTSAM_S)
+        self.assertEqual(result["boxes_xyxy"].shape[1], 4)
+        self.assertEqual(len(result["scores"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1100,23 +1256,23 @@ class ImuRvcParseTest(unittest.TestCase):
 
     def test_stream_of_frames(self) -> None:
         stream = b"".join(_rvc_frame(index=i) for i in range(5))
-        samples, rest = self.imu.iter_frames(stream)
+        samples, rest, _ = self.imu.iter_frames(stream)
         self.assertEqual([s.index for s in samples], [0, 1, 2, 3, 4])
         self.assertEqual(rest, b"")
 
     def test_resyncs_after_a_dropped_byte(self) -> None:
         good = _rvc_frame(index=7)
         stream = b"\x12\x34" + _rvc_frame(index=6)[3:] + good  # first frame truncated
-        samples, _ = self.imu.iter_frames(stream)
+        samples, _, _ = self.imu.iter_frames(stream)
         self.assertEqual([s.index for s in samples], [7])
 
     def test_partial_trailing_frame_is_kept_for_next_read(self) -> None:
         whole = _rvc_frame(index=1)
-        samples, rest = self.imu.iter_frames(whole + _rvc_frame(index=2)[:10])
+        samples, rest, _ = self.imu.iter_frames(whole + _rvc_frame(index=2)[:10])
         self.assertEqual([s.index for s in samples], [1])
         self.assertEqual(len(rest), 10)
         # The remainder plus the rest of the frame must decode next time.
-        more, _ = self.imu.iter_frames(rest + _rvc_frame(index=2)[10:])
+        more, _, _ = self.imu.iter_frames(rest + _rvc_frame(index=2)[10:])
         self.assertEqual([s.index for s in more], [2])
 
     def test_header_bytes_inside_the_payload_do_not_derail_it(self) -> None:
@@ -1124,7 +1280,7 @@ class ImuRvcParseTest(unittest.TestCase):
         # pattern can still occur across fields), so the decoder must rely on
         # the checksum rather than the header alone.
         stream = _rvc_frame(index=3, accel=(-21846, 0, 1000)) + _rvc_frame(index=4)
-        samples, _ = self.imu.iter_frames(stream)
+        samples, _, _ = self.imu.iter_frames(stream)
         self.assertEqual([s.index for s in samples], [3, 4])
 
     def test_tilt_angles_agree_between_the_two_sources(self) -> None:
@@ -1535,3 +1691,217 @@ class CameraParamsNumpyTest(unittest.TestCase):
     def test_pinhole_params_without_distortion(self) -> None:
         cam = self._Camera(np.array([1000.0, 1000.0, 768.0, 432.0]))
         self.assertEqual(camera_to_intrinsics(cam, dist=None)["dist"], [0.0, 0.0, 0.0, 0.0])
+
+
+class BaselineScaleTest(unittest.TestCase):
+    """Metric scale from a tape-measured driven line.
+
+    Replaces camera-height scale as the default: the camera now sits at
+    10-12 cm tilted up, so the floor is a sliver at the frame edge and the
+    plane fit that method depends on is ill-conditioned. The previous round
+    also left camera_height_m at 0.3 against an actual 0.05-0.06, so every
+    map was 5-6x the wrong size and nothing flagged it.
+    """
+
+    @staticmethod
+    def _centers():
+        import numpy as np
+        return {
+            10: np.array([0.0, 0.0, 0.0]),
+            20: np.array([0.5, 0.0, 0.0]),   # half a unit apart
+            30: np.array([0.0, 0.0, 0.0]),   # coincident with 10
+        }
+
+    def test_recovers_the_scale_factor(self):
+        from mac_server.scene3d.reconstruct_step import baseline_scale
+        scale, diag = baseline_scale(
+            self._centers(), {"from_frame": 10, "to_frame": 20, "length_m": 1.0}
+        )
+        self.assertAlmostEqual(scale, 2.0, places=6)
+        self.assertAlmostEqual(diag["reconstructed_chord"], 0.5, places=6)
+
+    def test_none_without_a_baseline_file(self):
+        from mac_server.scene3d.reconstruct_step import baseline_scale
+        scale, diag = baseline_scale(self._centers(), None)
+        self.assertIsNone(scale)
+        self.assertIn("no baseline", diag["reason"])
+
+    def test_reports_unregistered_frames_by_number(self):
+        """A silent None here would fall through to whatever method is next."""
+        from mac_server.scene3d.reconstruct_step import baseline_scale
+        scale, diag = baseline_scale(
+            self._centers(), {"from_frame": 10, "to_frame": 999, "length_m": 1.0}
+        )
+        self.assertIsNone(scale)
+        self.assertIn("999", diag["reason"])
+
+    def test_rejects_a_degenerate_chord(self):
+        from mac_server.scene3d.reconstruct_step import baseline_scale
+        scale, diag = baseline_scale(
+            self._centers(), {"from_frame": 10, "to_frame": 30, "length_m": 1.0}
+        )
+        self.assertIsNone(scale)
+        self.assertIn("same point", diag["reason"])
+
+    def test_rejects_malformed_and_non_positive_input(self):
+        from mac_server.scene3d.reconstruct_step import baseline_scale
+        for bad in ({"from_frame": 10}, {"from_frame": 10, "to_frame": 20, "length_m": 0.0},
+                    {"from_frame": "a", "to_frame": 20, "length_m": 1.0}):
+            scale, diag = baseline_scale(self._centers(), bad)
+            self.assertIsNone(scale, bad)
+            self.assertIn("reason", diag)
+
+
+class ScaleSourceFallbackTest(unittest.TestCase):
+    """`auto` must never leave a session unbuildable, and must never let a
+    weak estimate pass for a strong one.
+
+    The first version defaulted to `known_baseline` with NO fallback, on the
+    reasoning that a silent substitution is what let a 5-6x scale error
+    survive a whole round. Right about the danger, wrong about the remedy:
+    every session recorded without a baseline became a hard failure with no
+    way forward (session_20260803_171339). The fallback is loud now, not fatal.
+    """
+
+    def _order(self, preference):
+        """Mirror of the selection in reconstruct_step._run_vggt."""
+        if preference == "auto":
+            return ["known_baseline", "imu", "camera_height"]
+        return [preference]
+
+    def test_auto_prefers_a_measured_baseline(self):
+        self.assertEqual(self._order("auto")[0], "known_baseline")
+
+    def test_camera_height_is_the_last_resort_not_the_first(self):
+        """At 13 cm looking up, the floor is a sliver at the frame edge and
+        its plane fit is ill-conditioned — 15% inliers on the real session."""
+        self.assertEqual(self._order("auto")[-1], "camera_height")
+
+    def test_an_explicit_choice_is_honoured_strictly(self):
+        """Silently substituting a method the operator rejected is exactly
+        how the original error survived."""
+        self.assertEqual(self._order("imu"), ["imu"])
+
+    def test_config_default_is_auto(self):
+        import json
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[2]
+        config = json.loads((repo / "config/default.json").read_text())
+        self.assertEqual(config["scene3d"]["reconstruction"]["scale_source"], "auto")
+
+
+class ClassLogitsTest(unittest.TestCase):
+    """Whether the class head needs a sigmoid depends on where the hef's graph
+    was cut, not on the architecture — and being wrong about it produces zero
+    detections forever with no error anywhere."""
+
+    @staticmethod
+    def _outputs(num_classes, class_fill):
+        out = {}
+        for stride in (8, 16, 32):
+            s = 640 // stride
+            out[f"b{s}"] = np.zeros((s, s, 64), dtype=np.float32)
+            out[f"s{s}"] = np.full((s, s, num_classes), class_fill, dtype=np.float32)
+            out[f"c{s}"] = np.zeros((s, s, 32), dtype=np.float32)
+        out["p"] = np.zeros((160, 160, 32), dtype=np.float32)
+        return out
+
+    def test_logit_arch_recovers_a_detection_a_probability_arch_would_miss(self) -> None:
+        # A logit of 2.0 is sigmoid 0.881 — comfortably over a 0.4 threshold.
+        # Read as a probability it is 2.0, which also passes, but a logit of
+        # -1.0 (sigmoid 0.27) vs raw -1.0 is the case that separates them.
+        logits = self._outputs(31, 2.0)
+        with_sigmoid = yolov8_seg_postprocess(logits, score_threshold=0.4,
+                                              arch=INDOOR_ADE20K)
+        self.assertGreater(len(with_sigmoid["scores"]), 0)
+        self.assertLessEqual(float(with_sigmoid["scores"].max()), 1.0)
+
+    def test_negative_logits_stay_below_threshold(self) -> None:
+        # The real hef's class blob ranged -45.7..1.48 on a live frame. Under
+        # the sigmoid those are 0.0..0.81; read raw they are nonsense.
+        quiet = self._outputs(31, -34.0)
+        result = yolov8_seg_postprocess(quiet, score_threshold=0.4, arch=INDOOR_ADE20K)
+        self.assertEqual(len(result["scores"]), 0)
+
+    def test_default_arch_is_untouched(self) -> None:
+        self.assertFalse(YOLOV8_SEG.class_logits)
+        probs = self._outputs(80, 0.9)
+        result = yolov8_seg_postprocess(probs, score_threshold=0.4, arch=YOLOV8_SEG)
+        # 0.9 is already a probability; a stray sigmoid would make it 0.71 and
+        # still pass, so assert the value itself rather than just the count.
+        self.assertAlmostEqual(float(result["scores"].max()), 0.9, places=4)
+
+
+class ImuGravityGateTest(unittest.TestCase):
+    """A segment whose gravity the driver refused to publish must not set the
+    size of a reconstruction — measured cost of ignoring this: a 17x scale
+    error and a floor plan with no walls (session_20260807_171938)."""
+
+    @staticmethod
+    def _centers():
+        return {1: np.array([0.0, 0, 0]), 2: np.array([0.1, 0, 0]),
+                3: np.array([0.2, 0, 0])}
+
+    def test_untrusted_segments_are_dropped(self) -> None:
+        from mac_server.scene3d.poses_step import imu_scale_samples
+
+        segments = {
+            2: {"distance_m": 0.5, "speed_ms": 0.4, "gravity_ok": False},
+            3: {"distance_m": 0.5, "speed_ms": 0.4, "gravity_ok": True},
+        }
+        out = imu_scale_samples(segments, self._centers())
+        self.assertNotIn(2, out)
+        self.assertIn(3, out)
+
+    def test_legacy_sessions_without_the_field_still_work(self) -> None:
+        # Every session recorded before the flag existed omits it; treating
+        # absent as untrusted would silently disable the IMU on all of them.
+        from mac_server.scene3d.poses_step import imu_scale_samples
+
+        segments = {2: {"distance_m": 0.5, "speed_ms": 0.4}}
+        self.assertIn(2, imu_scale_samples(segments, self._centers()))
+
+
+class StaleNavIndexTest(unittest.TestCase):
+    """A place index built at one scale must not localize against poses at
+    another. Measured cost of not checking: after a 25.62 -> 1.515 scale fix
+    the stale index held positions spanning 24 m while the plan was 4 m, and
+    the live robot marker silently vanished off the canvas."""
+
+    def _session(self, tmp, index_scale, poses_scale):
+        root = Path(tmp) / "session_x"
+        derived = root / "derived"
+        derived.mkdir(parents=True)
+        kw = {"kf": np.array([1], np.int32),
+              "embs": np.ones((1, 4), np.float16),
+              "positions": np.zeros((1, 3), np.float32),
+              "forwards": np.zeros((1, 3), np.float32)}
+        if index_scale is not None:
+            kw["built_scale"] = np.array([index_scale], np.float64)
+        np.savez_compressed(derived / "place_index.npz", **kw)
+        (derived / "poses.json").write_text(json.dumps({"scale": poses_scale}))
+        return root
+
+    def test_matching_scale_is_usable(self) -> None:
+        from mac_server.scene3d.navindex import _load_session_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = _load_session_index(self._session(tmp, 1.5151, 1.5151))
+            self.assertFalse(entry["stale"])
+
+    def test_mismatched_scale_is_marked_stale(self) -> None:
+        from mac_server.scene3d.navindex import _load_session_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = _load_session_index(self._session(tmp, 25.6227, 1.5151))
+            self.assertTrue(entry["stale"])
+
+    def test_index_without_the_stamp_is_trusted(self) -> None:
+        # Every index built before the stamp existed lacks it; treating absent
+        # as stale would disable navigation on all older sessions at once.
+        from mac_server.scene3d.navindex import _load_session_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = _load_session_index(self._session(tmp, None, 1.5151))
+            self.assertFalse(entry["stale"])

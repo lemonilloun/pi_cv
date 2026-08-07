@@ -22,23 +22,28 @@ from mac_server.scene3d.session_io import SceneSession, list_sessions
 
 logger = logging.getLogger(__name__)
 
-STEP_ORDER = ["depth", "poses", "tsdf", "objects", "graph", "navindex"]
+# `describe` sits between objects and graph: it needs finished objects,
+# and the graph benefits from the VLM's corrected names.
+STEP_ORDER = ["reconstruct", "tsdf", "objects", "describe", "graph", "navindex"]
 
 
 def _step_functions() -> dict[str, Callable]:
     # Lazy imports: each step pulls heavy deps (torch/open3d/pycolmap).
-    from mac_server.scene3d.depth_step import run_depth_step
-    from mac_server.scene3d.poses_step import run_poses_step
+    from mac_server.scene3d.reconstruct_step import run_reconstruct_step
     from mac_server.scene3d.tsdf_step import run_tsdf_step
     from mac_server.scene3d.objects_step import run_objects_step
+    from mac_server.scene3d.describe_step import run_step as run_describe
     from mac_server.scene3d.graph_step import run_graph_step
     from mac_server.scene3d.navindex_step import run_navindex_step
 
     return {
-        "depth": run_depth_step,
-        "poses": run_poses_step,
+        # VGGT (GPU service) by default; scene3d.reconstruction.backend =
+        # "colmap_dav2" selects the original depth_step+poses_step pipeline
+        # instead (kept, not deleted — see reconstruct_step.py).
+        "reconstruct": run_reconstruct_step,
         "tsdf": run_tsdf_step,
         "objects": run_objects_step,
+        "describe": run_describe,
         "graph": run_graph_step,
         "navindex": run_navindex_step,
     }

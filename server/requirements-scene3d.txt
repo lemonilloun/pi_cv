@@ -3,8 +3,17 @@
 # open_clip_torch shared with monitoring:
 #   python3 -m pip install -r server/requirements-server-cv.txt -r server/requirements-scene3d.txt
 # Then: ./scripts/setup_server_cv.sh (Depth Anything V2 repo + metric checkpoint)
+#
+# As of the GPU-service migration (see gpu_service/, reconstruct_step.py),
+# VGGT/DINOv2/CLIP inference moved to pdfserver by default
+# (scene3d.reconstruction.backend="vggt", scene3d.embeddings.backend=
+# "remote") — pycolmap/torchvision/certifi below are now only exercised by
+# the explicit "colmap_dav2"/"local" fallback paths, not the default run.
+# Not removed: torch/open_clip_torch (requirements-server-cv.txt) are still
+# genuinely needed locally regardless, for cv_worker.py's live depth view
+# and monitoring/'s MobileCLIP re-id — unrelated to scene3d.
 open3d          # tsdf_step: TSDF fusion, mesh/point-cloud export
-pycolmap        # poses_step: sequential SfM (camera poses + sparse points)
+pycolmap        # poses_step: sequential SfM — only scene3d.reconstruction.backend="colmap_dav2"
 pillow          # navindex_step / embeddings: PIL.Image for CLIP preprocessing
-certifi         # objects_step: SSL_CERT_FILE for torch.hub (DINOv2 download)
-torchvision     # pulled in by DINOv2's torch.hub hubconf
+certifi         # objects_step: SSL_CERT_FILE for torch.hub — only scene3d.embeddings.backend="local"
+torchvision     # pulled in by DINOv2's torch.hub hubconf — only scene3d.embeddings.backend="local"

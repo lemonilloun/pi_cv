@@ -19,7 +19,15 @@ from shared.messages import Message
 
 logger = logging.getLogger(__name__)
 
-QUIET_MESSAGE_TYPES = {"camera_stream_frame", "system_telemetry", "nav_query", "scene_keyframe"}
+QUIET_MESSAGE_TYPES = {
+    "camera_stream_frame",
+    "system_telemetry",
+    "nav_query",
+    "scene_keyframe",
+    "imu_cal_state",  # ~5 Hz while the calibration wizard runs
+    "time_sync",      # a 21-message burst at each end of every episode
+    "vla_frame",      # 10 Hz for the whole of a recording episode
+}
 
 
 @dataclass
@@ -86,7 +94,82 @@ def handle_message(
             raise ValueError("storage_dir is required for nav queries")
         return _handle_nav_query(message, storage_dir)
 
+    if message.type == "imu_cal_state":
+        return _handle_imu_cal_state(message)
+
+    if message.type == "time_sync":
+        return _handle_time_sync(message)
+
+    if message.type in {"vla_session_start", "vla_frame", "vla_session_end"}:
+        if storage_dir is None:
+            raise ValueError("storage_dir is required for VLA episode messages")
+        return _handle_vla_message(message, binary_payload, storage_dir)
+
     return make_ack_response(message)
+
+
+# Latest state of the Pi's guided IMU calibration wizard, served to the
+# panel by GET /api/imu_cal/status. Deliberately just the last message:
+# the wizard is the authority on the measurement and writes its own CSVs
+# and summary.json on the Pi — this is a live view, not a record.
+_imu_cal_state: dict[str, object] | None = None
+_imu_cal_lock = threading.Lock()
+
+
+def _handle_imu_cal_state(message: Message) -> Message:
+    global _imu_cal_state
+    with _imu_cal_lock:
+        _imu_cal_state = dict(message.payload)
+    return make_ack_response(message)
+
+
+def _handle_time_sync(message: Message) -> Message:
+    """Answer with this machine's monotonic clock, as promptly as possible.
+
+    Deliberately does nothing else — no logging, no locks, no lookups. Every
+    microsecond spent here lands inside the measured round trip and inflates
+    the offset's error bar. `t0_pi_ns` is echoed so the Pi can match replies
+    to requests without keeping state.
+    """
+    return Message(
+        device_id="mac_server",
+        type="time_sync_reply",
+        payload={
+            "mac_monotonic_ns": time.monotonic_ns(),
+            "mac_wall_ns": time.time_ns(),
+            "t0_pi_ns": message.payload.get("t0_pi_ns"),
+            "seq": message.payload.get("seq", 0),
+        },
+    )
+
+
+# The robot link, registered by server.py. nav_query is the only place the
+# server sees the Pi's live heading, and the localization spin needs it to
+# know when a full revolution is done — see robocar.RobocarService.note_heading.
+_robot_service: object | None = None
+
+
+def set_robot_service(service: object | None) -> None:
+    global _robot_service
+    _robot_service = service
+
+
+# The action log, registered by server.py. Armed automatically when the Pi
+# announces an episode, rather than by a separate panel button: the recorder
+# is the authority on when an episode starts, so making the server follow it
+# removes the whole class of "recorded 200 frames, forgot to arm the actions"
+# failures — which the very first smoke episode already hit.
+_action_log: object | None = None
+
+
+def set_action_log(log: object | None) -> None:
+    global _action_log
+    _action_log = log
+
+
+def get_imu_cal_state() -> dict[str, object] | None:
+    with _imu_cal_lock:
+        return dict(_imu_cal_state) if _imu_cal_state else None
 
 
 def _handle_nav_query(message: Message, storage_dir: Path) -> Message:
@@ -97,10 +180,51 @@ def _handle_nav_query(message: Message, storage_dir: Path) -> Message:
     embedding = message.payload.get("clip_emb")
     if not isinstance(embedding, list) or len(embedding) < 8:
         raise ValueError("nav_query needs a clip_emb list")
-    result = navindex.query(storage_dir.parent / "scene_sessions", embedding)
+    sessions_dir = storage_dir.parent / "scene_sessions"
+    result = navindex.query(sessions_dir, embedding)
     depth = message.payload.get("depth_center_m")
     if depth is not None:
         result["depth_center_m"] = depth
+
+    # The Pi's own fused EKF state, if it is running one. Converted here
+    # rather than on the Pi because the metres->plan_frac mapping needs the
+    # session's plan_frame, which lives with the index on this side.
+    # Mutating `result` in place is deliberate: navindex.query already
+    # stored this same object as `last_result`, which is what
+    # GET /api/nav/last serves to the panel.
+    fused = message.payload.get("fused")
+    if isinstance(fused, dict) and result.get("located"):
+        position_m = fused.get("position_m")
+        if isinstance(position_m, list) and len(position_m) >= 2:
+            projected = navindex.fused_to_plan(
+                sessions_dir,
+                result["best"]["session_id"],
+                position_m,
+                heading_deg=fused.get("heading_deg"),
+                std_m=fused.get("std_m"),
+            )
+            if projected:
+                projected["filter"] = fused.get("filter")
+                # Pass the filter's own confidence through untouched. For the
+                # RVC heading filter, `yaw_bias_std_deg` falling is the signal
+                # that IMU yaw has been tied to this room's plan frame and can
+                # carry heading between visual fixes; the panel shows it so a
+                # drifting or unconverged filter is visible rather than
+                # silently producing a confident-looking arrow.
+                for key in ("heading_std_deg", "yaw_bias_deg", "yaw_bias_std_deg", "bias",
+                            "imu_yaw_deg", "imu_pitch_deg", "imu_roll_deg"):
+                    if fused.get(key) is not None:
+                        projected[key] = fused[key]
+                result["fused"] = projected
+
+    # Raw attitude, forwarded regardless of whether the fix landed. The
+    # localization spin needs the heading exactly when the robot is NOT
+    # localized yet, so gating this on `located` deadlocked it.
+    imu = message.payload.get("imu")
+    if isinstance(imu, dict):
+        result["imu"] = imu
+        if _robot_service is not None:
+            _robot_service.note_heading(imu.get("yaw_deg"))
     return Message(
         device_id="mac_server",
         type="nav_result",
@@ -342,3 +466,94 @@ def _safe_filename_part(value: str) -> str:
             safe_chars.append("_")
     safe_value = "".join(safe_chars).strip("_")
     return safe_value or "unknown"
+
+
+# --------------------------------------------------------------- VLA episodes
+# Behaviour-cloning data. Frames land here from the Pi; the matching actions
+# are logged on this machine by mac_server/vla/action_log.py, and
+# vla/build_dataset.py joins the two using the clock offset recorded at
+# episode start.
+
+
+def _vla_episode_dir(storage_dir: Path, episode_id: str) -> Path:
+    """Reject an unclean episode id rather than sanitizing it.
+
+    `_scene_session_dir` above strips unsafe characters, which is fine there:
+    a mangled scene name costs nothing. Here it would be a data-integrity
+    bug — sanitizing maps several distinct ids onto one directory, and two
+    episodes silently merged into a single folder produce a training example
+    whose frames come from two different demonstrations. The recorder
+    generates ids itself (`ep_YYYYmmdd_HHMMSS`), so anything that needs
+    cleaning means something upstream is wrong and should say so.
+    """
+    safe = "".join(c for c in episode_id if c.isalnum() or c == "_")
+    if not safe or safe != episode_id:
+        raise ValueError(
+            f"Invalid episode id {episode_id!r}: only letters, digits and underscore. "
+            f"Ids are not sanitized here because two ids collapsing onto one "
+            f"directory would merge two demonstrations into one episode."
+        )
+    return storage_dir.parent / "vla_episodes" / safe
+
+
+def _handle_vla_message(message: Message, binary_payload: bytes, storage_dir: Path) -> Message:
+    import json
+
+    payload = message.payload
+    episode_dir = _vla_episode_dir(storage_dir, str(payload.get("episode_id", "")))
+
+    if message.type == "vla_session_start":
+        (episode_dir / "frames").mkdir(parents=True, exist_ok=True)
+        if _action_log is not None:
+            _action_log.start_episode(str(payload.get("episode_id")), episode_dir)
+        (episode_dir / "episode_meta.json").write_text(
+            json.dumps({
+                "episode_id": payload.get("episode_id"),
+                "task": payload.get("task"),
+                "settings": payload.get("settings"),
+                "clock": payload.get("clock"),
+                "device_id": message.device_id,
+                "started_wall": time.time(),
+            }, indent=1),
+            encoding="utf-8",
+        )
+        return make_ack_response(message)
+
+    if message.type == "vla_frame":
+        expected = int(payload.get("jpeg_bytes", 0))
+        if expected != len(binary_payload):
+            raise ValueError(
+                f"vla_frame byte count mismatch: header {expected}, got {len(binary_payload)}"
+            )
+        frame_idx = int(payload.get("frame_idx", 0))
+        (episode_dir / "frames").mkdir(parents=True, exist_ok=True)
+        (episode_dir / "frames" / f"{frame_idx:06d}.jpg").write_bytes(binary_payload)
+        # One JSONL line per frame rather than a file per frame: at 10 Hz a
+        # 30 s episode is 300 frames, and 300 tiny JSON files cost far more in
+        # inode churn than one append-only log.
+        with (episode_dir / "frames.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "frame_idx": frame_idx,
+                "t_pi_mono_ns": payload.get("t_pi_mono_ns"),
+                "imu": payload.get("imu"),
+            }) + "\n")
+        return make_ack_response(message)
+
+    # vla_session_end
+    meta_path = episode_dir / "episode_meta.json"
+    existing = {}
+    if meta_path.exists():
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+        except ValueError:
+            existing = {}
+    existing.update(payload.get("episode_meta") or {})
+    existing["ended_wall"] = time.time()
+    if _action_log is not None:
+        existing["action_log"] = _action_log.status()
+        _action_log.stop_episode()
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(existing, indent=1), encoding="utf-8")
+    logger.info("VLA episode %s closed: %s frames",
+                payload.get("episode_id"), existing.get("frames_sent"))
+    return make_ack_response(message)

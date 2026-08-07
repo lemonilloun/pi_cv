@@ -28,7 +28,11 @@ class Keyframe:
         return self.dir / "meta.json"
 
     def meta(self) -> dict[str, Any]:
-        return json.loads(self.meta_path.read_text(encoding="utf-8"))
+        cached = getattr(self, "_meta_cache", None)
+        if cached is None:
+            cached = json.loads(self.meta_path.read_text(encoding="utf-8"))
+            self._meta_cache = cached
+        return cached
 
     def rgb_bgr(self):
         import cv2
@@ -39,12 +43,64 @@ class Keyframe:
         return image
 
     def masks(self):
-        import cv2
+        """The mask file exactly as stored — a label image or a stack.
 
-        masks = cv2.imread(str(self.masks_path), cv2.IMREAD_UNCHANGED)
-        if masks is None:
-            raise IOError(f"Unreadable masks: {self.masks_path}")
-        return masks
+        Cached, because `instance_mask` is called once per detection and a
+        class-agnostic session has tens of them per keyframe.
+        """
+        cached = getattr(self, "_masks_cache", None)
+        if cached is None:
+            import cv2
+
+            cached = cv2.imread(str(self.masks_path), cv2.IMREAD_UNCHANGED)
+            if cached is None:
+                raise IOError(f"Unreadable masks: {self.masks_path}")
+            self._masks_cache = cached
+        return cached
+
+    def masks_format(self) -> str:
+        """`stack_v1`, or `labels_v0` for everything recorded before it."""
+        return str(self.meta().get("masks_format") or "labels_v0")
+
+    def instance_mask(self, instance_id: int, out_shape: tuple[int, int] | None = None):
+        """Boolean mask for one detection, in either storage format.
+
+        `labels_v0` is a single uint16 label image: overlapping instances
+        overwrote each other at write time, so what comes back for a nested
+        object is whatever survived — that loss is in the recorded data and
+        cannot be undone here. `stack_v1` stores each mask separately and has
+        no such problem; this accessor exists so callers stop caring which.
+        """
+        import cv2
+        import numpy as np
+
+        raw = self.masks()
+        fmt = self.masks_format()
+        if fmt == "stack_v1":
+            meta = self.meta()
+            shape = meta.get("mask_shape")
+            count = int(meta.get("mask_count") or 0)
+            index = int(instance_id) - 1  # instance ids are 1-based
+            if not shape or not (0 <= index < count):
+                mask = np.zeros(raw.shape[:2], dtype=bool)
+            else:
+                mh, mw = int(shape[0]), int(shape[1])
+                band = raw[index * mh:(index + 1) * mh, :mw]
+                mask = band > 0
+        elif fmt == "labels_v0":
+            mask = raw == int(instance_id)
+        else:
+            raise ValueError(
+                f"Unknown masks_format {fmt!r} in {self.meta_path} — refusing to "
+                f"guess a layout")
+
+        if out_shape is not None and tuple(mask.shape[:2]) != tuple(out_shape):
+            # Instance masks are labels, not intensities: nearest only.
+            mask = cv2.resize(
+                mask.astype(np.uint8), (int(out_shape[1]), int(out_shape[0])),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        return mask
 
 
 class SceneSession:

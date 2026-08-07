@@ -24,6 +24,7 @@ data/cv_runs/
 data/rooms/
 data/monitoring/
 data/scene_sessions/
+data/imu_tests/
 
 research/
 models/
@@ -35,3 +36,5 @@ external/
 
 .ven-da3/
 config/imu_calibration.json
+config/imu_calibration_shtp.json
+data/vla_episodes

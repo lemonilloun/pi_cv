@@ -211,6 +211,98 @@ class SyntheticSource:
         return image
 
 
+class ReplaySource:
+    """Replays a recorded session's keyframes in order, as if from a camera.
+
+    The point is comparability. Every perception change after this — a new
+    proposal model, a crop policy, a gate threshold — is otherwise evaluated
+    against a fresh drive down a slightly different path, where a difference in
+    the output could be the change or could be the walk. Replaying fixed pixels
+    removes that confound and needs no robot, no battery and no room.
+
+    Two honest limits, both measured rather than assumed:
+    - The frames are the SAVED `rgb.jpg`, one JPEG round-trip away from what
+      the camera handed the model live. Detections sitting near the confidence
+      threshold move across it under that much perturbation (see
+      CLAUDE.md — a score moved 0.369 -> 0.522 with no visible change), so a
+      replay reproduces the pipeline, not the exact live detection list.
+    - `path_of()` exposes which keyframe a frame came from, because a replay
+      whose outputs cannot be traced back to a source frame is only half a
+      debugging tool.
+    """
+
+    def __init__(self, settings: CaptureSettings, session_dir: Path) -> None:
+        self.settings = settings
+        self.session_dir = Path(session_dir)
+        self._frames: list[Path] = []
+        self._index = 0
+        self.loop = False
+
+    def start(self) -> None:
+        keyframes = self.session_dir / "keyframes"
+        if not keyframes.is_dir():
+            raise FrameSourceError(f"No keyframes directory in {self.session_dir}")
+        # Sorted by directory name, which is the zero-padded keyframe index —
+        # i.e. recording order, which is what makes a replay a replay.
+        self._frames = sorted(
+            p for p in keyframes.glob("*/rgb.jpg") if p.is_file()
+        )
+        if not self._frames:
+            raise FrameSourceError(f"No keyframe rgb.jpg files under {keyframes}")
+        self._index = 0
+
+    def stop(self) -> None:
+        self._frames = []
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def path_of(self, index: int) -> Path:
+        return self._frames[index % len(self._frames)]
+
+    @property
+    def current_path(self) -> Path | None:
+        """The frame the LAST capture_bgr() returned, for labelling output."""
+        if not self._frames or self._index == 0:
+            return None
+        return self._frames[(self._index - 1) % len(self._frames)]
+
+    def next_stream_jpeg(self, timeout: float = 5.0) -> bytes:
+        if not self._frames:
+            raise FrameSourceError("Replay source is not started")
+        path = self._frames[self._index % len(self._frames)]
+        self._advance()
+        return path.read_bytes()
+
+    def capture_bgr(self) -> Any:
+        if not self._frames:
+            raise FrameSourceError("Replay source is not started")
+        try:
+            import cv2
+        except ImportError as exc:
+            raise FrameSourceError("OpenCV is required for replay capture") from exc
+
+        path = self._frames[self._index % len(self._frames)]
+        image = cv2.imread(str(path))
+        if image is None:
+            raise FrameSourceError(f"Failed to decode replay frame {path}")
+        self._advance()
+        return image
+
+    def _advance(self) -> None:
+        self._index += 1
+
+    @property
+    def exhausted(self) -> bool:
+        """True once every keyframe has been served.
+
+        The caller stops on this rather than the source looping by itself: a
+        replay that silently wraps around turns "processed the session once"
+        into an endless run that still looks like progress.
+        """
+        return not self.loop and self._index >= len(self._frames)
+
+
 def make_stream_source(source_kind: str, settings: CaptureSettings, image_path: Path) -> Any:
     if source_kind == "camera":
         return PicameraStreamSource(settings)
@@ -220,8 +312,12 @@ def make_stream_source(source_kind: str, settings: CaptureSettings, image_path: 
 
 
 def make_capture_source(source_kind: str, settings: CaptureSettings, image_path: Path) -> Any:
+    """`image_path` is the still for "synthetic" and the session directory for
+    "replay" — one positional slot, so existing callers are untouched."""
     if source_kind == "camera":
         return PicameraCaptureSource(settings)
     if source_kind == "synthetic":
         return SyntheticSource(settings, image_path)
+    if source_kind == "replay":
+        return ReplaySource(settings, image_path)
     raise FrameSourceError(f"Unsupported source: {source_kind}")

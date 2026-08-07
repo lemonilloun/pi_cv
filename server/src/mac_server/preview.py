@@ -17,6 +17,8 @@ import threading
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from . import robocar as robocar_mod
+
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,7 @@ class MjpegPreviewServer:
         room_store: Any | None = None,
         monitor_controller: Any | None = None,
         scene_pipeline: Any | None = None,
+        robocar: Any | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -105,6 +108,7 @@ class MjpegPreviewServer:
                 room_store,
                 monitor_controller,
                 scene_pipeline,
+                robocar,
             ),
         )
         self._thread: threading.Thread | None = None
@@ -139,6 +143,7 @@ def _make_handler(
     room_store: Any | None = None,
     monitor_controller: Any | None = None,
     scene_pipeline: Any | None = None,
+    robocar: Any | None = None,
 ) -> type[server.BaseHTTPRequestHandler]:
     class StreamingHandler(server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -197,6 +202,15 @@ def _make_handler(
             if parsed.path == "/api/nav/last":
                 self._serve_nav_last()
                 return
+            if parsed.path == "/api/vla/episodes":
+                self._serve_vla_episodes()
+                return
+            if parsed.path == "/api/robot/status":
+                self._serve_robot_status()
+                return
+            if parsed.path == "/api/imu_cal/status":
+                self._serve_imu_cal_status()
+                return
             if parsed.path == "/scene3d/artifact":
                 self._serve_scene_artifact(parsed.query)
                 return
@@ -233,6 +247,18 @@ def _make_handler(
                 return
             if parsed.path == "/api/monitor/anchors/freeze":
                 self._handle_anchors_freeze()
+                return
+            if parsed.path == "/api/robot/drive":
+                self._handle_robot_drive()
+                return
+            if parsed.path == "/api/robot/spin":
+                self._handle_robot_spin()
+                return
+            if parsed.path == "/api/robot/pan":
+                self._handle_robot_pan()
+                return
+            if parsed.path == "/api/robot/command":
+                self._handle_robot_command()
                 return
             if parsed.path == "/api/scene3d/run":
                 self._handle_scene_run()
@@ -759,6 +785,140 @@ def _make_handler(
                 self._send_json({"last": navindex.get_last()})
             except Exception as exc:
                 self._send_json({"last": None, "error": str(exc)})
+
+        def _serve_vla_episodes(self) -> None:
+            """Recorded episodes with their quality report.
+
+            Each one is checked rather than merely listed: an episode whose
+            clock sync was loose, or whose action log was armed late, trains
+            a subtly wrong policy and cannot be spotted by eye afterwards.
+            """
+            from mac_server.vla import build_dataset
+
+            episodes_dir = Path(__file__).resolve().parents[3] / "data/vla_episodes"
+            out = []
+            for path in sorted(episodes_dir.glob("ep_*"), reverse=True):
+                entry: dict[str, Any] = {"episode_id": path.name}
+                try:
+                    report = build_dataset.build_episode(path)
+                    entry.update({
+                        "task": report["task"],
+                        "frames": report["frames_total"],
+                        "labelled": len(report["samples"]),
+                        "stopped_frac": report["stopped_frac"],
+                        "clock_quality_ms": report["clock_quality_ms"],
+                        "problems": build_dataset.check_episode(report),
+                    })
+                except FileNotFoundError as exc:
+                    entry["problems"] = [str(exc).split(" — ")[-1]]
+                except Exception as exc:      # a half-written episode must
+                    entry["problems"] = [f"unreadable: {exc}"]   # not hide the rest
+                out.append(entry)
+            usable = [e for e in out if not e.get("problems")]
+            self._send_json({
+                "episodes": out,
+                "usable": len(usable),
+                "total": len(out),
+                "recording": (
+                    robocar.action_log.status() if robocar is not None
+                    and getattr(robocar, "action_log", None) is not None else None
+                ),
+            })
+
+        def _serve_robot_status(self) -> None:
+            if robocar is None:
+                self._send_json({"available": False,
+                                 "reason": "server started with --no-robot"})
+                return
+            payload = robocar.status()
+            payload["available"] = True
+            self._send_json(payload)
+
+        def _handle_robot_drive(self) -> None:
+            """Wheel PWMs, or a (throttle, steer, speed) trio to be mixed.
+
+            The panel refreshes this every 100 ms while a key is held; the
+            service stops the motors on its own if the refresh stops (see
+            robocar.COMMAND_TTL_S), so a crashed browser cannot leave the
+            robot driving.
+            """
+            if robocar is None:
+                self._send_json({"error": "robot control disabled"}, status=409)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            command = robocar_mod.parse_drive_payload(self.rfile.read(length) if length else b"{}")
+            if command is None:
+                self._send_json({"error": "bad drive payload"}, status=400)
+                return
+            # The pre-mix intent travels with the wheels so the action log can
+            # keep both — see vla/action_log.py for why one does not substitute
+            # for the other.
+            if not robocar.drive(
+                command.left, command.right, source="panel",
+                throttle=command.throttle, steer=command.steer, speed=command.speed,
+            ):
+                self._send_json({"error": "no robot connected", "left": command.left,
+                                 "right": command.right}, status=409)
+                return
+            self._send_json({"ok": True, "left": command.left, "right": command.right})
+
+        def _handle_robot_spin(self) -> None:
+            """Start (or cancel) the localization spin.
+
+            Stops on MEASURED rotation, not a timer: with no wheel encoders
+            the IMU is the only thing that knows the robot came all the way
+            round, so pi_navigation has to be running and reporting yaw
+            before this can do anything.
+            """
+            if robocar is None:
+                self._send_json({"error": "robot control disabled"}, status=409)
+                return
+            body = self._read_json_body()
+            if body is None:
+                return
+            if body.get("cancel"):
+                robocar.cancel_spin("cancelled from the panel")
+                self._send_json({"ok": True, "detail": "cancelled"})
+                return
+            ok, detail = robocar.start_spin(
+                speed=int(body.get("speed", robocar_mod.SPIN_SPEED)),
+                target_deg=float(body.get("target_deg", robocar_mod.SPIN_TARGET_DEG)),
+            )
+            self._send_json({"ok": ok, "detail": detail}, status=200 if ok else 409)
+
+        def _handle_robot_pan(self) -> None:
+            """Point the camera. Only while the wheels are stopped — the ESP
+            shares a timer between the servo and the motor PWM."""
+            if robocar is None:
+                self._send_json({"error": "robot control disabled"}, status=409)
+                return
+            body = self._read_json_body()
+            if body is None:
+                return
+            if body.get("survey"):
+                reached = robocar.pan_survey()
+                self._send_json({"ok": bool(reached), "reached_deg": reached})
+                return
+            ok, detail = robocar.set_pan(float(body.get("angle_deg", 0.0)))
+            self._send_json({"ok": ok, "detail": detail}, status=200 if ok else 409)
+
+        def _handle_robot_command(self) -> None:
+            if robocar is None:
+                self._send_json({"error": "robot control disabled"}, status=409)
+                return
+            body = self._read_json_body()
+            if body is None:
+                return
+            ok, detail = robocar.send_command(str(body.get("command", "")))
+            self._send_json({"ok": ok, "detail": detail}, status=200 if ok else 409)
+
+        def _serve_imu_cal_status(self) -> None:
+            try:
+                from mac_server.handlers import get_imu_cal_state
+
+                self._send_json({"state": get_imu_cal_state()})
+            except Exception as exc:
+                self._send_json({"state": None, "error": str(exc)})
 
         def _handle_scene_delete(self) -> None:
             if self._scene_unavailable():

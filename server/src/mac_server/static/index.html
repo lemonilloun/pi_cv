@@ -67,6 +67,20 @@
     border-radius: 10px;
     padding: 14px;
   }
+  .robot-pad {
+    display: grid; gap: 6px; margin-bottom: 12px;
+    grid-template-columns: repeat(3, 58px); grid-template-rows: repeat(2, 52px);
+  }
+  .rkey {
+    display: flex; align-items: center; justify-content: center;
+    background: #1e2229; border: 1px solid #2c313a; border-radius: 8px;
+    font-weight: 600; color: #99a0ac; cursor: pointer; user-select: none;
+    transition: background .06s, color .06s;
+  }
+  .rkey.on { background: #2f6f4f; border-color: #3d8f66; color: #eafff2; }
+  .robot-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .robot-row > span { color: var(--muted); font-size: 12px; width: 48px; }
+  .robot-row input[type=range] { flex: 1; accent-color: #3d8f66; }
   .video-card { padding: 0; overflow: hidden; position: relative; }
   .video-card img {
     display: block;
@@ -334,7 +348,28 @@
   .step-chip.failed { color: var(--critical); border-color: var(--critical); }
   .step-chip.running { color: var(--accent); border-color: var(--accent); }
   #meshViewer { width: 100%; height: 420px; background: #111; border-radius: 10px; }
-  #scenePlanImg { max-width: 100%; border-radius: 10px; }
+  /* The marker layer is positioned in PERCENTAGES of #planWrap, so that box
+     must be exactly the rendered image box — not the column it sits in.
+     It used to be a plain block div stretching the full card width while a
+     331x371 plan sat at its left edge, which put a marker at "50%" in the
+     empty space beside the picture rather than in the middle of the room.
+     Width is driven by the image's own aspect ratio (set from JS on load),
+     so the wrapper hugs the image at any size: small plans scale up to the
+     card, tall ones are bounded by height instead. */
+  #planWrap {
+    position: relative;
+    margin: 0 auto;
+    width: min(100%, calc(72vh * var(--plan-aspect, 1)));
+  }
+  #scenePlanImg {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 10px;
+    /* An occupancy grid is data, not a photograph: smoothing it turns a
+       one-cell wall into a grey smear. */
+    image-rendering: pixelated;
+  }
   .scene-objects td { font-size: 12.5px; }
 </style>
 <script type="importmap">
@@ -342,6 +377,24 @@
 </script>
 </head>
 <body>
+<!-- IMU calibration coach. An overlay rather than a tab card on purpose:
+     while it runs the operator is physically pushing the cart and needs the
+     current instruction readable at a glance from across the room, not
+     hidden behind whichever tab happens to be open. Auto-shows when the Pi
+     wizard starts publishing and auto-hides when its state goes stale. -->
+<div id="imuCal" style="display:none; position:fixed; inset:0; z-index:50; background:rgba(8,10,14,.93); backdrop-filter:blur(3px); align-items:center; justify-content:center; text-align:center; padding:24px">
+  <div style="max-width:760px; width:100%">
+    <p id="imuCalRun" style="margin:0 0 6px; font-size:14px; letter-spacing:.14em; text-transform:uppercase; opacity:.6"></p>
+    <p id="imuCalTitle" style="margin:0; font-size:56px; line-height:1.1; font-weight:700"></p>
+    <p id="imuCalDetail" style="margin:14px 0 0; font-size:17px; opacity:.82"></p>
+    <p id="imuCalCount" style="margin:18px 0 8px; font-size:80px; font-weight:700; font-variant-numeric:tabular-nums"></p>
+    <div style="height:10px; border-radius:5px; background:rgba(255,255,255,.12); overflow:hidden">
+      <div id="imuCalBar" style="height:100%; width:0%; background:#5ac8ff; transition:width .2s linear"></div>
+    </div>
+    <p id="imuCalSamples" style="margin:8px 0 0; font-size:12.5px; opacity:.5"></p>
+    <div id="imuCalResults" style="margin-top:22px; font-size:13.5px; opacity:.85; text-align:left"></div>
+  </div>
+</div>
 <header>
   <h1>pi_cv Control Panel</h1>
   <nav class="tabs" id="tabs">
@@ -536,9 +589,14 @@
         <button data-result="objects">Objects</button>
       </div>
       <p class="meta-line" id="navLine"></p>
-      <div id="planWrap" style="position:relative; display:none">
+      <div id="planWrap" style="display:none">
         <img id="scenePlanImg" alt="Floor plan" style="display:block">
         <div id="navDot" style="position:absolute; display:none; transform:translate(-50%,-50%); color:#ff5533; font-size:20px; text-shadow:0 0 6px #000; pointer-events:none">➤</div>
+        <!-- Fused EKF pose. Drawn UNDER navDot so the raw visual fix stays
+             visible on top: seeing the two diverge is how you tell the
+             filter is doing something. Ellipse is the position std-dev. -->
+        <div id="navFusedEllipse" style="position:absolute; display:none; transform:translate(-50%,-50%); border:1px solid rgba(90,200,255,.55); background:rgba(90,200,255,.13); border-radius:50%; pointer-events:none"></div>
+        <div id="navFusedDot" style="position:absolute; display:none; transform:translate(-50%,-50%); color:#5ac8ff; font-size:18px; text-shadow:0 0 6px #000; pointer-events:none">➤</div>
       </div>
       <div id="meshViewer" style="display:none"></div>
       <div id="sceneObjects" style="display:none">
@@ -549,6 +607,45 @@
         <p class="meta-line" id="sceneEdges"></p>
       </div>
       <p class="meta-line" id="sceneResultHint" style="opacity:0.75"></p>
+    </div>
+
+    <!-- Drive control. Lives beside the floor plan on purpose: driving with
+         the live fix and the IMU heading in the same view is the whole
+         point of the exercise — you can watch the arrow move as you steer,
+         and see immediately whether the heading follows the turn. -->
+    <div class="card" id="robotCard">
+      <p class="section-title">Drive</p>
+      <div id="robotPad" class="robot-pad">
+        <div></div><div class="rkey" data-k="w">W</div><div></div>
+        <div class="rkey" data-k="a">A</div>
+        <div class="rkey" data-k="s">S</div>
+        <div class="rkey" data-k="d">D</div>
+      </div>
+      <label class="robot-row">
+        <span>speed</span>
+        <input id="robotSpeed" type="range" min="40" max="255" value="140">
+        <b id="robotSpeedVal">140</b>
+      </label>
+      <div class="robot-row" style="gap:8px">
+        <button id="robotStop" class="scan-btn" style="background:var(--critical)">STOP</button>
+        <button id="robotKeysBtn" class="ghost-btn">keyboard: off</button>
+      </div>
+      <div class="robot-row" style="gap:8px">
+        <button id="robotSpinBtn" class="ghost-btn">Spin to localize (360°)</button>
+      </div>
+      <label class="robot-row">
+        <span>cam→body</span>
+        <select id="robotYawOffset" style="flex:1">
+          <option value="0">0° — camera faces the way it drives</option>
+          <option value="180">180° — camera faces backwards</option>
+          <option value="90">90° — camera faces left</option>
+          <option value="-90">-90° — camera faces right</option>
+        </select>
+      </label>
+      <p class="meta-line" id="robotSpin" style="opacity:.8"></p>
+      <p class="meta-line" id="robotStatus">robot: —</p>
+      <p class="meta-line" id="robotHeading" style="opacity:.8">heading: —</p>
+      <p class="meta-line" id="robotHb" style="opacity:.6"></p>
     </div>
   </section>
 </main>
@@ -1625,6 +1722,15 @@ document.querySelectorAll("#tabs button").forEach((btn) => {
   });
 });
 
+// How the camera is bolted to the chassis, in degrees. The heading the
+// markers show comes from the RECORDED KEYFRAME POSES — i.e. where the
+// camera was looking — while "forward" to the operator is where the wheels
+// push. Mount the camera backwards and the arrow sits 180° from the
+// driving direction while the localization itself is perfectly correct.
+// Display-only on purpose: the EKF's theta is camera heading throughout and
+// is self-consistent, so rotating it here would be fixing the wrong thing.
+let robotYawOffset = +(localStorage.getItem("robotYawOffset") || 0);
+
 // Live localization fix from pi_navigation (drawn on the floor plan).
 let navPollTimer = null;
 function startNavPolling() {
@@ -1636,27 +1742,81 @@ async function pollNav() {
   if (document.getElementById("tabScene").style.display === "none") return;
   const line = document.getElementById("navLine");
   const dot = document.getElementById("navDot");
+  const fusedDot = document.getElementById("navFusedDot");
+  const fusedEllipse = document.getElementById("navFusedEllipse");
+  const hideAll = () => {
+    dot.style.display = "none";
+    fusedDot.style.display = "none";
+    fusedEllipse.style.display = "none";
+  };
   try {
     const res = await fetch("/api/nav/last");
     const data = await res.json();
     const last = data.last;
-    if (!last || !last.located) { line.textContent = ""; dot.style.display = "none"; return; }
+    if (!last || !last.located) { line.textContent = ""; hideAll(); return; }
     const best = last.best;
     const age = Math.max(0, Math.round(Date.now() / 1000 - last.at));
-    if (age > 30) { line.textContent = ""; dot.style.display = "none"; return; }
+    if (age > 30) { line.textContent = ""; hideAll(); return; }
     const room = best.name || best.session_id.replace("session_", "");
     const spread = best.heading_spread_deg !== undefined ? ` ±${best.heading_spread_deg}°` : "";
     const heading = best.heading_deg !== undefined ? ` · heading ${best.heading_deg}°${spread}` : "";
     const depth = last.depth_center_m !== undefined ? ` · ahead ${last.depth_center_m}m` : "";
-    line.textContent = `📍 ${room} · sim ${best.similarity}${heading}${depth} · ${age}s ago`;
-    if (best.session_id === sceneState.selected && best.plan_frac) {
+    const f = last.fused;
+    let fusedText = "";
+    if (f) {
+      fusedText = ` · fused ±${f.std_m}m`;
+      if (f.heading_std_deg !== undefined) fusedText += ` · hdg ±${f.heading_std_deg}°`;
+      // Yaw-bias spread: the RVC heading filter's convergence indicator.
+      // Small = IMU yaw is tied to this room's frame and carries heading
+      // between visual fixes; large = still learning, trust the fix only.
+      if (f.yaw_bias_std_deg !== undefined) {
+        fusedText += ` · yawbias ${f.yaw_bias_deg}°±${f.yaw_bias_std_deg}°`;
+      }
+      if (f.bias) fusedText += ` · bias ${f.bias[0]},${f.bias[1]}m/s²`;
+      // Raw sensor attitude beside the drive keys: hold A and watch which
+      // way imu yaw moves. That is the axis convention, measured rather
+      // than assumed — the gravity calibration cannot see it.
+      const hd = document.getElementById("robotHeading");
+      if (hd && f.imu_yaw_deg !== undefined) {
+        hd.textContent =
+          `imu yaw ${f.imu_yaw_deg.toFixed(1)}°  pitch ${f.imu_pitch_deg}°  ` +
+          `roll ${f.imu_roll_deg}°  →  map ${f.heading_deg}°` +
+          (f.heading_std_deg !== undefined ? ` ±${f.heading_std_deg}°` : "");
+      }
+    }
+    line.textContent = `📍 ${room} · sim ${best.similarity}${heading}${depth}${fusedText} · ${age}s ago`;
+
+    const onThisPlan = best.session_id === sceneState.selected;
+    if (onThisPlan && best.plan_frac) {
       dot.style.left = (best.plan_frac[0] * 100) + "%";
       dot.style.top = (best.plan_frac[1] * 100) + "%";
       dot.style.transform =
-        `translate(-50%,-50%) rotate(${best.heading_deg !== undefined ? best.heading_deg : 0}deg)`;
+        `translate(-50%,-50%) rotate(${(best.heading_deg !== undefined ? best.heading_deg : 0) + robotYawOffset}deg)`;
       dot.style.display = "";
     } else {
       dot.style.display = "none";
+    }
+
+    if (onThisPlan && f && f.plan_frac) {
+      fusedDot.style.left = (f.plan_frac[0] * 100) + "%";
+      fusedDot.style.top = (f.plan_frac[1] * 100) + "%";
+      fusedDot.style.transform =
+        `translate(-50%,-50%) rotate(${(f.heading_deg !== undefined ? f.heading_deg : 0) + robotYawOffset}deg)`;
+      fusedDot.style.display = "";
+      if (f.std_frac) {
+        // 2-sigma, and the two axes are sized separately because a
+        // non-square grid stretches metres differently per axis.
+        fusedEllipse.style.left = (f.plan_frac[0] * 100) + "%";
+        fusedEllipse.style.top = (f.plan_frac[1] * 100) + "%";
+        fusedEllipse.style.width = Math.max(0.5, f.std_frac[0] * 2 * 100) + "%";
+        fusedEllipse.style.height = Math.max(0.5, f.std_frac[1] * 2 * 100) + "%";
+        fusedEllipse.style.display = "";
+      } else {
+        fusedEllipse.style.display = "none";
+      }
+    } else {
+      fusedDot.style.display = "none";
+      fusedEllipse.style.display = "none";
     }
   } catch (err) { /* transient */ }
 }
@@ -1862,7 +2022,14 @@ async function loadSceneResults() {
   img.onerror = () => { img.onerror = null; img.src = `${base}&name=floor_plan.png&t=${Date.now()}`; };
   img.src = `${base}&name=floor_plan_labeled.png&t=${Date.now()}`;
   img.onload = () => {
-    document.getElementById("planWrap").style.display =
+    const wrap = document.getElementById("planWrap");
+    // Hand the wrapper the image's true aspect ratio so its box matches the
+    // rendered picture exactly. Without this the marker overlay is aligned to
+    // the column instead of to the plan.
+    if (img.naturalWidth && img.naturalHeight) {
+      wrap.style.setProperty("--plan-aspect", img.naturalWidth / img.naturalHeight);
+    }
+    wrap.style.display =
       document.querySelector("#sceneResultPills .active").dataset.result === "plan" ? "" : "none";
   };
 
@@ -1966,10 +2133,223 @@ async function loadMeshViewer() {
   }
 }
 
+// ------------------------------------------------- IMU calibration coach
+// Polled fast (2 Hz) because it drives a live countdown the operator is
+// acting on — a 1s-granularity clock that lags by a second is worse than
+// no clock. Cheap: one small JSON, and only while a wizard is actually
+// publishing.
+const IMU_CAL_STALE_S = 8;
+
+// Per-run results accumulate here: /api/imu_cal/status only ever holds the
+// LATEST wizard message, so a finished run's numbers would otherwise vanish
+// the moment the next phase starts publishing. Keyed by wizard session so a
+// second calibration doesn't show the first one's rows.
+const imuCalRuns = { session: null, rows: {} };
+
+function renderImuCalResults(state) {
+  const box = document.getElementById("imuCalResults");
+  if (imuCalRuns.session !== state.session) {
+    imuCalRuns.session = state.session;
+    imuCalRuns.rows = {};
+  }
+  if (state.result && state.run) {
+    const r = state.result;
+    imuCalRuns.rows[state.run] = r.ok
+      ? `Заезд ${state.run}: ${r.corrected_distance_m} м (эталон ${r.truth_m} м, ошибка ${r.error_m > 0 ? "+" : ""}${r.error_m} м) · смещение |${r.bias_mag_ms2}| м/с²`
+      : `Заезд ${state.run}: непригоден — ${r.reason}`;
+  }
+  const rows = Object.keys(imuCalRuns.rows)
+    .sort((a, b) => a - b)
+    .map((k) => imuCalRuns.rows[k]);
+  if (state.summary) {
+    const s = state.summary;
+    if (s.ok) {
+      rows.push(`<b>Итог:</b> пригодных заездов ${s.runs_usable}/${s.runs_total} · среднее смещение ${s.bias_mean_ms2} м/с² · наклон ${s.tilt_error_mean_deg}°`);
+      if (s.verdict) rows.push(`<b>${s.verdict}</b> — ${s.verdict_text}`);
+    } else {
+      rows.push(`<b>Итог:</b> ${s.reason}`);
+    }
+  }
+  if (rows.length) box.innerHTML = rows.map((r) => `<p style="margin:4px 0">${r}</p>`).join("");
+}
+
+async function pollImuCal() {
+  const box = document.getElementById("imuCal");
+  let state = null;
+  try {
+    const res = await fetch("/api/imu_cal/status");
+    state = (await res.json()).state;
+  } catch (err) { /* server hiccup — keep whatever is on screen */ }
+  if (!state || !state.at || Date.now() / 1000 - state.at > IMU_CAL_STALE_S) {
+    box.style.display = "none";
+    return;
+  }
+  box.style.display = "flex";
+  const runLabel = state.run
+    ? `Заезд ${state.run} из ${state.runs_total} · эталон ${state.truth_m} м`
+    : "Базовый замер";
+  document.getElementById("imuCalRun").textContent = state.phase === "done" ? "" : runLabel;
+  document.getElementById("imuCalTitle").textContent = state.title || "";
+  document.getElementById("imuCalDetail").textContent = state.detail || "";
+  const counting = state.remaining_s !== undefined;
+  document.getElementById("imuCalCount").textContent = counting ? Math.ceil(state.remaining_s) : "";
+  document.getElementById("imuCalBar").style.width =
+    counting ? Math.round((state.progress || 0) * 100) + "%" : "100%";
+  document.getElementById("imuCalSamples").textContent =
+    state.samples !== undefined ? `${state.samples} сэмплов записано` : "";
+  renderImuCalResults(state);
+}
+
 backfill().then(poll);
 loadRooms();
 loadScenes();
 setInterval(poll, 1000);
+setInterval(pollImuCal, 500);
+pollImuCal();
+
+// ---------------------------------------------------------------- driving
+// Keyboard capture is OFF by default and opt-in via the button: this page
+// has text inputs (scene name, the monitoring Ask box), and a WASD handler
+// that swallowed those keystrokes would make them unusable. It also means
+// the robot cannot be driven by a stray keypress on a page left open.
+const robotKeys = new Set();
+let robotSpeed = 140;
+let robotKeyboard = false;
+let robotLastSent = null;
+
+const ROBOT_MAP = {
+  w: "w", a: "a", s: "s", d: "d",
+  "ц": "w", "ф": "a", "ы": "s", "в": "d",
+  arrowup: "w", arrowleft: "a", arrowdown: "s", arrowright: "d",
+};
+
+function robotTile(k) { return document.querySelector(`.rkey[data-k="${k}"]`); }
+function robotPress(k)   { robotKeys.add(k);    robotTile(k)?.classList.add("on"); }
+function robotRelease(k) { robotKeys.delete(k); robotTile(k)?.classList.remove("on"); }
+function robotReleaseAll() { [...robotKeys].forEach(robotRelease); }
+
+document.querySelectorAll(".rkey").forEach((el) => {
+  const k = el.dataset.k;
+  el.addEventListener("pointerdown", (e) => { e.preventDefault(); robotPress(k); });
+  el.addEventListener("pointerup", (e) => { e.preventDefault(); robotRelease(k); });
+  el.addEventListener("pointerleave", () => robotRelease(k));
+  el.addEventListener("pointercancel", () => robotRelease(k));
+});
+
+document.getElementById("robotSpeed").addEventListener("input", (e) => {
+  robotSpeed = +e.target.value;
+  document.getElementById("robotSpeedVal").textContent = robotSpeed;
+});
+document.getElementById("robotStop").addEventListener("click", () => {
+  robotReleaseAll();
+  fetch("/api/robot/command", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: "STOP" }),
+  }).catch(() => {});
+});
+document.getElementById("robotKeysBtn").addEventListener("click", (e) => {
+  robotKeyboard = !robotKeyboard;
+  e.target.textContent = "keyboard: " + (robotKeyboard ? "ON" : "off");
+  e.target.classList.toggle("scan-btn", robotKeyboard);
+  if (!robotKeyboard) robotReleaseAll();
+});
+
+addEventListener("keydown", (e) => {
+  if (!robotKeyboard || e.repeat) return;
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return;
+  if (e.key === " ") { e.preventDefault(); robotReleaseAll(); return; }
+  const k = ROBOT_MAP[e.key.toLowerCase()];
+  if (k) { e.preventDefault(); robotPress(k); }
+});
+addEventListener("keyup", (e) => {
+  const k = ROBOT_MAP[(e.key || "").toLowerCase()];
+  if (k) robotRelease(k);
+});
+// Losing focus must stop the robot — a held key whose keyup lands in
+// another window would otherwise stay "held" here forever.
+addEventListener("blur", robotReleaseAll);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) robotReleaseAll();
+});
+
+setInterval(() => {
+  let throttle = 0, steer = 0;
+  if (robotKeys.has("w")) throttle += 1;
+  if (robotKeys.has("s")) throttle -= 1;
+  if (robotKeys.has("d")) steer += 1;
+  if (robotKeys.has("a")) steer -= 1;
+  // A/D alone means "spin in place" and gets full steering authority. A/D
+  // WITH W/S means "drive round a curve", and full steer there saturates the
+  // mixer into a pure spin — the forward part of the request is exactly what
+  // gets clamped away. STEER_WITH_THROTTLE is the arc: at 0.55 the outer
+  // wheel stays well above the stall threshold while the inner one still
+  // drives, which is what actually carries the chassis round a corner
+  // instead of scrubbing it.
+  const STEER_WITH_THROTTLE = 0.55;
+  if (throttle !== 0 && steer !== 0) steer *= STEER_WITH_THROTTLE;
+  const key = `${throttle},${steer},${robotSpeed}`;
+  // Keep resending while moving: the ESP stops itself after 400 ms of
+  // silence and the server expires the command after 600 ms, both by
+  // design. Only a settled stop is allowed to go quiet.
+  if (key === robotLastSent && throttle === 0 && steer === 0) return;
+  robotLastSent = key;
+  fetch("/api/robot/drive", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ throttle, steer, speed: robotSpeed }),
+  }).catch(() => {});
+}, 100);
+
+document.getElementById("robotSpinBtn").addEventListener("click", async (e) => {
+  const spinning = e.target.dataset.spinning === "1";
+  const r = await fetch("/api/robot/spin", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spinning ? { cancel: true } : {}),
+  }).then((x) => x.json()).catch(() => null);
+  if (r && !r.ok) document.getElementById("robotSpin").textContent = "spin: " + r.detail;
+});
+
+const yawOffsetSel = document.getElementById("robotYawOffset");
+yawOffsetSel.value = String(robotYawOffset);
+yawOffsetSel.addEventListener("change", (e) => {
+  robotYawOffset = +e.target.value;
+  localStorage.setItem("robotYawOffset", String(robotYawOffset));
+});
+
+async function pollRobot() {
+  const line = document.getElementById("robotStatus");
+  try {
+    const s = await (await fetch("/api/robot/status")).json();
+    if (!s.available) { line.textContent = "robot: disabled (--no-robot)"; return; }
+    if (s.errors && s.errors.length) {
+      line.textContent = "robot: port problem — " + s.errors.join("; ");
+      return;
+    }
+    line.textContent = s.connected
+      ? `robot: connected ${s.address} · ${s.drive[0]}/${s.drive[1]} · up ${s.uptime_s}s`
+      : `robot: waiting for ESP (UDP ${s.discovery_port} / TCP ${s.command_port})`;
+    document.getElementById("robotHb").textContent = s.heartbeat || "";
+    const spin = s.spin || {};
+    const btn = document.getElementById("robotSpinBtn");
+    btn.dataset.spinning = spin.active ? "1" : "0";
+    btn.textContent = spin.active ? "Cancel spin" : "Spin to localize (360°)";
+    btn.classList.toggle("scan-btn", !!spin.active);
+    // "blind" means no IMU heading arrived, so it is a timed spin rather
+    // than a measured 360° — worth saying out loud, since the two look
+    // identical from the outside but only one of them is verified.
+    document.getElementById("robotSpin").textContent = spin.active
+      ? (spin.mode === "blind"
+          ? `spinning blind: step ${spin.steps || 0} (no IMU heading — is pi_navigation running?)`
+          : `spinning: ${spin.turned_deg}° of ${spin.target_deg}° · step ${spin.steps || 0}`)
+      : (spin.reason
+          ? `last spin: ${spin.turned_deg}° in ${spin.steps || 0} steps — ${spin.reason}`
+          : "");
+  } catch (e) {
+    line.textContent = "robot: panel offline";
+  }
+}
+setInterval(pollRobot, 1000);
+pollRobot();
 </script>
 </body>
 </html>

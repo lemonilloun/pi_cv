@@ -46,6 +46,22 @@ const char* AP_SSID = "RoboCar-Setup";
 const char* AP_PASS = "robocar123";      // минимум 8 символов
 
 // ==================== ПИНЫ ====================
+// --- Camera pan servo (added 2026-08-03) -----------------------------------
+// D4 / GPIO2 is the spare pin on this board. It is also the onboard LED, so
+// the LED flickers while the servo is being driven; harmless.
+//
+// IMPORTANT, and the reason the servo is attached and detached rather than
+// held: on the ESP8266 the Servo library and analogWrite() both use timer1,
+// and the motors are driven by analogWrite. Holding a servo attached while
+// driving degrades the motor PWM. So PAN refuses while the wheels are turning,
+// moves the servo, waits for it to arrive, and detaches again. That matches
+// how the robot is actually used — park, look around, drive on.
+#include <Servo.h>
+#define PIN_SERVO D4
+Servo panServo;
+int  panAngle = 90;          // servo degrees; 90 = straight ahead
+const uint16_t PAN_TRAVEL_MS = 450;
+
 #define PIN_PWMA  D5
 #define PIN_AIN1  D1
 #define PIN_AIN2  D2
@@ -54,7 +70,9 @@ const char* AP_PASS = "robocar123";      // минимум 8 символов
 #define PIN_BIN2  D0
 
 // ==================== ДВИЖЕНИЕ ====================
-int      MAX_PWM     = 80;    // подобрано опытно
+int      MAX_PWM     = 150;   // сервер поднимает его при каждом коннекте
+                              // (DEFAULT_MAX_PWM); 80 подбирали на голом
+                              // шасси, оно едва везёт Pi 5 с камерой
 int      MIN_PWM     = 40;
 uint32_t FAILSAFE_MS = 400;
 const int      RAMP_STEP = 8;
@@ -141,6 +159,10 @@ void applyBrake() {
   curL = curR = targetL = targetR = 0;
 }
 
+// Ниже MIN_PWM мотор гудит и греется, но колесо не крутится: заклиненный
+// коллекторный двигатель тянет СТОПОРНЫЙ ток -- самый большой, какой он вообще
+// потребляет, и весь он уходит в тепло. Поэтому команда внутри мёртвой зоны
+// хуже нуля: жрёт максимум батареи и не даёт движения.
 int scaleCmd(int v) {
   if (abs(v) < 5) return 0;
   int m = map(abs(v), 5, 255, MIN_PWM, MAX_PWM);
@@ -148,17 +170,66 @@ int scaleCmd(int v) {
   return v > 0 ? m : -m;
 }
 
+// Пара колёс масштабируется ОДНИМ множителем, а не каждое само по себе.
+//
+// Раньше каждое колесо гналось через scaleCmd отдельно, и это сжимало РАЗНИЦУ
+// между ними -- а разница и есть поворот. Замер: пара (200, 86), отношение
+// 0.43, выходила как (125, 75), отношение 0.60. Поворот слабел на ровном
+// месте, ещё до того как его начинала душить просадка аккумулятора.
+//
+// Здесь через кривую MIN..MAX проводится только большее колесо, а меньшее
+// получает тот же множитель. Отношение сохраняется точно; затем то, что
+// попало в мёртвую зону, поднимается до MIN_PWM или обнуляется -- висеть
+// внутри неё нельзя.
+void scalePair(int l, int r, int *outL, int *outR) {
+  int big = max(abs(l), abs(r));
+  if (big < 5) { *outL = 0; *outR = 0; return; }
+
+  int scaled = abs(scaleCmd(big));            // большее колесо на кривой
+  float k = (float)scaled / (float)big;       // общий множитель для обоих
+
+  int nl = (int)lroundf(l * k);
+  int nr = (int)lroundf(r * k);
+
+  // Меньшее колесо могло попасть в мёртвую зону. Поднимаем ВВЕРХ, а не
+  // обнуляем: команда чуть ниже порога и так стоит полного тока, так что
+  // выбросить это колесо значило бы потерять его вклад, уже оплаченный
+  // батареей.
+  if (nl != 0 && abs(nl) < MIN_PWM) nl = (nl > 0) ? MIN_PWM : -MIN_PWM;
+  if (nr != 0 && abs(nr) < MIN_PWM) nr = (nr > 0) ? MIN_PWM : -MIN_PWM;
+
+  *outL = constrain(nl, -255, 255);
+  *outR = constrain(nr, -255, 255);
+}
+
+// Колёса разгоняются СИНХРОННО, одной долей пути, а не каждое своим шагом.
+//
+// Раньше каждое колесо шло к своей цели по RAMP_STEP за тик. Если одному
+// колесу ехать дальше (а при повороте так всегда), то пока быстрое уже
+// доехало, медленное ещё в пути -- и всё это время реальная разница между
+// колёсами не та, что просили. Машина успевала «клюнуть» прямо, прежде чем
+// начать поворот. Здесь обе цели достигаются за одно и то же число тиков,
+// поэтому отношение колёс верное на всём разгоне.
 void updateRamp() {
   if (millis() - lastRampMs < RAMP_MS) return;
   lastRampMs = millis();
-  if (curL != targetL) {
-    curL += constrain(targetL - curL, -RAMP_STEP, RAMP_STEP);
-    applyMotor(true, curL);
+  if (curL == targetL && curR == targetR) return;
+
+  int dl = targetL - curL;
+  int dr = targetR - curR;
+  int biggest = max(abs(dl), abs(dr));
+  if (biggest <= RAMP_STEP) {
+    curL = targetL;
+    curR = targetR;
+  } else {
+    // Общая доля пути: большее из расхождений проходит ровно RAMP_STEP,
+    // меньшее -- пропорционально меньше.
+    float frac = (float)RAMP_STEP / (float)biggest;
+    curL += (int)lroundf(dl * frac);
+    curR += (int)lroundf(dr * frac);
   }
-  if (curR != targetR) {
-    curR += constrain(targetR - curR, -RAMP_STEP, RAMP_STEP);
-    applyMotor(false, curR);
-  }
+  applyMotor(true, curL);
+  applyMotor(false, curR);
 }
 
 void checkFailsafe() {
@@ -362,8 +433,7 @@ void runSelfTest() {
     {   0,   0, "стоп" },
   };
   for (uint8_t i = 0; i < sizeof(steps)/sizeof(steps[0]); i++) {
-    targetL = scaleCmd(steps[i].l);
-    targetR = scaleCmd(steps[i].r);
+    scalePair(steps[i].l, steps[i].r, &targetL, &targetR);
     lastCmdMs = millis();
     failsafeHit = false;
     uint32_t t0 = millis();
@@ -402,8 +472,8 @@ void handleCommand(char* c) {
   if (!strncmp(c, "M ", 2)) {
     int l = 0, r = 0;
     if (sscanf(c + 2, "%d %d", &l, &r) == 2) {
-      targetL = scaleCmd(constrain(l, -255, 255));
-      targetR = scaleCmd(constrain(r, -255, 255));
+      scalePair(constrain(l, -255, 255), constrain(r, -255, 255),
+                &targetL, &targetR);
       lastCmdMs = millis();
       failsafeHit = false;
       send(String("OK M ") + targetL + " " + targetR);
@@ -424,6 +494,21 @@ void handleCommand(char* c) {
                                 send(String("OK FAILSAFE = ") + FAILSAFE_MS); return; }
 
   if (!strcmp(c, "TEST"))   { runSelfTest(); return; }
+  if (!strncmp(c, "PAN ", 4)) {
+    // Refuse while moving: see the timer note at PIN_SERVO. The server
+    // enforces the same order, so this is a backstop, not the only guard.
+    if (curL != 0 || curR != 0 || targetL != 0 || targetR != 0) {
+      send("ERR PAN while driving"); return;
+    }
+    int deg = constrain(atoi(c + 4), -80, 80);
+    panAngle = 90 + deg;
+    panServo.attach(PIN_SERVO);
+    panServo.write(panAngle);
+    delay(PAN_TRAVEL_MS);
+    panServo.detach();
+    send(String("OK PAN ") + deg);
+    return;
+  }
   if (!strcmp(c, "PING"))   { send("PONG"); return; }
   if (!strcmp(c, "STATE"))  { send(String("STATE L=") + curL + " R=" + curR +
                                    " max=" + MAX_PWM + " min=" + MIN_PWM); return; }

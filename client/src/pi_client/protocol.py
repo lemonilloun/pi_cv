@@ -248,16 +248,122 @@ def make_scene_session_end_message(
     )
 
 
+def make_imu_cal_state_message(device_id: str, state: dict[str, object]) -> Message:
+    """Live state of the guided IMU calibration wizard (imu_calibration.py)
+    so the panel can tell the operator what to do right now. Pure display
+    telemetry — the measurement itself is complete on the Pi whether or not
+    anyone is watching, so the server just keeps the latest one."""
+    return make_message(
+        device_id=device_id,
+        message_type="imu_cal_state",
+        payload=state,
+    )
+
+
 def make_nav_query_message(
     device_id: str,
     clip_emb: list[float],
     depth_center_m: float | None = None,
+    fused: dict[str, object] | None = None,
+    imu: dict[str, object] | None = None,
 ) -> Message:
+    """`fused`: the Pi's own EKF state, so the panel can draw the filtered
+    pose next to the raw visual fix. Sent in METRES along the plan frame's
+    axes; the server projects it into display coordinates (it owns the
+    plan_frame). Optional — a vision-only run simply omits it.
+
+    `imu`: raw sensor attitude, deliberately a TOP-LEVEL field rather than
+    part of `fused`. The filter state only exists once the robot has been
+    localized at least once, but the server's localization spin needs the
+    heading precisely when it has NOT been localized yet — nesting the two
+    together produced a deadlock where the spin refused to start for want
+    of a heading that only a successful fix would have delivered.
+    """
     payload: dict[str, object] = {"clip_emb": clip_emb}
     if depth_center_m is not None:
         payload["depth_center_m"] = round(depth_center_m, 2)
+    if fused is not None:
+        payload["fused"] = fused
+    if imu is not None:
+        payload["imu"] = imu
     return make_message(
         device_id=device_id,
         message_type="nav_query",
         payload=payload,
+    )
+
+
+def make_time_sync_message(device_id: str, t0_pi_ns: int, seq: int = 0) -> Message:
+    """Ask the server for its monotonic clock so the two can be joined.
+
+    Carries the Pi's send-time so the server can echo it back; the Pi pairs
+    that with its own receive-time to get an RTT without needing the server
+    to track anything per-client. See shared/clock_sync.py for why the
+    minimum-RTT sample of a burst is the one to keep.
+    """
+    return make_message(
+        device_id=device_id,
+        message_type="time_sync",
+        payload={"t0_pi_ns": int(t0_pi_ns), "seq": int(seq)},
+    )
+
+
+# ----------------------------------------------------------------- VLA data
+# Behaviour-cloning episodes. Unlike scene_keyframe, these are sampled at a
+# FIXED rate: a policy learns a mapping from observation to action at a
+# regular control interval, so parallax-gated selection (which is right for
+# reconstruction) would hand it a time axis that stretches and compresses
+# with how fast the robot happened to be moving.
+
+
+def make_vla_session_start_message(
+    device_id: str,
+    episode_id: str,
+    task: str,
+    settings: dict[str, object],
+    clock: dict[str, object] | None = None,
+) -> Message:
+    """`clock`: the measured Pi<->Mac offset (shared/clock_sync). Sent up
+    front so the server can stamp frames into a single timeline even if the
+    episode is cut short."""
+    payload: dict[str, object] = {
+        "episode_id": episode_id,
+        "task": task,
+        "settings": settings,
+    }
+    if clock is not None:
+        payload["clock"] = clock
+    return make_message(
+        device_id=device_id, message_type="vla_session_start", payload=payload,
+    )
+
+
+def make_vla_frame_message(
+    device_id: str,
+    episode_id: str,
+    frame_idx: int,
+    t_pi_mono_ns: int,
+    jpeg_bytes: int,
+    imu: dict[str, object] | None = None,
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="vla_frame",
+        payload={
+            "episode_id": episode_id,
+            "frame_idx": frame_idx,
+            "t_pi_mono_ns": int(t_pi_mono_ns),
+            "jpeg_bytes": jpeg_bytes,
+            "imu": imu,
+        },
+    )
+
+
+def make_vla_session_end_message(
+    device_id: str, episode_id: str, episode_meta: dict[str, object]
+) -> Message:
+    return make_message(
+        device_id=device_id,
+        message_type="vla_session_end",
+        payload={"episode_id": episode_id, "episode_meta": episode_meta},
     )

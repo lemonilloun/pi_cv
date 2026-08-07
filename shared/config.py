@@ -43,6 +43,7 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
     session_config = config.setdefault("session", {})
     server_cv_config = config.setdefault("server_cv", {})
     monitoring_config = config.setdefault("monitoring", {})
+    scene3d_config = config.setdefault("scene3d", {})
     logging_config = config.setdefault("logging", {})
 
     if value := os.environ.get("PI_CV_SERVER_BIND_HOST"):
@@ -114,6 +115,14 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
         monitoring_config.setdefault("agent", {})["base_url"] = value
     if value := os.environ.get("PI_CV_MONITORING_DIGEST_INTERVAL_S"):
         monitoring_config.setdefault("agent", {})["digest_interval_s"] = float(value)
+
+    reconstruction_config = scene3d_config.setdefault("reconstruction", {})
+    if value := os.environ.get("PI_CV_SCENE3D_GPU_SERVICE_URL"):
+        reconstruction_config["gpu_service_url"] = value
+    if value := os.environ.get("PI_CV_SCENE3D_RECONSTRUCTION_BACKEND"):
+        reconstruction_config["backend"] = value
+    if value := os.environ.get("PI_CV_SCENE3D_RSYNC_HOST"):
+        reconstruction_config["rsync_host"] = value
 
     if value := os.environ.get("PI_CV_LOG_LEVEL"):
         logging_config["level"] = value

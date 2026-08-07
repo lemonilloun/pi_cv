@@ -192,3 +192,49 @@ class EmaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AssignmentsTest(unittest.TestCase):
+    """`assignments` exists to replace a bbox-keyed reverse lookup that
+    collapsed duplicate boxes. These tests pin the properties that made the
+    lookup wrong, so a future refactor cannot quietly reintroduce them."""
+
+    def test_aligned_to_the_input_list_including_filtered_detections(self) -> None:
+        tracker = make_tracker(min_confidence=0.5)
+        dets = [
+            det("person", [0, 0, 50, 100], conf=0.9),
+            det("tv", [200, 0, 260, 60], conf=0.9),       # excluded class
+            det("bottle", [300, 300, 340, 380], conf=0.1),  # below gate
+            det("laptop", [400, 400, 460, 460], conf=0.9),
+        ]
+        updates = tracker.update(dets, 0.0)
+        self.assertEqual(len(updates.assignments), len(dets))
+        # Kept detections get ids; declined ones get None — and crucially the
+        # positions still line up with the caller's list.
+        self.assertIsNotNone(updates.assignments[0])
+        self.assertIsNone(updates.assignments[1])
+        self.assertIsNone(updates.assignments[2])
+        self.assertIsNotNone(updates.assignments[3])
+        self.assertNotEqual(updates.assignments[0], updates.assignments[3])
+
+    def test_identical_boxes_get_distinct_ids(self) -> None:
+        # The exact case the old lookup lost: two proposals on the same box.
+        # Dense class-agnostic proposals produce nested and near-duplicate
+        # boxes routinely, so this is the normal case, not a curiosity.
+        tracker = make_tracker()
+        dets = [det("person", [10, 10, 60, 110]), det("laptop", [10, 10, 60, 110])]
+        updates = tracker.update(dets, 0.0)
+        ids = updates.assignments
+        self.assertEqual(len(ids), 2)
+        self.assertIsNotNone(ids[0])
+        self.assertIsNotNone(ids[1])
+        self.assertNotEqual(ids[0], ids[1])
+
+    def test_id_is_stable_across_ticks_for_the_same_object(self) -> None:
+        tracker = make_tracker()
+        first = tracker.update([det("person", [0, 0, 50, 100])], 0.0)
+        second = tracker.update([det("person", [2, 2, 52, 102])], 0.1)
+        self.assertEqual(first.assignments[0], second.assignments[0])
+
+    def test_empty_input_yields_empty_assignments(self) -> None:
+        self.assertEqual(make_tracker().update([], 0.0).assignments, [])

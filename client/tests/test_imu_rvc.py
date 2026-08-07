@@ -58,9 +58,31 @@ class ParseFrameTests(unittest.TestCase):
     def test_iter_frames_resyncs_after_one_bad_byte(self) -> None:
         good = make_frame(1, 0, 0, 0, 0, 0, 1000)
         buffer = b"\x00" + good + good  # one junk byte before two good frames
-        samples, remainder = iter_frames(buffer)
+        samples, remainder, resyncs = iter_frames(buffer)
         self.assertEqual(len(samples), 2)
         self.assertEqual(remainder, b"")
+        self.assertEqual(resyncs, 0)  # the junk byte is not a false header
+
+    def test_iter_frames_counts_a_corrupt_frame_as_a_resync(self) -> None:
+        """The counter is the link-health signal — a corrupt frame that still
+        starts with the header bytes has to be visible, not silently skipped.
+        The SHTP link's collapse went unnoticed for a session because nothing
+        counted this."""
+        good = make_frame(1, 0, 0, 0, 0, 0, 1000)
+        bad = good[:-1] + bytes([(good[-1] + 1) % 256])
+        samples, _, resyncs = iter_frames(bad + good)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(resyncs, 1)
+
+    def test_iter_frames_keeps_a_straddling_header(self) -> None:
+        """A read boundary in the middle of a frame must not lose it."""
+        good = make_frame(3, 0, 0, 0, 0, 0, 1000)
+        samples, remainder, _ = iter_frames(good[:10])
+        self.assertEqual(samples, [])
+        self.assertEqual(remainder, good[:10])
+        samples, remainder, _ = iter_frames(remainder + good[10:])
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].index, 3)
 
 
 class FitTiltModelTests(unittest.TestCase):
@@ -157,3 +179,36 @@ class ImuIntegratorDynamicGravityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class YawSignNormalizationTests(unittest.TestCase):
+    """RVC reports a COMPASS heading (clockwise positive); the plan frame is
+    counter-clockwise positive. Measured 2026-08-03 with two full turns
+    against a floor mark: gain -0.996 left, -1.003 right.
+
+    This matters more than a cosmetic convention. `Ekf2DHeading` models the
+    IMU as `z = theta - b`, and an additive datum offset can absorb any
+    constant but NOT a sign — with the sign wrong the filter steers its
+    heading estimate the wrong way on every turn, and the gravity calibration
+    cannot detect it because rotation about gravity leaves gravity unchanged.
+    """
+
+    def test_the_sign_is_negative_as_measured(self):
+        from pi_client.imu_rvc import YAW_SIGN
+
+        self.assertEqual(YAW_SIGN, -1.0)
+
+    def test_a_left_turn_comes_out_positive_after_normalization(self):
+        """Turning left is +360 in the plan frame; the sensor reports -358.4.
+        Downstream must see the plan-frame sense."""
+        from pi_client.imu_rvc import YAW_SIGN
+
+        sensor_reading = -358.41
+        self.assertGreater(YAW_SIGN * sensor_reading, 0.0)
+
+    def test_normalization_preserves_magnitude(self):
+        """A sign fix must not become a scale fix — the measured gain was
+        within 0.4% of unity, so nothing here may rescale."""
+        from pi_client.imu_rvc import YAW_SIGN
+
+        self.assertEqual(abs(YAW_SIGN), 1.0)

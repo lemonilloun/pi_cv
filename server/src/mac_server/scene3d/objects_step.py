@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mac_server.scene3d import depth_filter, occupancy
+from mac_server.scene3d.object_roles import (
+    AGGREGATE_CLASSES,
+    scale_plausibility,
+    ROLE_AREA,
+    classes_may_be_same,
+    load_roles,
+    vote_label,
+)
 from mac_server.scene3d.session_io import SceneSession
 
 
@@ -96,11 +104,27 @@ class ObjectBank:
         centroid_max_m: float = 0.5,
         class_gate: bool = True,
         size_gate_factor: float = 0.5,
+        arbiter: Callable[[bytes, bytes], bool | None] | None = None,
+        arbiter_band: float = 0.15,
     ) -> None:
         self.dino_cos_min = dino_cos_min
         self.centroid_max_m = centroid_max_m
         self.class_gate = class_gate
         self.size_gate_factor = size_gate_factor
+        # Asked only about borderline pairs: cosine inside `arbiter_band`
+        # BELOW the accept threshold, where geometry already agrees. Above the
+        # threshold the embeddings have decided; far below, they have decided
+        # the other way. The band is the only place a second opinion changes
+        # anything, and it keeps the number of VLM calls proportional to the
+        # genuinely ambiguous cases rather than to the detection count.
+        #
+        # A None verdict (model unreachable, unparseable reply) must NOT read
+        # as "different": an outage would then silently double every object in
+        # the room. It falls through to the existing embedding decision.
+        self.arbiter = arbiter
+        self.arbiter_band = arbiter_band
+        self.arbiter_calls = 0
+        self.arbiter_merges = 0
         self.objects: list[dict[str, Any]] = []
         self._by_track: dict[int, int] = {}  # pi track_id -> object idx
 
@@ -115,9 +139,22 @@ class ObjectBank:
         return self.centroid_max_m + self.size_gate_factor * diag
 
     def _compatible(self, obj: dict[str, Any], candidate: dict[str, Any]) -> bool:
+        """Is a label disagreement reason enough to refuse a merge?
+
+        It used to be `candidate["class"] in obj["classes"]` — an exact match.
+        That was defensible with COCO, where a detection that fired at all was
+        usually right. It is wrong with the indoor fine-tune: measured on one
+        snapshot, the same box came back as `cabinet 0.339` AND `door 0.339`,
+        so an exact gate splits one piece of furniture into two objects
+        standing in the same place. Now any class the object has already been
+        called counts, and confusable pairs (large flat vertical surfaces, seat
+        furniture) are forgiven — see object_roles.CONFUSABLE_GROUPS. Distinct
+        classes from different groups still block, so a chair and a fridge
+        cannot merge on appearance alone.
+        """
         if not self.class_gate:
             return True
-        return candidate["class"] in obj["classes"]
+        return any(classes_may_be_same(candidate["class"], seen) for seen in obj["classes"])
 
     def add(self, candidate: dict[str, Any]) -> int:
         """candidate: {track_id, class, centroid(3), dino_emb, clip_emb?,
@@ -139,6 +176,7 @@ class ObjectBank:
             del self._by_track[track_id]  # id was recycled; re-associate below
 
         best_idx, best_cos = None, 0.0
+        borderline_idx, borderline_cos = None, 0.0
         for idx, obj in enumerate(self.objects):
             if not self._compatible(obj, candidate):
                 continue
@@ -148,6 +186,22 @@ class ObjectBank:
             cos = cosine(obj["dino_emb"], candidate["dino_emb"])
             if cos > self.dino_cos_min and cos > best_cos:
                 best_idx, best_cos = idx, cos
+            elif (self.dino_cos_min - self.arbiter_band) < cos <= self.dino_cos_min \
+                    and cos > borderline_cos:
+                borderline_idx, borderline_cos = idx, cos
+
+        if best_idx is None and borderline_idx is not None and self.arbiter is not None:
+            # Geometry says these could be the same and appearance is
+            # undecided. This is exactly the question a human answers instantly
+            # from two pictures, so ask the vision model.
+            obj = self.objects[borderline_idx]
+            crop_a, crop_b = obj.get("crop_jpeg"), candidate.get("crop_jpeg")
+            if crop_a and crop_b:
+                self.arbiter_calls += 1
+                verdict = self.arbiter(crop_a, crop_b)
+                if verdict is True:
+                    self.arbiter_merges += 1
+                    best_idx = borderline_idx
 
         if best_idx is not None:
             self._merge(best_idx, candidate)
@@ -158,6 +212,9 @@ class ObjectBank:
         points = candidate.get("points")
         obj = {
             "classes": {candidate["class"]: 1},
+            # Summed confidence per class, not just a tally: six weak `wall`
+            # guesses should not outvote two strong `cabinet` ones.
+            "class_conf": {candidate["class"]: float(candidate.get("confidence", 1.0))},
             "centroid": list(candidate["centroid"]),
             "dino_emb": list(candidate["dino_emb"]),
             "clip_embs": [candidate["clip_emb"]] if candidate.get("clip_emb") else [],
@@ -166,6 +223,10 @@ class ObjectBank:
             "points": [points] if points is not None else [],
             "aabb_min": None,
             "aabb_max": None,
+            # Kept for the arbiter to show the vision model later. The first
+            # view is not necessarily the best one; describe_step re-picks
+            # views by visibility when it writes the crops out.
+            "crop_jpeg": candidate.get("crop_jpeg"),
         }
         self.objects.append(obj)
         idx = len(self.objects) - 1
@@ -208,6 +269,9 @@ class ObjectBank:
             self._grow_aabb(obj, candidate["points"])
         obj["n_observations"] = n + 1
         obj["keyframes"].append(candidate.get("keyframe"))
+        conf = obj.setdefault("class_conf", {})
+        conf[candidate["class"]] = conf.get(candidate["class"], 0.0) + float(
+            candidate.get("confidence", 1.0))
 
     def finalize(self, min_observations: int = 3) -> list[dict[str, Any]]:
         import numpy as np
@@ -217,6 +281,7 @@ class ObjectBank:
             if obj["n_observations"] < min_observations:
                 continue
             classes = sorted(obj["classes"].items(), key=lambda kv: -kv[1])
+            top, agreement = vote_label(obj["classes"], obj.get("class_conf"))
             clip_emb = None
             if obj["clip_embs"]:
                 mean = np.mean(np.asarray(obj["clip_embs"]), axis=0)
@@ -224,8 +289,12 @@ class ObjectBank:
                 clip_emb = [float(v) for v in mean / norm]
             final.append(
                 {
-                    "class_top": classes[0][0],
+                    "class_top": top,
                     "class_votes": dict(classes),
+                    # How much of the confidence mass the winning name holds.
+                    # Low means the detector never settled — worth passing to
+                    # the VLM as "probably X" rather than asserting X.
+                    "label_agreement": round(float(agreement), 3),
                     "centroid": [round(float(v), 3) for v in obj["centroid"]],
                     "n_observations": obj["n_observations"],
                     "keyframes": [k for k in obj["keyframes"] if k is not None],
@@ -384,10 +453,19 @@ def run_objects_step(
     import open3d as o3d
 
     obj_cfg = config.get("objects", {})
+    emb_cfg = config.get("embeddings", {})
     intr = session.active_intrinsics(float(config.get("fallback_hfov_deg", 75.0)))
     poses = session.load_poses()
-    progress("loading DINOv2 (first run downloads it, cached after)")
-    embedder = DinoEmbedder(device=str(obj_cfg.get("device", "mps")))
+    if str(emb_cfg.get("backend", "remote")).lower() == "remote":
+        from mac_server.scene3d.gpu_client import RemoteDinoEmbedder
+
+        progress("using remote DINOv2 (gpu_service, dinov2_vitg14)")
+        embedder = RemoteDinoEmbedder(
+            base_url=str(emb_cfg.get("gpu_service_url", "http://127.0.0.1:8700"))
+        )
+    else:
+        progress("loading DINOv2 locally (first run downloads it, cached after)")
+        embedder = DinoEmbedder(device=str(obj_cfg.get("device", "mps")))
     bank = ObjectBank(
         dino_cos_min=float(obj_cfg.get("dino_cos_min", 0.6)),
         centroid_max_m=float(obj_cfg.get("centroid_max_m", 0.5)),
@@ -417,6 +495,19 @@ def run_objects_step(
     started = time.monotonic()
     oversized_skipped = 0
     detections_processed = 0
+    area_skipped = 0
+    floor_points: list[int] = []
+    # Roles come from the same file that defines the class ids, so adding a
+    # class in one place cannot leave the reconstruction guessing what to do
+    # with it. An empty map (old COCO sessions) means every class is an object,
+    # which is exactly the previous behaviour.
+    roles_path = Path(__file__).resolve().parents[4] / "config/seg_classes_indoor.json"
+    class_roles: dict[str, str] = {}
+    if roles_path.exists():
+        try:
+            class_roles = load_roles(roles_path)
+        except Exception as exc:  # noqa: BLE001 - a bad config must not abort a run
+            logger.warning("Could not read class roles from %s: %s", roles_path, exc)
     for done, kf in enumerate(frames, 1):
         depth_path = (
             session.depth_filtered_path(kf.index) if use_filtered
@@ -427,21 +518,34 @@ def run_objects_step(
             if not depth_path.exists():
                 continue
         depth = np.load(depth_path).astype(np.float32)
-        masks = kf.masks()
         bgr = kf.rgb_bgr()
         meta = kf.meta()
         wfc = poses[kf.index]
-        if masks.shape[:2] != depth.shape[:2]:
-            # Instance ids are labels, not intensities — nearest only.
-            masks = cv2.resize(
-                masks, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST
-            )
         depth_intr = depth_filter.intrinsics_for_shape(intr, depth.shape)
-        frame_area = masks.shape[0] * masks.shape[1]
+        frame_area = depth.shape[0] * depth.shape[1]
 
         for det in meta.get("detections", []):
-            instance_id = det.get("instance_id")
-            mask = masks == instance_id
+            det_class = str(det.get("class_coco") or det.get("class") or "?")
+            role = class_roles.get(det_class)
+            if role == ROLE_AREA and det_class not in AGGREGATE_CLASSES:
+                # `wall` and `ceiling` are regions, not things. On the 53-frame
+                # session the fine-tuned detector returned 50 walls out of 112
+                # detections; instancing them would bury the actual furniture
+                # on the floor plan while adding nothing — where the room ends
+                # is already in the occupancy grid and the mesh.
+                area_skipped += 1
+                continue
+            if det_class in AGGREGATE_CLASSES:
+                # `floor` gets ONE record for the whole session rather than one
+                # per fragment: the robot drives on it, so the useful answer is
+                # a single drivable region with a nominal centre.
+                floor_points.append(kf.index)
+                area_skipped += 1
+                continue
+            # Resolved per detection and resized to the depth grid by the
+            # accessor, which also hides whether this session stored a label
+            # image or a mask stack.
+            mask = kf.instance_mask(det.get("instance_id"), depth.shape[:2])
             mask_area = int(mask.sum())
             if mask_area < 200:
                 continue
@@ -501,7 +605,8 @@ def run_objects_step(
         eta_s = (len(frames) - done) / rate if rate > 0 else None
         progress(
             f"objects {done}/{len(frames)} keyframes "
-            f"({detections_processed} objects, {oversized_skipped} oversized masks skipped)"
+            f"({detections_processed} objects, {oversized_skipped} oversized masks "
+            f"skipped, {area_skipped} area-class detections skipped)"
             + (f", ~{eta_s:.0f}s left" if eta_s is not None else "")
         )
 
@@ -562,8 +667,23 @@ def run_objects_step(
         "detections_processed": detections_processed,
         "oversized_masks_skipped": oversized_skipped,
         "depth_source": "filtered" if use_filtered else "raw",
+        "area_class_detections_skipped": area_skipped,
         "size_verdicts": size_flags,
+        # Whether the whole reconstruction is room-sized. Distinct from
+        # size_verdicts, which flags individual objects: a per-object failure
+        # is usually a one-sided view, while a consistent ratio across objects
+        # points at the global scale.
+        "scale_check": scale_plausibility(export),
     }
+    scale_check = report["scale_check"]
+    if scale_check.get("checked") and not scale_check.get("plausible"):
+        # Louder than the per-object flag on purpose: a wrong global scale
+        # crops the room at depth truncation and pushes real walls outside the
+        # floor plan's height band, which shows up as a starburst of rays with
+        # no walls rather than as an obviously broken number.
+        logger.error("SCALE LOOKS WRONG: %s", scale_check["warning"])
+        report["scale_warning"] = scale_check["warning"]
+
     implausible = sum(v for k, v in size_flags.items() if k not in ("ok", "no_box"))
     if implausible:
         report["warning"] = (

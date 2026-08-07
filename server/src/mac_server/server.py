@@ -15,10 +15,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mac_server.handlers import SessionContext, handle_message
+from mac_server.handlers import (
+    SessionContext,
+    handle_message,
+    set_action_log,
+    set_robot_service,
+)
 from mac_server.preview import FrameStoreHub, MjpegPreviewServer
 from mac_server.protocol import make_error_response
 from mac_server.registry import ClientRegistry, TelemetryStore
+from mac_server.robocar import RobocarService
+from mac_server.vla.action_log import ActionLog
 from shared.config import load_config
 from shared.framing import receive_packet, send_packet
 from shared.messages import Message
@@ -43,6 +50,7 @@ class MacServer:
         mapping_config: dict[str, Any] | None = None,
         monitoring_config: dict[str, Any] | None = None,
         scene3d_config: dict[str, Any] | None = None,
+        robot_enabled: bool = True,
     ) -> None:
         self.host = host
         self.port = port
@@ -56,6 +64,18 @@ class MacServer:
         self.room_store, self.scan_controller = self._build_mapping(mapping_config or {})
         self.monitor_controller = self._build_monitoring(monitoring_config or {})
         self.scene_pipeline = self._build_scene3d(scene3d_config or {})
+        # The RoboCar drive link. Optional and non-fatal: a bound port or an
+        # absent chassis must not stop the panel from serving the camera,
+        # the map and the monitoring stack.
+        # One action log, owned by the server and shared with the drive link.
+        # Always on (it is a bounded ring buffer); it only writes to disk once
+        # an episode is started.
+        self.action_log = ActionLog()
+        self.robocar = (
+            RobocarService(action_log=self.action_log) if robot_enabled else None
+        )
+        set_robot_service(self.robocar)
+        set_action_log(self.action_log)
         self.preview_server = (
             MjpegPreviewServer(
                 preview_host,
@@ -68,6 +88,7 @@ class MacServer:
                 room_store=self.room_store,
                 monitor_controller=self.monitor_controller,
                 scene_pipeline=self.scene_pipeline,
+                robocar=self.robocar,
             )
             if preview_enabled
             else None
@@ -140,6 +161,7 @@ class MacServer:
                     timeout_s=float(agent_config.get("timeout_s", 20.0)),
                     max_input_tokens=int(agent_config.get("max_input_tokens", 2500)),
                     max_output_tokens=int(agent_config.get("max_output_tokens", 400)),
+                    chat_template_kwargs=agent_config.get("chat_template_kwargs"),
                 )
             except Exception as exc:
                 logger.warning("Monitoring agent disabled: %s", exc)
@@ -148,14 +170,25 @@ class MacServer:
         vision_config = monitoring_config.get("vision", {})
         if vision_config.get("enabled", False):
             try:
-                from mac_server.monitoring.vision import OllamaVisionClient
+                backend = str(vision_config.get("backend", "qwen")).lower()
+                if backend == "qwen":
+                    from mac_server.monitoring.vision import QwenVisionClient
 
-                vision = OllamaVisionClient(
-                    base_url=str(vision_config.get("base_url", "http://127.0.0.1:11434")),
-                    model=str(vision_config.get("model", "gemma4:e4b-it-qat")),
-                    timeout_s=float(vision_config.get("timeout_s", 30.0)),
-                    keep_alive=str(vision_config.get("keep_alive", "0s")),
-                )
+                    vision = QwenVisionClient(
+                        base_url=str(vision_config.get("base_url", "http://172.25.6.176:8000")),
+                        model=str(vision_config.get("model", "Qwen/Qwen3.5-9B")),
+                        timeout_s=float(vision_config.get("timeout_s", 30.0)),
+                        chat_template_kwargs=vision_config.get("chat_template_kwargs"),
+                    )
+                else:
+                    from mac_server.monitoring.vision import OllamaVisionClient
+
+                    vision = OllamaVisionClient(
+                        base_url=str(vision_config.get("base_url", "http://127.0.0.1:11434")),
+                        model=str(vision_config.get("model", "gemma4:e4b-it-qat")),
+                        timeout_s=float(vision_config.get("timeout_s", 30.0)),
+                        keep_alive=str(vision_config.get("keep_alive", "0s")),
+                    )
             except Exception as exc:
                 logger.warning("Monitoring vision captioning disabled: %s", exc)
 
@@ -195,6 +228,9 @@ class MacServer:
 
         self._socket = server_socket
         logger.info("Server listening on %s:%s", self.host, self.port)
+        if self.robocar is not None and not self.robocar.start():
+            logger.warning("RoboCar link did not start — driving is unavailable, "
+                           "everything else is unaffected.")
         if self.preview_server is not None:
             self.preview_server.start()
         if self.cv_worker is not None:
@@ -240,6 +276,8 @@ class MacServer:
             self._socket.close()
             self._socket = None
             logger.info("Server stopped")
+        if self.robocar is not None:
+            self.robocar.stop()
         if self.preview_server is not None:
             self.preview_server.stop()
 
@@ -330,6 +368,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-port", type=int, help="HTTP MJPEG preview port")
     parser.add_argument("--no-preview", action="store_true", help="Disable HTTP MJPEG preview server")
     parser.add_argument("--no-cv", action="store_true", help="Disable server-side CV worker and mapping")
+    parser.add_argument("--no-robot", action="store_true",
+                        help="Disable the RoboCar drive link (UDP 5001 discovery + TCP 5000)")
     return parser.parse_args()
 
 
@@ -371,6 +411,7 @@ def main() -> int:
         mapping_config=mapping_config,
         monitoring_config=monitoring_config,
         scene3d_config=scene3d_config,
+        robot_enabled=not args.no_robot,
     )
     try:
         server.serve_forever(once=args.once)

@@ -1,0 +1,16 @@
+# Install torch/torchvision separately first, matched to pdfserver's CUDA
+# driver (see scripts/deploy_gpu_service.sh) - a plain `torch` line here
+# would pull a CPU-only wheel from PyPI.
+fastapi
+uvicorn[standard]
+
+# VGGT's own deps (vggt itself is `pip install -e`'d from a sibling clone
+# of facebookresearch/vggt by deploy_gpu_service.sh, not listed here).
+huggingface_hub
+einops
+safetensors
+
+# M3: DINOv2 (via torch.hub, no extra package) + CLIP embeddings.
+open_clip_torch
+pillow
+

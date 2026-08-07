@@ -43,8 +43,8 @@
     "torch_threads": 3
   },
   "server_cv": {
-    "enabled": true,
-    "device": "mps",
+    "enabled": false,
+    "device": "cpu",
     "depth_model_path": "models/depth_anything_v2_metric_hypersim_vits.pth",
     "depth_encoder": "vits",
     "depth_input_size": 392,
@@ -61,7 +61,7 @@
       0.1,
       2.0
     ],
-    "camera_height_m": 0.3,
+    "camera_height_m": 0.13,
     "hfov_deg": 102.0,
     "vfov_deg": 67.0,
     "point_stride": 4,
@@ -78,12 +78,25 @@
   "scene3d": {
     "sessions_dir": "data/scene_sessions",
     "fallback_hfov_deg": 75.0,
+    "reconstruction": {
+      "backend": "vggt",
+      "gpu_service_url": "http://127.0.0.1:8700",
+      "rsync_host": "pdfserver",
+      "remote_sessions_dir": "~/cv_research/sessions",
+      "request_timeout_s": 1800,
+      "scale_source": "auto",
+      "camera_height_m": 0.095
+    },
+    "embeddings": {
+      "backend": "remote",
+      "gpu_service_url": "http://127.0.0.1:8700"
+    },
     "depth": {
       "model_path": "models/depth_anything_v2_metric_hypersim_vitb.pth",
       "encoder": "vitb",
       "input_size": 518,
       "max_depth_m": 20.0,
-      "device": "mps"
+      "device": "cpu"
     },
     "poses": {
       "matching_mode": "auto",
@@ -114,7 +127,7 @@
       "wall_min_cells": 12
     },
     "objects": {
-      "device": "mps",
+      "device": "cpu",
       "dino_cos_min": 0.6,
       "centroid_max_m": 0.5,
       "min_observations": 3,
@@ -143,7 +156,7 @@
     }
   },
   "monitoring": {
-    "enabled": true,
+    "enabled": false,
     "data_dir": "data/monitoring",
     "min_confidence": 0.35,
     "anchor_classes": [
@@ -175,7 +188,7 @@
     "embeddings": {
       "enabled": true,
       "model": "MobileCLIP-S1",
-      "device": "mps"
+      "device": "cpu"
     },
     "qa": {
       "key_moments_per_digest": 3,
@@ -189,21 +202,26 @@
     "max_snapshot_mb": 200,
     "agent": {
       "enabled": true,
-      "auto_start": true,
-      "base_url": "http://127.0.0.1:11500",
-      "model": "apple-foundationmodel",
+      "managed": false,
+      "base_url": "http://172.25.6.176:8000",
+      "model": "Qwen/Qwen3.5-9B",
       "digest_interval_s": 300,
-      "timeout_s": 20,
-      "max_input_tokens": 2500,
-      "max_output_tokens": 400
+      "timeout_s": 30,
+      "max_input_tokens": 6000,
+      "max_output_tokens": 600,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
     },
     "vision": {
-      "enabled": false,
-      "auto_start": true,
-      "base_url": "http://127.0.0.1:11434",
-      "model": "gemma4:e4b-it-qat",
-      "keep_alive": "0s",
-      "timeout_s": 120,
+      "enabled": true,
+      "backend": "qwen",
+      "base_url": "http://172.25.6.176:8000",
+      "model": "Qwen/Qwen3.5-9B",
+      "timeout_s": 30,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      },
       "crop_margin_frac": 0.15,
       "caption_events": [
         "on"

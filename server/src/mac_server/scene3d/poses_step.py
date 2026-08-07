@@ -217,6 +217,13 @@ def imu_scale_samples(
         previous = index - 1
         if previous not in centers or index not in centers:
             continue
+        # The recorder marks a segment when gravity could not be justified for
+        # it (rig outside the pose the calibration was measured in). A
+        # doubly-integrated distance built on a gravity vector the driver
+        # itself refused to publish is not a measurement. Absent field = an
+        # older session, trusted as before.
+        if segment.get("gravity_ok") is False:
+            continue
         distance_m = float(segment.get("distance_m") or 0.0)
         if distance_m < min_distance_m:
             continue

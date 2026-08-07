@@ -18,6 +18,8 @@ via the stored pose, where in it / which way the camera points.
 
 from __future__ import annotations
 
+import json
+
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -63,16 +65,26 @@ def run_navindex_step(
     import numpy as np
 
     graph_cfg = config.get("graph", {})
+    emb_cfg = config.get("embeddings", {})
     poses = session.load_poses()
     frames = [kf for kf in session.keyframes() if kf.index in poses]
     if not frames:
         raise RuntimeError("No posed keyframes — run the poses step first")
 
-    encoder = ClipFrameEncoder(
-        model_name=str(graph_cfg.get("clip_text_model", "RN50x4")),
-        pretrained=str(graph_cfg.get("clip_text_pretrained", "openai")),
-        device=str(config.get("depth", {}).get("device", "mps")),
-    )
+    # MUST stay RN50x4/openai regardless of backend — see graph_step.py's
+    # module docstring on why (Pi-side Hailo hef embedding space parity).
+    if str(emb_cfg.get("backend", "remote")).lower() == "remote":
+        from mac_server.scene3d.gpu_client import RemoteClipEncoder
+
+        encoder = RemoteClipEncoder(
+            base_url=str(emb_cfg.get("gpu_service_url", "http://127.0.0.1:8700"))
+        )
+    else:
+        encoder = ClipFrameEncoder(
+            model_name=str(graph_cfg.get("clip_text_model", "RN50x4")),
+            pretrained=str(graph_cfg.get("clip_text_pretrained", "openai")),
+            device=str(config.get("depth", {}).get("device", "mps")),
+        )
 
     kf_indices, embs, positions, forwards = [], [], [], []
     for done, kf in enumerate(frames, 1):
@@ -85,6 +97,23 @@ def run_navindex_step(
         if done % 10 == 0 or done == len(frames):
             progress(f"navindex {done}/{len(frames)}")
 
+    # Stamp the metric scale these positions were built at. The index stores
+    # world coordinates, so it is only meaningful against the poses.json that
+    # produced it — re-running `reconstruct` with a different scale and NOT
+    # re-running this step leaves the navigation reporting the robot at
+    # coordinates from the previous geometry. Measured: after a scale fix from
+    # 25.62 to 1.515 the stale index still held positions spanning 24 m while
+    # the new floor plan was 4 m across, so the live marker landed off the plan
+    # entirely and simply stopped being drawn — silent, and easy to blame on
+    # navigation rather than on a step that was skipped.
+    built_scale = None
+    poses_path = session.derived / "poses.json"
+    if poses_path.exists():
+        try:
+            built_scale = json.loads(poses_path.read_text(encoding="utf-8")).get("scale")
+        except (OSError, ValueError):
+            pass
+
     out = session.derived / "place_index.npz"
     np.savez_compressed(
         out,
@@ -92,7 +121,10 @@ def run_navindex_step(
         embs=np.asarray(embs, dtype=np.float16),
         positions=np.asarray(positions, dtype=np.float32),
         forwards=np.asarray(forwards, dtype=np.float32),
+        built_scale=np.asarray([-1.0 if built_scale is None else float(built_scale)],
+                               dtype=np.float64),
     )
-    report = {"frames": len(kf_indices), "dim": int(np.asarray(embs).shape[1])}
+    report = {"frames": len(kf_indices), "dim": int(np.asarray(embs).shape[1]),
+              "built_scale": built_scale}
     logger.info("Nav index done: %s", report)
     return report

@@ -281,22 +281,34 @@ class MonitorController:
         return {"scene_id": scene["scene_id"]}
 
     def _start_ai_services(self) -> None:
-        self._apfel_process = _maybe_start_service(
-            self._config.get("agent", {}),
-            binary_name="apfel",
-            build_args=lambda host, port: ["apfel", "--serve", "--host", host, "--port", str(port)],
-            log_path=self.store.data_dir / "apfel.log",
-            default_port=11500,
-        )
+        # "managed"/backend="ollama" mean a local binary this process might
+        # need to spawn (and must remember to kill). The default agent/
+        # vision backend now points at the already-running Qwen vLLM
+        # instance on pdfserver — external infrastructure this process
+        # must never spawn OR kill, so both auto-start calls are skipped
+        # entirely rather than let _maybe_start_service's "already
+        # listening" probe merely happen to no-op correctly (it would,
+        # since Qwen is reachable — but skipping is the honest way to say
+        # "not ours to manage", and keeps the logs from claiming "apfel"/
+        # "ollama" is what's actually listening there).
+        if self._config.get("agent", {}).get("managed", False):
+            self._apfel_process = _maybe_start_service(
+                self._config.get("agent", {}),
+                binary_name="apfel",
+                build_args=lambda host, port: ["apfel", "--serve", "--host", host, "--port", str(port)],
+                log_path=self.store.data_dir / "apfel.log",
+                default_port=11500,
+            )
         # Ollama takes no host/port CLI flags — it reads OLLAMA_HOST from env.
-        self._ollama_process = _maybe_start_service(
-            self._config.get("vision", {}),
-            binary_name="ollama",
-            build_args=lambda host, port: ["ollama", "serve"],
-            build_env=lambda host, port: {"OLLAMA_HOST": f"{host}:{port}"},
-            log_path=self.store.data_dir / "ollama.log",
-            default_port=11434,
-        )
+        if str(self._config.get("vision", {}).get("backend", "qwen")).lower() == "ollama":
+            self._ollama_process = _maybe_start_service(
+                self._config.get("vision", {}),
+                binary_name="ollama",
+                build_args=lambda host, port: ["ollama", "serve"],
+                build_env=lambda host, port: {"OLLAMA_HOST": f"{host}:{port}"},
+                log_path=self.store.data_dir / "ollama.log",
+                default_port=11434,
+            )
 
     def _stop_ai_services(self) -> None:
         _terminate_service(self._apfel_process, "apfel")
