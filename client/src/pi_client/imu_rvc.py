@@ -67,6 +67,7 @@ import math
 import statistics
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -704,6 +705,13 @@ class RvcReader:
                     else:
                         self._yaw_unwrapped += (raw - self._yaw_last_raw + 180.0) % 360.0 - 180.0
                     self._yaw_last_raw = raw
+                # ImuSample is FROZEN, so the stamped fields are set by
+                # rebuilding each sample rather than by assignment. Assigning
+                # raised FrozenInstanceError and killed the reader thread on
+                # the first frame — the port then looked dead ("no valid RVC
+                # frame within 2.0s") and the failure read like a wiring fault
+                # rather than a code one.
+                stamped = []
                 for sample in samples:
                     # The wire index wraps at 256; turn it into a running count
                     # so the clock model sees a straight line. Gaps are added
@@ -715,8 +723,11 @@ class RvcReader:
                         step = (sample.index - self._seq_last_index) & 0xFF
                         self._seq += step if step else 256
                     self._seq_last_index = sample.index
-                    sample.seq = self._seq
-                    sample.t_grid = self._clock.update(self._seq, sample.monotonic)
+                    stamped.append(dataclasses.replace(
+                        sample,
+                        seq=self._seq,
+                        t_grid=self._clock.update(self._seq, sample.monotonic)))
+                samples = stamped
                 self._samples.extend(samples)
                 cutoff = now - self.window_s
                 self._samples = [s for s in self._samples if s.monotonic >= cutoff]

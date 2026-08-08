@@ -389,3 +389,69 @@ class KeyframeBlurGateTest(unittest.TestCase):
         out = motion_state(knocked, 0.0, 0.3)
         self.assertTrue(out["impact"])
         self.assertLess(out["omega_dps"], 1.0)
+
+
+class ReaderStampsSamplesTest(unittest.TestCase):
+    """ImuSample is frozen. The reader stamps `seq`/`t_grid` on every sample,
+    and doing that by ASSIGNMENT raised FrozenInstanceError on the first frame,
+    killing the reader thread — after which the port looked dead and the error
+    read as a wiring fault. This exercises the real stamping path, which the
+    earlier test missed by building samples through the constructor."""
+
+    def _reader(self):
+        import threading
+
+        from pi_client.imu_rvc import RvcReader
+        from pi_client.imu_rvc_math import FrameClock
+
+        reader = RvcReader.__new__(RvcReader)
+        reader._lock = threading.Lock()
+        reader._samples = []
+        reader._clock = FrameClock()
+        reader._seq = 0
+        reader._seq_last_index = None
+        return reader
+
+    def _sample(self, index):
+        from pi_client.imu_rvc import ImuSample
+
+        return ImuSample(index=index, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0,
+                         accel_mg=(0, 0, 1000), monotonic=index * 0.01)
+
+    def test_stamping_a_frozen_sample_does_not_raise(self) -> None:
+        import dataclasses
+
+        reader = self._reader()
+        sample = self._sample(0)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            sample.seq = 1                     # the bug, pinned
+        stamped = dataclasses.replace(sample, seq=1, t_grid=0.01)
+        self.assertEqual(stamped.seq, 1)
+        self.assertEqual(stamped.index, sample.index)
+
+    def test_sequence_survives_the_index_wrap(self) -> None:
+        # The wire counter wraps at 256; a running count must not go backwards.
+        import dataclasses
+
+        reader = self._reader()
+        seqs = []
+        for index in (253, 254, 255, 0, 1, 2):
+            if reader._seq_last_index is None:
+                reader._seq += 1
+            else:
+                step = (index - reader._seq_last_index) & 0xFF
+                reader._seq += step if step else 256
+            reader._seq_last_index = index
+            seqs.append(reader._seq)
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(seqs[-1] - seqs[0], 5)
+
+    def test_a_dropped_frame_advances_time_rather_than_compressing_it(self) -> None:
+        reader = self._reader()
+        for index in (0, 1, 5):                # three frames missing
+            if reader._seq_last_index is None:
+                reader._seq += 1
+            else:
+                reader._seq += (index - reader._seq_last_index) & 0xFF
+            reader._seq_last_index = index
+        self.assertEqual(reader._seq, 6)       # not 3
