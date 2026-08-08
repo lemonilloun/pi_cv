@@ -857,6 +857,32 @@ class DriveCommand:
     form: str = "wheels"        # "wheels" (explicit) or "mixed" (from intent)
 
 
+_TRIM_CACHE: dict[str, float] | None = None
+
+
+def _wheel_trim() -> dict[str, float]:
+    """Подстройка колёс из конфига, читается один раз за процесс.
+
+    Файл, а не аргумент: `parse_drive_payload` — функция модуля, её зовут из
+    HTTP-обработчика без доступа к конфигу сервера, и протаскивать его через
+    всю цепочку ради двух чисел значит менять сигнатуры на пути.
+    Кэш за процесс, поэтому после правки подстройки сервер надо перезапустить
+    — скрипт замера об этом прямо предупреждает.
+    """
+    global _TRIM_CACHE
+    if _TRIM_CACHE is None:
+        _TRIM_CACHE = {"left": 1.0, "right": 1.0}
+        try:
+            path = Path(__file__).resolve().parents[3] / "config/default.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            trim = (data.get("robot") or {}).get("wheel_trim") or {}
+            _TRIM_CACHE = {"left": float(trim.get("left", 1.0)),
+                           "right": float(trim.get("right", 1.0))}
+        except Exception:  # noqa: BLE001 — без конфига едем без подстройки
+            pass
+    return _TRIM_CACHE
+
+
 def parse_drive_payload(body: bytes) -> DriveCommand | None:
     """Accept either explicit wheel PWMs or a (throttle, steer, speed) trio.
 
@@ -881,6 +907,8 @@ def parse_drive_payload(body: bytes) -> DriveCommand | None:
         speed = int(payload.get("speed", 160))
     except (TypeError, ValueError):
         return None
-    left, right = mix_drive(throttle, steer, speed)
+    trim = _wheel_trim()
+    left, right = mix_drive(throttle, steer, speed,
+                            trim_left=trim["left"], trim_right=trim["right"])
     return DriveCommand(left=left, right=right, throttle=throttle,
                         steer=steer, speed=speed, form="mixed")
