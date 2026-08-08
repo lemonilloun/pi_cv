@@ -364,3 +364,28 @@ class MountOffsetTest(unittest.TestCase):
     def test_calibration_without_the_section(self) -> None:
         reader = self._reader({"mode": "full"})
         self.assertEqual(reader.mount_offsets_deg, (0.0, 0.0))
+
+
+class KeyframeBlurGateTest(unittest.TestCase):
+    """Пороги отбраковки кадров по IMU (§7.5). Резкость по Лапласиану ловит
+    смаз постфактум; курс говорит, что кадр мажется прямо сейчас."""
+
+    def _still(self, n=30):
+        return [(0.0, 0.0, 9.81) for _ in range(n)]
+
+    def test_fast_turn_is_over_the_blur_threshold(self) -> None:
+        # 20 град/с при выдержке 1/30 с — уже смаз.
+        out = motion_state(self._still(), math.radians(6.0), 0.3)
+        self.assertGreater(out["omega_dps"], 15.0)
+
+    def test_a_slow_pan_stays_under_it(self) -> None:
+        # Съёмка комнаты ведётся медленно; гасить такие кадры значило бы
+        # выбросить почти всю запись.
+        out = motion_state(self._still(), math.radians(1.5), 0.3)
+        self.assertLess(out["omega_dps"], 15.0)
+
+    def test_a_knock_is_caught_even_while_standing_still(self) -> None:
+        knocked = self._still(29) + [(0.0, 0.0, 20.0)]
+        out = motion_state(knocked, 0.0, 0.3)
+        self.assertTrue(out["impact"])
+        self.assertLess(out["omega_dps"], 1.0)

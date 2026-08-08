@@ -29,6 +29,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 import signal
 import sys
 import time
@@ -54,6 +55,7 @@ from pi_client.protocol import (
     make_scene_session_end_message,
     make_scene_session_start_message,
 )
+from pi_client.imu_rvc_math import motion_state
 from pi_client.seg_postprocess import SEG_ARCHS, letterbox, yolov8_seg_postprocess
 from shared.config import load_config
 
@@ -111,6 +113,10 @@ def parse_args() -> argparse.Namespace:
                         help="Median feature displacement (in a 480x270 image) "
                              "that counts as a genuinely new viewpoint")
     parser.add_argument("--blur-threshold", type=float, default=100.0, help="Variance-of-Laplacian gate")
+    parser.add_argument("--max-keyframe-omega-dps", type=float, default=15.0,
+                        help="Не выдавать ключевой кадр, если камера поворачивается "
+                             "быстрее (руководство §7.5: при выдержке 1/30 с выше "
+                             "этого начинается смаз). 0 — выключить.")
     parser.add_argument("--confidence", type=float, default=0.4,
                         help="Proposal score gate. One value used to drive both "
                              "this and the tracker; see --track-min-confidence.")
@@ -759,6 +765,35 @@ class SceneRecorder:
         deltas = moved.reshape(-1, 2)[ok] - points.reshape(-1, 2)[ok]
         return float(np.median(np.linalg.norm(deltas, axis=1)))
 
+    def _imu_blur_risk(self) -> str | None:
+        """Причина отбраковки кадра по IMU, или None если кадр годен.
+
+        Пороги из руководства §7.5: 15°/с — предел, за которым выдержка 1/30 с
+        начинает мазать; вибрация и удар портят кадр иначе, но так же
+        необратимо. Молчит, когда данных мало: отбраковывать по одному отсчёту
+        значит выбрасывать кадры по шуму.
+        """
+        try:
+            window = self.gravity_source.window()
+        except Exception:  # noqa: BLE001 — датчик не должен ронять запись
+            return None
+        if len(window) < 10:
+            return None
+        accel = [(s.accel_mg[0] / 1000.0 * 9.80665,
+                  s.accel_mg[1] / 1000.0 * 9.80665,
+                  s.accel_mg[2] / 1000.0 * 9.80665) for s in window]
+        span_rad = math.radians(window[-1].yaw_deg - window[0].yaw_deg)
+        dt = max(1e-3, window[-1].monotonic - window[0].monotonic)
+        state = motion_state(accel, span_rad, dt)
+        limit = self.args.max_keyframe_omega_dps
+        if limit > 0 and state["omega_dps"] > limit:
+            return "imu_turning"
+        if state["impact"]:
+            return "imu_impact"
+        if state["vibration"]:
+            return "imu_vibration"
+        return None
+
     def _is_keyframe(self, bgr: np.ndarray, now: float) -> bool:
         cv2 = self._cv2
         gray = cv2.cvtColor(cv2.resize(bgr, (480, 270)), cv2.COLOR_BGR2GRAY)
@@ -780,6 +815,21 @@ class SceneRecorder:
             sharpness=sharpness,
             is_first=self._last_keyframe_gray is None,
         )
+        # Отбраковка по IMU (руководство §7.5). Резкость по Лапласиану ловит
+        # уже СЛУЧИВШИЙСЯ смаз, а курс говорит, что кадр смазан ПРЯМО СЕЙЧАС —
+        # при выдержке 1/30 с поворот быстрее 15°/с растягивает точку на
+        # полградуса кадра. Такой кадр портит и признаки DINOv2, и глубину, а
+        # выглядит достаточно резким, чтобы порог по Лапласиану пройти.
+        #
+        # Гасится только ВЫДАЧА ключевого кадра: съёмка и трекинг продолжаются,
+        # иначе робот, который просто разворачивается, переставал бы видеть.
+        if emit and self.gravity_source is not None:
+            blur = self._imu_blur_risk()
+            if blur is not None:
+                reason = blur
+                emit = False
+                self._select_reasons[blur] = self._select_reasons.get(blur, 0) + 1
+
         self._select_reasons[reason] = self._select_reasons.get(reason, 0) + 1
         if emit:
             self._last_keyframe_gray = gray
