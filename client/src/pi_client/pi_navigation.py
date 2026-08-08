@@ -115,7 +115,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu-port", default="/dev/ttyUSB0")
     parser.add_argument("--imu-calibration", type=Path,
                         default=REPO_ROOT / "config/imu_calibration.json")
-    parser.add_argument("--imu-yaw-sigma-deg", type=float, default=1.0,
+    # 0.2 deg, from acceptance test B on this sensor: yaw increment noise
+    # 0.00025 deg and drift 0.003 deg/min over 10 minutes.
+    #
+    # NOT 0.00025. That figure is how quietly the fused output moves between
+    # consecutive samples, which is a statement about smoothness, not about
+    # how well the heading matches the room. Feeding it as the measurement
+    # sigma would make the filter treat IMU yaw as ground truth and stop
+    # visual fixes from ever correcting the heading. 0.2 deg is the guide's
+    # own figure for relative yaw over a short window, and it is the honest
+    # one to trust.
+    parser.add_argument("--imu-yaw-sigma-deg", type=float, default=0.2,
                         help="Measurement noise on the RVC fused yaw. The bench figure is far "
                              "tighter (0.03 deg/min drift, +-0.05 deg jitter, stationary); 1.0 "
                              "leaves room for the sensor-to-chassis mounting not being perfectly "
@@ -245,37 +255,27 @@ def main() -> int:
                         turned_rad = math.radians(orientation["yaw_deg"] - last_yaw_deg)
                     last_yaw_deg = orientation["yaw_deg"]
 
-                # Body-frame displacement since the last tick. This is what
-                # makes the marker MOVE when the robot drives: without it the
-                # filter only grows a circle of doubt and the position sits
-                # still until the next visual fix, which is exactly how it
-                # looked on the floor plan — drive up to the door, marker
-                # stays in the middle of the room.
+                # NO accelerometer-derived displacement here. This was tried
+                # and reverted the same day: RVC gives fused attitude plus raw
+                # accelerometer, and turning that into position needs DOUBLE
+                # integration, where a tilt error of 0.5 deg becomes 0.086 m/s^2
+                # of phantom acceleration and 0.43 m of phantom travel in 10 s.
+                # The fused marker flew off the plan. No filter fixes it —
+                # the error is in the input, not the estimator.
                 #
-                # Only used when the driver vouched for the gravity it
-                # subtracted. A segment with `gravity_ok: false` means the rig
-                # left the pose the calibration was measured in, and its
-                # "distance" is then mostly un-subtracted gravity — the same
-                # error that inflated the scene scale by 17x.
-                forward_m = lateral_m = None
-                motion = imu.read_motion() if imu is not None else None
-                segment = (motion or {}).get("segment") or {}
-                if segment and segment.get("gravity_ok") is not False:
-                    delta = segment.get("delta_p_m") or []
-                    if len(delta) >= 2:
-                        # x-forward, y-left on this mounting (see imu_rvc);
-                        # the filter wants forward/lateral with lateral to the
-                        # LEFT positive, which matches.
-                        forward_m, lateral_m = float(delta[0]), float(delta[1])
-
+                # The right displacement source for this chassis is the wheel
+                # encoders, and the right heading source is yaw. A differential
+                # drive is non-holonomic: it can only move along its own X
+                # axis, so the direction of travel IS the heading and there is
+                # nothing to integrate. Until encoder counts reach this loop,
+                # position moves only on a visual fix and `speed_ms` states the
+                # honest "it could be anywhere within this radius".
                 if ekf is not None:
                     now = time.monotonic()
                     dt_s = (now - last_predict_at) if last_predict_at else interval
                     last_predict_at = now
                     ekf.predict(dt_s=dt_s, speed_ms=args.imu_unknown_speed_ms,
-                                turned_rad=turned_rad,
-                                forward_m=forward_m,
-                                lateral_m=lateral_m if lateral_m is not None else 0.0)
+                                turned_rad=turned_rad)
                     if orientation is not None:
                         ekf.update_imu_yaw(
                             math.radians(orientation["yaw_deg"]),

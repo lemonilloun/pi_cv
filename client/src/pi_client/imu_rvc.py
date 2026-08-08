@@ -71,6 +71,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pi_client.imu_rvc_math import FrameClock
+
 logger = logging.getLogger(__name__)
 
 HEADER = b"\xaa\xaa"
@@ -110,7 +112,13 @@ class ImuSample:
     pitch_deg: float
     roll_deg: float
     accel_mg: tuple[float, float, float]
-    monotonic: float
+    monotonic: float          # when the bytes reached us — batched, unreliable
+    # Reconstructed from the device's own 100 Hz frame counter. Use THIS to
+    # place a sample in time: `monotonic` is up to 20 ms late because the CH340
+    # delivers frames in pairs (measured: p95 gap 20.07 ms, 50.2% of gaps under
+    # 1 ms). At 30 deg/s that is 0.6 deg of heading on a camera frame.
+    t_grid: float = 0.0
+    seq: int = 0              # frames since start, immune to the 0-255 wrap
 
     @property
     def accel_magnitude_mg(self) -> float:
@@ -568,6 +576,10 @@ class RvcReader:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._samples: list[ImuSample] = []
+        # Timestamps come from the frame index, never from arrival time.
+        self._clock = FrameClock()
+        self._seq = 0
+        self._seq_last_index: int | None = None
         self._frames_ok = 0
         self._frames_bad = 0
         self._dropped = 0        # frames the sensor sent that never reached us
@@ -692,6 +704,19 @@ class RvcReader:
                     else:
                         self._yaw_unwrapped += (raw - self._yaw_last_raw + 180.0) % 360.0 - 180.0
                     self._yaw_last_raw = raw
+                for sample in samples:
+                    # The wire index wraps at 256; turn it into a running count
+                    # so the clock model sees a straight line. Gaps are added
+                    # too, so a dropped frame shifts time forward by the right
+                    # amount instead of compressing the timeline.
+                    if self._seq_last_index is None:
+                        self._seq += 1
+                    else:
+                        step = (sample.index - self._seq_last_index) & 0xFF
+                        self._seq += step if step else 256
+                    self._seq_last_index = sample.index
+                    sample.seq = self._seq
+                    sample.t_grid = self._clock.update(self._seq, sample.monotonic)
                 self._samples.extend(samples)
                 cutoff = now - self.window_s
                 self._samples = [s for s in self._samples if s.monotonic >= cutoff]
@@ -711,6 +736,90 @@ class RvcReader:
     def window(self) -> list[ImuSample]:
         with self._lock:
             return list(self._samples)
+
+    @property
+    def mount_offsets_deg(self) -> tuple[float, float]:
+        """Pitch/roll of the MOUNT itself, subtracted from every reported angle.
+
+        Measured by acceptance test E and stored as
+        `rvc_acceptance.pitch_offset_deg` / `roll_offset_deg`. On this rig:
+        1.39 and 1.49 degrees, i.e. 2.04 degrees of combined tilt.
+
+        Not cosmetic. The whole value of RVC here is that pitch and roll give
+        a vertical that never drifts, and everything downstream leans on it —
+        levelling the point cloud, finding the floor, measuring object height.
+        A constant 2.04 degree lie in that vertical tips the floor by 14 cm
+        across a 4 m room, and does it consistently enough to look like a real
+        sloping floor rather than an error.
+        """
+        # getattr, not attribute access: a reader built without a calibration
+        # file must still report angles, just uncorrected ones. Refusing to
+        # work at all because the mount was never measured would be worse than
+        # a 2 degree tilt.
+        section = (getattr(self, "calibration", None) or {}).get("rvc_acceptance") or {}
+        return (float(section.get("pitch_offset_deg", 0.0)),
+                float(section.get("roll_offset_deg", 0.0)))
+
+    def level_angles_deg(self, pitch_deg: float, roll_deg: float) -> tuple[float, float]:
+        """Angles with the mount offset removed — what the WORLD is doing."""
+        pitch_off, roll_off = self.mount_offsets_deg
+        return (pitch_deg - pitch_off, roll_deg - roll_off)
+
+    def at_time(self, t_query: float) -> dict[str, Any] | None:
+        """Orientation at an arbitrary instant, interpolated on the frame clock.
+
+        This is what ties the IMU to the camera. A keyframe is exposed at some
+        moment; the nearest IMU sample can be up to 10 ms away and the arrival
+        time of that sample up to 20 ms wrong. Interpolating on `t_grid` — the
+        reconstructed device clock — removes both.
+
+        `t_query` must be on the same monotonic base as the samples, i.e. the
+        camera's `SensorTimestamp`, NOT a `time.monotonic()` taken after the
+        frame was processed: that one includes capture, transfer and whatever
+        inference ran in between.
+
+        Returns None rather than the nearest sample when the query falls
+        outside the buffered window. A silently-extrapolated orientation is
+        indistinguishable from a real one downstream, and wrong.
+        """
+        with self._lock:
+            samples = list(self._samples)
+        if len(samples) < 2:
+            return None
+        if t_query < samples[0].t_grid or t_query > samples[-1].t_grid:
+            return None
+
+        low, high = 0, len(samples) - 1
+        while high - low > 1:
+            mid = (low + high) // 2
+            if samples[mid].t_grid <= t_query:
+                low = mid
+            else:
+                high = mid
+        before, after = samples[low], samples[high]
+        span = after.t_grid - before.t_grid
+        weight = 0.0 if span <= 0 else (t_query - before.t_grid) / span
+
+        def lerp(a: float, b: float) -> float:
+            return a + weight * (b - a)
+
+        # Yaw is interpolated on the SHORT way round, so a query landing on the
+        # +/-180 wrap does not average 179 and -179 into 0.
+        yaw_step = (after.yaw_deg - before.yaw_deg + 180.0) % 360.0 - 180.0
+        pitch_level, roll_level = self.level_angles_deg(
+            lerp(before.pitch_deg, after.pitch_deg),
+            lerp(before.roll_deg, after.roll_deg))
+        return {
+            "yaw_deg": YAW_SIGN * (before.yaw_deg + weight * yaw_step),
+            "pitch_deg": pitch_level,
+            "roll_deg": roll_level,
+            "t_grid": t_query,
+            # How far apart the two samples used were. Above ~30 ms the
+            # interpolation spanned a dropout and the answer is coarse — worth
+            # recording next to the value rather than hiding.
+            "interp_gap_ms": round(span * 1000.0, 2),
+            "seq": before.seq,
+        }
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
