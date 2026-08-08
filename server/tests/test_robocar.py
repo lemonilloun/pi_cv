@@ -427,3 +427,37 @@ class DeadbandTests(unittest.TestCase):
         # and cancel the turn.
         left, right = mix_drive(1.0, 0.25, 200)
         self.assertNotEqual(left, right)
+
+
+class WheelTrimTests(unittest.TestCase):
+    """Моторы N20 при одинаковом PWM крутятся по-разному — замер одометрии
+    показал это косвенно: команда была симметричной во всех шести проездах, а
+    робота уводило настолько, что длинные проезды занижали скорость на 24%."""
+
+    def test_trim_is_off_by_default(self):
+        self.assertEqual(mix_drive(1.0, 0.0, 200), (200, 200))
+
+    def test_trim_lands_on_the_wheel_it_names(self):
+        # Слот 0 команды `M <l> <r>` — левое колесо. Ослабив ЛЕВОЕ, ожидаем
+        # изменения именно в слоте 0. Микшер переставляет колёса внутри, и
+        # проверка ловит, если подстройка уедет не туда.
+        left, right = mix_drive(1.0, 0.0, 200, trim_left=0.9)
+        self.assertLess(left, 200)
+        self.assertEqual(right, 200)
+
+    def test_trimming_the_right_wheel_touches_only_it(self):
+        left, right = mix_drive(1.0, 0.0, 200, trim_right=0.9)
+        self.assertEqual(left, 200)
+        self.assertLess(right, 200)
+
+    def test_trim_does_not_break_a_turn(self):
+        left, right = mix_drive(1.0, -0.55, 200, trim_left=0.92)
+        self.assertNotEqual(left, right)
+
+    def test_trim_never_parks_a_wheel_in_the_stall_band(self):
+        from mac_server.robocar import WHEEL_DEADBAND
+
+        for trim in (0.5, 0.7, 0.9, 1.0):
+            for speed in (60, 120, 200):
+                for wheel in mix_drive(1.0, 0.0, speed, trim_left=trim):
+                    self.assertFalse(0 < abs(wheel) < WHEEL_DEADBAND)

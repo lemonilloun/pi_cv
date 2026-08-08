@@ -128,6 +128,22 @@ TURN_BOOST = 0.45
 # own MIN_PWM; drive_profile.py carries the same constant for the VLA path.
 WHEEL_DEADBAND = 40
 
+# Множители на левое и правое колесо, выравнивающие РАЗНЫЕ моторы.
+#
+# Замер одометрии показал это косвенно и убедительно: команда была строго
+# симметричной (разница колёс 0 во всех шести проездах), а робота всё равно
+# уводило — и настолько, что проезды длиннее 4 с занижали измеренную скорость
+# на 24%, потому что рулетка меряет прямую до финиша, а робот ехал по дуге.
+#
+# Одинаковый PWM на два дешёвых мотора N20 не даёт одинаковых оборотов:
+# отличаются щётки, редуктор, приработка. Лечится только программно —
+# постоянным множителем на более быстрое колесо.
+#
+# 1.0/1.0 = выключено. Не подбирать на глаз: измерять
+# `scripts/measure_wheel_trim.py`, иначе робот будет уводить в другую сторону.
+WHEEL_TRIM_LEFT = 1.0
+WHEEL_TRIM_RIGHT = 1.0
+
 
 def _snap_out_of_deadband(value: int, deadband: int = WHEEL_DEADBAND) -> int:
     """Round a wheel command out of the stall band, never leave it inside.
@@ -146,7 +162,9 @@ def _snap_out_of_deadband(value: int, deadband: int = WHEEL_DEADBAND) -> int:
 
 def mix_drive(throttle: float, steer: float, speed: int,
               turn_boost: float = TURN_BOOST,
-              deadband: int = WHEEL_DEADBAND) -> tuple[int, int]:
+              deadband: int = WHEEL_DEADBAND,
+              trim_left: float = WHEEL_TRIM_LEFT,
+              trim_right: float = WHEEL_TRIM_RIGHT) -> tuple[int, int]:
     """Differential mix: (throttle, steer) in [-1, 1] -> (left, right) PWM.
 
     Three things happen here that a naive `throttle +/- steer` does not do,
@@ -196,6 +214,17 @@ def mix_drive(throttle: float, steer: float, speed: int,
         right += under
 
     speed = max(0, min(PWM_LIMIT, int(speed)))
+    # Выравнивание моторов — ДО мёртвой зоны и до ограничения, чтобы
+    # подстройка меняла то, что реально уйдёт на мотор.
+    #
+    # Множители СКРЕЩЕНЫ намеренно. Эта функция возвращает колёса
+    # переставленными (`return out_right, out_left`) — у шасси зеркальная
+    # проводка. Значит внутреннее `left` попадает в правый слот команды
+    # `M <l> <r>`. Подстройка называется по ФИЗИЧЕСКОМУ колесу, которое вы
+    # видите и меряете, поэтому здесь она перекрещивается ровно один раз,
+    # в том же месте, где перекрещиваются сами колёса.
+    left *= trim_right
+    right *= trim_left
     # Extra effort for the scrub, proportional to how hard the turn is, and
     # capped so a boosted turn cannot exceed what the ESP will accept.
     effort = min(float(PWM_LIMIT), speed * (1.0 + turn_boost * min(1.0, abs(steer))))

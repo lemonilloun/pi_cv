@@ -1,0 +1,84 @@
+{
+ "model": {
+  "k_ms_per_pwm": 0.004342,
+  "pwm0": 21.3,
+  "n": 6,
+  "residual_ms_median": 0.0223,
+  "points": [
+   {
+    "pwm": 80.0,
+    "speed_ms": 0.2757
+   },
+   {
+    "pwm": 101.0,
+    "speed_ms": 0.3224
+   },
+   {
+    "pwm": 120.0,
+    "speed_ms": 0.5351
+   },
+   {
+    "pwm": 125.0,
+    "speed_ms": 0.3344
+   },
+   {
+    "pwm": 182.0,
+    "speed_ms": 0.7011
+   },
+   {
+    "pwm": 216.0,
+    "speed_ms": 0.853
+   }
+  ]
+ },
+ "samples": [
+  {
+   "duration_s": 3.7,
+   "pwm": 120.0,
+   "wheel_diff": 0.0,
+   "ticks": 68,
+   "distance_m": 1.98,
+   "speed_ms": 0.5351
+  },
+  {
+   "duration_s": 7.507,
+   "pwm": 80.0,
+   "wheel_diff": 0.0,
+   "ticks": 138,
+   "distance_m": 2.07,
+   "speed_ms": 0.2757
+  },
+  {
+   "duration_s": 2.579,
+   "pwm": 216.0,
+   "wheel_diff": 0,
+   "ticks": 47,
+   "distance_m": 2.2,
+   "speed_ms": 0.853
+  },
+  {
+   "duration_s": 2.282,
+   "pwm": 182.0,
+   "wheel_diff": 0.0,
+   "ticks": 42,
+   "distance_m": 1.6,
+   "speed_ms": 0.7011
+  },
+  {
+   "duration_s": 5.77,
+   "pwm": 101.0,
+   "wheel_diff": 0.0,
+   "ticks": 106,
+   "distance_m": 1.86,
+   "speed_ms": 0.3224
+  },
+  {
+   "duration_s": 5.084,
+   "pwm": 125.0,
+   "wheel_diff": 0,
+   "ticks": 93,
+   "distance_m": 1.7,
+   "speed_ms": 0.3344
+  }
+ ]
+}
