@@ -100,11 +100,17 @@ class PicameraStreamSource:
 class PicameraCaptureSource:
     """Low-rate BGR array capture for CV modes.
 
+    `last_frame_time` holds the mid-exposure instant of the most recent frame,
+    from the sensor's own clock, or None when the driver did not report one.
+    It is what lets `RvcReader.at_time()` say where the rig was looking when
+    THIS picture was taken rather than when the code got round to asking.
+
     Uses a video configuration (no per-frame still warmup) with an RGB888 main
     stream, which Picamera2 delivers in BGR memory order — matching cv2.
     """
 
     def __init__(self, settings: CaptureSettings) -> None:
+        self.last_frame_time: float | None = None
         self.settings = settings
         self._picam2: Any = None
 
@@ -159,7 +165,30 @@ class PicameraCaptureSource:
         try:
             import numpy as np
 
-            array = self._picam2.capture_array("main")
+            # capture_request() rather than capture_array(): the request
+            # carries the frame's METADATA, and `SensorTimestamp` is the
+            # instant the sensor actually exposed it, on the same monotonic
+            # base as the IMU. Timing the frame with `time.monotonic()` after
+            # the call instead folds in capture, transfer and whatever
+            # inference ran in between — tens of milliseconds of slop, which
+            # at 30 deg/s is a degree of heading attached to the wrong moment.
+            request = self._picam2.capture_request()
+            try:
+                array = request.make_array("main")
+                metadata = request.get_metadata()
+            finally:
+                # A request not released is a buffer not returned; miss a few
+                # and the camera stalls.
+                request.release()
+            timestamp_ns = metadata.get("SensorTimestamp")
+            if timestamp_ns:
+                # Mid-exposure is the honest instant to attach: the shutter is
+                # open for a while, and the start of it is not when the picture
+                # "happened".
+                exposure_us = float(metadata.get("ExposureTime", 0) or 0)
+                self.last_frame_time = timestamp_ns / 1e9 + exposure_us * 1e-6 / 2.0
+            else:
+                self.last_frame_time = None
             # Picamera2 raw captures are frequently a strided view (row
             # padding) and may carry a stray alpha channel; downstream
             # NCNN inference needs a plain contiguous HxWx3 uint8 buffer,

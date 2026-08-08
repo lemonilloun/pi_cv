@@ -946,6 +946,18 @@ class SceneRecorder:
                 gravity = motion.pop("gravity_camera", None)
                 if gravity is not None:
                     meta["gravity"] = gravity
+                # Ориентация на момент СЪЁМКИ кадра, а не на момент, когда до
+                # неё дошли руки. Метка берётся с сенсора камеры, а сама
+                # ориентация интерполируется по восстановленным часам IMU.
+                # Время прихода IMU-кадров на хост врёт до 20 мс — адаптер
+                # отдаёт их парами; время после инференса врёт ещё больше.
+                # При 30 град/с каждые 20 мс это 0.6 град курса, приписанного
+                # не тому мгновению.
+                frame_time = getattr(self.source, "last_frame_time", None)
+                if frame_time is not None:
+                    at_frame = self.gravity_source.at_time(frame_time)
+                    if at_frame is not None:
+                        motion["at_frame"] = at_frame
                 meta["imu"] = motion
 
         sent = False

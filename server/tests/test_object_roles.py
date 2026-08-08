@@ -324,3 +324,45 @@ class ScalePlausibilityTest(unittest.TestCase):
         ])
         self.assertLess(out["median_ratio"], 0.8)
         self.assertTrue(out["plausible"], out.get("warning"))
+
+
+class ImuPoseCheckTest(unittest.TestCase):
+    """IMU — независимый свидетель для поз: он не смотрит на картинку и не
+    может ошибиться так же, как ошибается визуальное сопоставление."""
+
+    def test_pure_yaw_is_measured_as_that_yaw(self) -> None:
+        from mac_server.scene3d.object_roles import relative_rotation_deg
+
+        a = {"yaw_deg": 0.0, "pitch_deg": 0.0, "roll_deg": 0.0}
+        b = {"yaw_deg": 30.0, "pitch_deg": 0.0, "roll_deg": 0.0}
+        self.assertAlmostEqual(relative_rotation_deg(a, b), 30.0, places=4)
+
+    def test_the_pm180_wrap_is_two_degrees_not_358(self) -> None:
+        # Вычитание углов Эйлера здесь даёт 358 — метрикой на поворотах оно
+        # не является, поэтому считается настоящий угол.
+        from mac_server.scene3d.object_roles import relative_rotation_deg
+
+        a = {"yaw_deg": 179.0, "pitch_deg": 0.0, "roll_deg": 0.0}
+        b = {"yaw_deg": -179.0, "pitch_deg": 0.0, "roll_deg": 0.0}
+        self.assertAlmostEqual(relative_rotation_deg(a, b), 2.0, places=4)
+
+    def test_agreeing_pair_is_not_flagged(self) -> None:
+        from mac_server.scene3d.object_roles import poses_disagreeing_with_imu
+
+        imu = {1: {"yaw_deg": 0.0}, 2: {"yaw_deg": 20.0}}
+        self.assertEqual(poses_disagreeing_with_imu(imu, {(1, 2): 21.0}), [])
+
+    def test_a_mismatched_pair_is_reported_with_both_numbers(self) -> None:
+        from mac_server.scene3d.object_roles import poses_disagreeing_with_imu
+
+        imu = {1: {"yaw_deg": 0.0}, 2: {"yaw_deg": 5.0}}
+        out = poses_disagreeing_with_imu(imu, {(1, 2): 90.0})
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(out[0]["imu_deg"], 5.0, places=1)
+        self.assertAlmostEqual(out[0]["pose_deg"], 90.0, places=1)
+
+    def test_frames_without_imu_are_skipped_not_flagged(self) -> None:
+        # Старые сессии без IMU не должны выглядеть как сплошная ошибка поз.
+        from mac_server.scene3d.object_roles import poses_disagreeing_with_imu
+
+        self.assertEqual(poses_disagreeing_with_imu({}, {(1, 2): 90.0}), [])

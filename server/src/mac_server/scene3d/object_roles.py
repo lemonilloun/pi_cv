@@ -204,3 +204,71 @@ def scale_plausibility(objects: list[dict[str, Any]]) -> dict[str, Any]:
             f'{{"from_frame": N, "to_frame": M, "distance_m": D}} and re-run.'
         )
     return result
+
+
+def relative_rotation_deg(a: dict[str, float], b: dict[str, float]) -> float:
+    """Угол поворота между двумя ориентациями IMU, в градусах.
+
+    Берётся именно УГОЛ, а не разность углов Эйлера: последняя не является
+    метрикой на поворотах — 179 и -179 отличаются на два градуса, а вычитание
+    даёт 358.
+    """
+    import math
+
+    def matrix(pose: dict[str, float]):
+        y = math.radians(float(pose.get("yaw_deg", 0.0)))
+        p = math.radians(float(pose.get("pitch_deg", 0.0)))
+        r = math.radians(float(pose.get("roll_deg", 0.0)))
+        cy, sy, cp, sp, cr, sr = (math.cos(y), math.sin(y), math.cos(p),
+                                  math.sin(p), math.cos(r), math.sin(r))
+        rz = [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]]
+        ry = [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]]
+        rx = [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]]
+        rzy = [[sum(rz[i][k] * ry[k][j] for k in range(3)) for j in range(3)]
+               for i in range(3)]
+        return [[sum(rzy[i][k] * rx[k][j] for k in range(3)) for j in range(3)]
+                for i in range(3)]
+
+    ma, mb = matrix(a), matrix(b)
+    # trace(Ra^T Rb) = 1 + 2cos(theta)
+    trace = sum(sum(ma[k][i] * mb[k][j] for k in range(3))
+                for i, j in ((0, 0), (1, 1), (2, 2)))
+    cos_theta = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+    return math.degrees(math.acos(cos_theta))
+
+
+# Расхождение выше этого на СОСЕДНИХ кадрах означает, что позы разъехались с
+# физикой. Порог из руководства §10.3; он щедрый намеренно — pitch/roll от
+# гравитации точны, но yaw за интервал между кадрами может уйти на доли
+# градуса, а реконструкция имеет право на свою погрешность.
+POSE_IMU_DISAGREE_DEG = 10.0
+
+
+def poses_disagreeing_with_imu(
+    imu_by_frame: dict[int, dict[str, float]],
+    rotation_by_pair: dict[tuple[int, int], float],
+    threshold_deg: float = POSE_IMU_DISAGREE_DEG,
+) -> list[dict[str, Any]]:
+    """Пары соседних кадров, где реконструкция и IMU разошлись во вращении.
+
+    IMU — независимый свидетель: он не смотрит на картинку и потому не может
+    ошибиться так же, как ошибается сопоставление признаков. На комнате с
+    повторяющимися элементами (одинаковые двери, шкафы, полосатые обои) визуальный
+    матчинг уверенно склеивает не те виды, и поза уезжает; курс от IMU это
+    видит сразу.
+
+    Возвращает список расхождений, а не исправлений: что делать с плохой парой —
+    исключить, понизить вес или пересобрать — решает вызывающий, у которого
+    есть контекст.
+    """
+    out: list[dict[str, Any]] = []
+    for (i, j), pose_deg in sorted(rotation_by_pair.items()):
+        a, b = imu_by_frame.get(i), imu_by_frame.get(j)
+        if not a or not b:
+            continue
+        imu_deg = relative_rotation_deg(a, b)
+        delta = abs(pose_deg - imu_deg)
+        if delta > threshold_deg:
+            out.append({"pair": [i, j], "pose_deg": round(pose_deg, 2),
+                        "imu_deg": round(imu_deg, 2), "delta_deg": round(delta, 2)})
+    return out
