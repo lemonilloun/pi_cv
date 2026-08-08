@@ -1079,7 +1079,27 @@ def main() -> int:
                        "still valid, the yaw simply went unverified.")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Сохранить чужие разделы файла, а не переписать его целиком.
+    #
+    # Этот файл делят два измерителя: здесь живёт гравитационная калибровка, а
+    # `scripts/imu_acceptance.py` кладёт рядом `rvc_acceptance` — смещение
+    # крепления, шумы и дрейф из приёмочных тестов. Полная перезапись стирала
+    # их молча: калибровка отрабатывала успешно, печатала красивый JSON, и
+    # измеренные 1.39/1.49 градуса перекоса просто исчезали. Обнаружилось это
+    # только потому, что в выводе не хватало одной строки.
+    #
+    # Ключи, которые пишет эта функция, обновляются; всё остальное остаётся.
+    merged = {}
+    if args.output.exists():
+        try:
+            merged = json.loads(args.output.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            merged = {}
+        if merged:
+            args.output.with_suffix(".json.bak").write_text(
+                json.dumps(merged, indent=2), encoding="utf-8")
+    merged.update(payload)
+    args.output.write_text(json.dumps(merged, indent=2), encoding="utf-8")
     logger.info("Saved %s (mode: %s)", args.output, payload["mode"])
     print(json.dumps(payload, indent=2))
     return 0
