@@ -315,6 +315,7 @@ class RobocarService:
         # Localization spin state.
         self._spin_thread: threading.Thread | None = None
         self._spin_cancel = threading.Event()
+        self._takeover_hooks: list = []
         # Same shape the spin loop publishes, so the panel and the API never
         # see a half-populated dict before the first spin has ever run.
         self._spin: dict[str, Any] = {
@@ -524,6 +525,7 @@ class RobocarService:
         """
         if not _internal:
             self.cancel_spin("operator took over")
+            self._notify_takeover("operator took over")
         left, right = clamp_pwm(left), clamp_pwm(right)
 
         # Shape the request out of the stall band. Recorded before the
@@ -584,6 +586,7 @@ class RobocarService:
                 stop_spin = False
         if stop_spin:
             self.cancel_spin("STOP pressed")
+            self._notify_takeover("STOP pressed")
         return (True, "sent") if link.send(command) else (False, "send failed")
 
     # ------------------------------------------------------------------ pan
@@ -681,6 +684,27 @@ class RobocarService:
         )
         self._spin_thread.start()
         return True, f"spinning: {SPIN_BLIND_STEPS} timed steps"
+
+    def add_takeover_hook(self, hook) -> None:
+        """Позвать `hook(reason)`, когда управление перехватил человек.
+
+        Спин отменяется здесь же напрямую, но автономных потребителей стало
+        больше одного, а зашивать каждого в этот класс значит связать привод
+        с навигацией. Оператор должен побеждать МГНОВЕННО и без отдельной
+        команды отмены — это единственное требование, и хук ему отвечает.
+        """
+        with self._lock:
+            self._takeover_hooks.append(hook)
+
+    def _notify_takeover(self, reason: str) -> None:
+        with self._lock:
+            hooks = list(self._takeover_hooks)
+        for hook in hooks:
+            try:
+                hook(reason)
+            except Exception:
+                # Сбойный потребитель не должен мешать оператору рулить.
+                logger.exception("RoboCar takeover hook failed")
 
     def cancel_spin(self, reason: str = "cancelled") -> None:
         if self._spin_thread is not None and self._spin_thread.is_alive():
