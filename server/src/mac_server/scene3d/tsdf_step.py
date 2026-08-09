@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
@@ -392,6 +393,33 @@ def run_tsdf_step(
         min_free=int(tsdf_cfg.get("plan_min_free", 2)),
     )
     walls = occupancy.extract_walls(grid, min_cluster=int(tsdf_cfg.get("wall_min_cells", 12)))
+
+    # Манхэттенская привязка курса (руководство §13.2). Комнаты почти всегда
+    # прямоугольны, поэтому направления стен кучкуются кратно 90 градусам, и
+    # отклонение этой кучки от осей плана говорит, насколько курс разъехался с
+    # геометрией здания.
+    #
+    # Это единственная поправка курса, которая НЕ накапливает ошибку: она
+    # наблюдает геометрию, а не интегрирует показания. Дрейф yaw у BNO085
+    # 0.003 град/мин по приёмочному тесту B — мало, но за получасовую сессию
+    # это уже градус, и его нечем было убрать.
+    #
+    # Считается здесь, а не в graph: сетка занятости строится именно тут, и
+    # стены в ней уже выделены. Записывается как ФАКТ о сцене, применять его к
+    # курсу или нет — решает навигация.
+    from mac_server.scene3d.occupancy import wall_azimuths
+
+    from shared.manhattan import manhattan_is_usable, manhattan_yaw_offset
+
+    segments = wall_azimuths(walls)
+    yaw_offset_rad, yaw_strength = manhattan_yaw_offset([a for a, _ in segments])
+    manhattan = {
+        "wall_segments": len(segments),
+        "yaw_offset_deg": round(math.degrees(yaw_offset_rad), 3),
+        "strength": round(float(yaw_strength), 3),
+        "usable": manhattan_is_usable(yaw_strength, len(segments)),
+    }
+    logger.info("Manhattan: %s", manhattan)
     cv2.imwrite(str(session.plan_path()), occupancy.render_plan(grid, walls))
     np.savez_compressed(
         session.occupancy_path(), grid=grid, walls=walls,
@@ -412,6 +440,10 @@ def run_tsdf_step(
                 "grid_h": int(spec["height"]),
                 "floor_offset": floor_offset,
                 "gravity_source": gravity_source,
+                # Привязка курса к стенам комнаты. Навигация читает её отсюда
+                # вместе с системой координат плана — иначе поправку пришлось
+                # бы искать в отчёте шага, который к тому моменту уже забыт.
+                "manhattan": manhattan,
             }
         ),
         encoding="utf-8",
@@ -431,6 +463,7 @@ def run_tsdf_step(
         "depth_trunc_m": round(depth_trunc, 2),
         "depth_kept_frac": filter_stats.get("kept_frac"),
         "gravity_source": gravity_source,
+        "manhattan": manhattan,
         "free_cells": int((grid == occupancy.FREE).sum()),
         "occupied_cells": int((grid == occupancy.OCCUPIED).sum()),
     }

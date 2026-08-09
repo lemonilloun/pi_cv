@@ -293,3 +293,58 @@ def render_plan(grid: np.ndarray, walls: np.ndarray | None = None) -> np.ndarray
     if walls is not None:
         img[walls] = (20, 20, 20)
     return img
+
+
+# Отрезок короче этого — не стена, а огрызок: в сетке с шагом 4 см это 60 см.
+# Такие дают азимут, но он определяется парой клеток и шумит.
+WALL_MIN_SEGMENT_CELLS = 15
+
+
+def wall_azimuths(walls: np.ndarray, min_segment_cells: int = WALL_MIN_SEGMENT_CELLS,
+                  ) -> list[tuple[float, float]]:
+    """Направления стен на плане: список (азимут в радианах, вес).
+
+    Азимут берётся у самой ЛИНИИ стены, а не у её нормали, и это не оплошность:
+    манхэттенская привязка сворачивает угол по модулю 90 градусов, а линия и
+    нормаль отличаются ровно на 90 — после свёртки они дают одно и то же число.
+    Считать направление линии проще и устойчивее: у сегмента из двадцати клеток
+    знак нормали не определён.
+
+    Отрезки ищутся преобразованием Хафа, а НЕ связными компонентами. Первая
+    версия делала именно последнее и на первом же тесте дала ноль стен: две
+    стены сходятся в углу и становятся одной компонентой, у которой главная
+    ось — диагональ, а не стена. В настоящей комнате всё ещё хуже, там контур
+    замкнут, и компонента одна на всё помещение. Хаф ищет прямолинейные куски
+    независимо от того, соединены они или нет, — то есть ровно то, что нужно.
+
+    Вес — длина отрезка в клетках: длинная стена должна значить больше
+    короткого простенка.
+    """
+    import cv2
+
+    mask = np.asarray(walls).astype(np.uint8)
+    if mask.ndim != 2 or not mask.any():
+        return []
+    mask = (mask > 0).astype(np.uint8) * 255
+
+    segments = cv2.HoughLinesP(
+        mask, rho=1.0, theta=np.pi / 360.0,
+        threshold=max(8, min_segment_cells // 2),
+        minLineLength=float(min_segment_cells),
+        # Стена в сетке занятости дырявая: её видно кусками, между которыми
+        # мебель и непросмотренные места. Разрыв в несколько клеток — это всё
+        # ещё одна стена.
+        maxLineGap=float(max(3, min_segment_cells // 3)),
+    )
+    if segments is None:
+        return []
+
+    out: list[tuple[float, float]] = []
+    for segment in segments:
+        x1, y1, x2, y2 = (float(v) for v in segment[0])
+        dx, dy = x2 - x1, y2 - y1
+        length = float(np.hypot(dx, dy))
+        if length < min_segment_cells:
+            continue
+        out.append((float(np.arctan2(dy, dx)), length))
+    return out

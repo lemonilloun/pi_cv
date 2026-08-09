@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -1905,3 +1906,55 @@ class StaleNavIndexTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             entry = _load_session_index(self._session(tmp, None, 1.5151))
             self.assertFalse(entry["stale"])
+
+
+class WallAzimuthTest(unittest.TestCase):
+    """Направления стен для манхэттенской привязки. Первая версия искала их
+    связными компонентами и на замкнутом контуре комнаты давала ноль: четыре
+    стены сходятся в углах в одну компоненту, у которой главная ось —
+    диагональ. Хаф ищет прямые куски независимо от связности."""
+
+    @staticmethod
+    def _room(rotate_deg=0.0):
+        import cv2
+
+        g = np.zeros((80, 80), np.uint8)
+        g[10, 5:75] = 1; g[70, 5:75] = 1
+        g[5:75, 10] = 1; g[5:75, 70] = 1
+        if rotate_deg:
+            m = cv2.getRotationMatrix2D((40, 40), rotate_deg, 1.0)
+            g = (cv2.warpAffine(g * 255, m, (80, 80),
+                                flags=cv2.INTER_NEAREST) > 0).astype(np.uint8)
+        return g
+
+    def test_a_closed_room_yields_its_four_walls(self) -> None:
+        from mac_server.scene3d.occupancy import wall_azimuths
+
+        segments = wall_azimuths(self._room())
+        self.assertGreaterEqual(len(segments), 4)
+
+    def test_axis_aligned_room_needs_no_correction(self) -> None:
+        from pi_client.imu_rvc_math import manhattan_yaw_offset
+        from mac_server.scene3d.occupancy import wall_azimuths
+
+        offset, strength = manhattan_yaw_offset(
+            [a for a, _ in wall_azimuths(self._room())])
+        self.assertAlmostEqual(math.degrees(offset), 0.0, delta=1.0)
+        self.assertGreater(strength, 0.9)
+
+    def test_a_rotated_room_reports_its_rotation(self) -> None:
+        from pi_client.imu_rvc_math import manhattan_yaw_offset
+        from mac_server.scene3d.occupancy import wall_azimuths
+
+        offset, strength = manhattan_yaw_offset(
+            [a for a, _ in wall_azimuths(self._room(12.0))])
+        self.assertAlmostEqual(abs(math.degrees(offset)), 12.0, delta=1.5)
+        self.assertGreater(strength, 0.9)
+
+    def test_empty_and_speckle_grids_report_nothing(self) -> None:
+        from mac_server.scene3d.occupancy import wall_azimuths
+
+        self.assertEqual(wall_azimuths(np.zeros((40, 40), np.uint8)), [])
+        speckle = np.zeros((40, 40), np.uint8)
+        speckle[5, 5] = speckle[20, 30] = speckle[33, 7] = 1
+        self.assertEqual(wall_azimuths(speckle), [])

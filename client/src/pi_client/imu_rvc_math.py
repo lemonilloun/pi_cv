@@ -259,27 +259,10 @@ def motion_state(accel_ms2: list[tuple[float, float, float]],
     }
 
 
-def manhattan_yaw_offset(wall_azimuths_rad: list[float]) -> tuple[float, float]:
-    """Heading correction from the room's own walls, and how much to trust it.
-
-    Rooms are overwhelmingly rectangular, so wall normals cluster at multiples
-    of 90 degrees. Folding every azimuth into [0, 90) and taking a circular
-    mean on the QUADRUPLED angle (which makes the four wall directions
-    coincide) recovers how far the heading has slipped against the building.
-
-    This is the only correction here that does not accumulate error: it is an
-    observation of geometry, not an integration. Returns (offset, strength);
-    strength near 1 means the walls agreed, near 0 means there were no walls
-    worth listening to and the offset must be ignored.
-    """
-    if not wall_azimuths_rad:
-        return (0.0, 0.0)
-    folded = [a % (math.pi / 2.0) for a in wall_azimuths_rad]
-    cos_sum = sum(math.cos(4.0 * a) for a in folded) / len(folded)
-    sin_sum = sum(math.sin(4.0 * a) for a in folded) / len(folded)
-    offset = math.atan2(sin_sum, cos_sum) / 4.0
-    strength = math.hypot(cos_sum, sin_sum)
-    return (offset, strength)
+# Реализация переехала в shared/manhattan.py: её нужна и серверному шагу tsdf,
+# и навигации здесь, а из server/ импортировать pi_client нельзя. Имя оставлено
+# здесь, чтобы не менять вызовы.
+from shared.manhattan import manhattan_yaw_offset  # noqa: E402,F401
 
 
 class YawDriftCorrector:
