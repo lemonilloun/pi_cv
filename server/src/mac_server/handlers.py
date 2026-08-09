@@ -11,6 +11,7 @@ import time
 import zipfile
 from io import BytesIO
 
+from shared.fix_gate import FixGate
 from mac_server.protocol import make_ack_response, make_cv_result_ack_response, make_image_ack_response
 from mac_server.preview import LatestFrameStore
 from mac_server.registry import ClientHandle, ClientRegistry, TelemetryStore
@@ -161,6 +162,17 @@ def set_robot_service(service: object | None) -> None:
 # failures — which the very first smoke episode already hit.
 _action_log: object | None = None
 
+# One gate for the whole process: there is one robot, and its position history
+# is exactly the state the gate needs. Reset when the robot is picked up and
+# put somewhere else (POST /api/nav/reset).
+_fix_gate = FixGate()
+
+
+def reset_fix_gate() -> None:
+    """Forget the position history — for when the robot is physically moved."""
+    global _fix_gate
+    _fix_gate = FixGate()
+
 
 def set_action_log(log: object | None) -> None:
     global _action_log
@@ -182,6 +194,31 @@ def _handle_nav_query(message: Message, storage_dir: Path) -> Message:
         raise ValueError("nav_query needs a clip_emb list")
     sessions_dir = storage_dir.parent / "scene_sessions"
     result = navindex.query(sessions_dir, embedding)
+
+    # The index compares one frame against every recorded one and takes the
+    # best, with no memory of the previous fix. Standing in a room and glancing
+    # through a doorway yields a frame that genuinely resembles the middle of
+    # the hall, and the robot teleported there. The gate asks the question the
+    # embedding cannot: could the robot have GOT there since the last fix?
+    if result.get("located"):
+        best = result.get("best") or {}
+        position = best.get("position_m")
+        if isinstance(position, (list, tuple)) and len(position) >= 2:
+            verdict = _fix_gate.accept(
+                str(best.get("session_id")),
+                (float(position[0]), float(position[1])),
+                time.time(),
+                similarity=float(best.get("similarity") or 0.0),
+            )
+            result["gate"] = verdict
+            if not verdict["accepted"]:
+                # Downgraded, not deleted: the panel still shows what was
+                # matched and why it was refused, so a gate that rejects
+                # everything is visible instead of looking like a dead index.
+                result["located"] = False
+                result["reason"] = verdict["reason"]
+                result["rejected_fix"] = best
+
     depth = message.payload.get("depth_center_m")
     if depth is not None:
         result["depth_center_m"] = depth
