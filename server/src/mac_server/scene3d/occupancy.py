@@ -339,9 +339,16 @@ def wall_azimuths(walls: np.ndarray, min_segment_cells: int = WALL_MIN_SEGMENT_C
     if segments is None:
         return []
 
+    # HoughLinesP отдаёт то (N, 1, 4), то (N, 4) — зависит от сборки OpenCV и,
+    # судя по всему, от числа найденных отрезков: на моих прогонах была первая
+    # форма, а на сессии пользователя вторая, и распаковка segment[0] уронила
+    # весь шаг tsdf с "'numpy.int32' object is not iterable". Приводим к (N, 4)
+    # и перестаём зависеть от того, какая версия попалась.
+    segments = np.asarray(segments).reshape(-1, 4)
+
     out: list[tuple[float, float]] = []
     for segment in segments:
-        x1, y1, x2, y2 = (float(v) for v in segment[0])
+        x1, y1, x2, y2 = (float(v) for v in segment)
         dx, dy = x2 - x1, y2 - y1
         length = float(np.hypot(dx, dy))
         if length < min_segment_cells:

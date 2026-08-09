@@ -1958,3 +1958,33 @@ class WallAzimuthTest(unittest.TestCase):
         speckle = np.zeros((40, 40), np.uint8)
         speckle[5, 5] = speckle[20, 30] = speckle[33, 7] = 1
         self.assertEqual(wall_azimuths(speckle), [])
+
+
+class HoughShapeTest(unittest.TestCase):
+    """HoughLinesP отдаёт то (N,1,4), то (N,4). Предположение об одной форме
+    уронило весь шаг tsdf на живой сессии пользователя, хотя на тех же данных
+    у меня проходило."""
+
+    def test_both_return_shapes_are_handled(self) -> None:
+        from unittest.mock import patch
+
+        from mac_server.scene3d.occupancy import wall_azimuths
+
+        grid = np.zeros((40, 40), np.uint8)
+        grid[10, 5:35] = 1
+        lines = np.array([[5, 10, 34, 10]], dtype=np.int32)
+        for shape in ((1, 1, 4), (1, 4)):
+            with patch("cv2.HoughLinesP", return_value=lines.reshape(shape)):
+                out = wall_azimuths(grid)
+            self.assertEqual(len(out), 1, f"форма {shape} не обработана")
+            self.assertAlmostEqual(math.degrees(out[0][0]), 0.0, delta=1.0)
+
+    def test_no_lines_found_is_not_a_crash(self) -> None:
+        from unittest.mock import patch
+
+        from mac_server.scene3d.occupancy import wall_azimuths
+
+        grid = np.zeros((40, 40), np.uint8)
+        grid[10, 5:35] = 1
+        with patch("cv2.HoughLinesP", return_value=None):
+            self.assertEqual(wall_azimuths(grid), [])
