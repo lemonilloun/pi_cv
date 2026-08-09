@@ -38,3 +38,6 @@ external/
 config/imu_calibration.json
 config/imu_calibration_shtp.json
 data/vla_episodes
+# Топологическая навигация: веса апстрима и результаты офлайн-гейта
+models/nav2/
+data/nav2_eval/
