@@ -628,8 +628,34 @@
       </div>
       <p class="meta-line" id="robotSpin" style="opacity:.8"></p>
       <p class="meta-line" id="robotStatus">robot: —</p>
-      <p class="meta-line" id="robotHeading" style="opacity:.8">heading: —</p>
       <p class="meta-line" id="robotHb" style="opacity:.6"></p>
+    </div>
+
+    <!-- Топологическая навигация. Никакого положения на плане: «где робот» —
+         это номер узла в графе кадров, и показывается он номером и кадром.
+         Точка на плане подразумевала бы координаты, которых в этой схеме
+         нет. -->
+    <div class="card">
+      <h2>Навигация по топокарте</h2>
+      <div class="robot-row" style="gap:8px">
+        <select id="nav2Map" style="flex:1"><option value="">— карта —</option></select>
+        <button id="nav2BuildBtn" class="ghost-btn">Собрать из сессии</button>
+      </div>
+      <div class="robot-row" style="gap:8px">
+        <label style="flex:1">цель, узел
+          <input id="nav2Goal" type="number" min="0" placeholder="последний" style="width:100%">
+        </label>
+        <label style="flex:1">скорость
+          <input id="nav2Speed" type="number" min="60" max="255" value="120" style="width:100%">
+        </label>
+      </div>
+      <div class="robot-row" style="gap:8px">
+        <button id="nav2StartBtn" class="scan-btn">Ехать</button>
+        <button id="nav2StopBtn" class="scan-btn" style="background:var(--critical)">СТОП</button>
+      </div>
+      <p class="meta-line" id="nav2Status">навигация: —</p>
+      <img id="nav2NodeImg" alt="текущий узел" style="display:none; width:100%; border-radius:6px; margin-top:6px">
+      <p class="meta-line" id="nav2Error" style="color:var(--critical)"></p>
     </div>
   </section>
 </main>
@@ -1702,8 +1728,72 @@ document.querySelectorAll("#tabs button").forEach((btn) => {
     const tab = btn.dataset.tab;
     document.getElementById("tabLive").style.display = tab === "live" ? "" : "none";
     document.getElementById("tabScene").style.display = tab === "scene" ? "grid" : "none";
-    if (tab === "scene") { refreshSceneSessions(); }
+    if (tab === "scene") { refreshSceneSessions(); if (nav2Timer === null) { pollNav2(); nav2Timer = setInterval(pollNav2, 1000); } }
   });
+});
+
+// ------------------------------------------------------- топонавигация
+async function nav2Post(path, body) {
+  document.getElementById("nav2Error").textContent = "";
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) document.getElementById("nav2Error").textContent = data.error || ("HTTP " + res.status);
+    return data;
+  } catch (err) {
+    document.getElementById("nav2Error").textContent = "запрос не прошёл: " + err;
+    return {};
+  }
+}
+
+let nav2Timer = null;
+async function pollNav2() {
+  if (document.getElementById("tabScene").style.display === "none") return;
+  let data;
+  try { data = await (await fetch("/api/nav2/status")).json(); } catch (err) { return; }
+  const sel = document.getElementById("nav2Map");
+  const chosen = sel.value;
+  const names = (data.maps || []).map((m) => m.name);
+  if (names.join("|") !== (sel.dataset.names || "")) {
+    sel.innerHTML = `<option value="">— карта —</option>` +
+      (data.maps || []).map((m) => `<option value="${m.name}">${m.name} (${m.nodes} узлов)</option>`).join("");
+    sel.dataset.names = names.join("|");
+    if (names.includes(chosen)) sel.value = chosen;
+  }
+  const r = data.runner;
+  const line = document.getElementById("nav2Status");
+  const img = document.getElementById("nav2NodeImg");
+  if (!r) { line.textContent = "навигация: не запускалась"; img.style.display = "none"; return; }
+  // Положение — это НОМЕР УЗЛА и его кадр. Координат в этой схеме нет.
+  line.textContent = r.active
+    ? `едет · узел ${r.node} из ${r.nodes} · дистанция ${r.distance ?? "—"} · кадров ${r.frames}`
+    : `стоит · узел ${r.node} из ${r.nodes}${r.reason ? " · " + r.reason : ""}`;
+  const map = data.loaded_map;
+  if (map) { img.src = `/topomap/${map}/${r.node}.jpg?t=${r.frames}`; img.style.display = "block"; }
+}
+
+document.getElementById("nav2BuildBtn").addEventListener("click", async () => {
+  const session = sceneState.selected;
+  if (!session) { document.getElementById("nav2Error").textContent = "выберите сессию в таблице выше"; return; }
+  const out = await nav2Post("/api/nav2/build", { session });
+  if (out.ok) { document.getElementById("nav2Map").dataset.names = ""; pollNav2(); }
+});
+document.getElementById("nav2StartBtn").addEventListener("click", async () => {
+  const goal = document.getElementById("nav2Goal").value;
+  await nav2Post("/api/nav2/start", {
+    map: document.getElementById("nav2Map").value,
+    speed: +document.getElementById("nav2Speed").value || 120,
+    goal_node: goal === "" ? null : +goal,
+  });
+  pollNav2();
+});
+document.getElementById("nav2StopBtn").addEventListener("click", async () => {
+  await nav2Post("/api/nav2/stop", {});
+  pollNav2();
 });
 
 async function sceneAction(url, body) {

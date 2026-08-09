@@ -22,6 +22,13 @@ from . import robocar as robocar_mod
 
 logger = logging.getLogger(__name__)
 
+# Топологическая навигация: загруженная политика и текущий заезд. Живёт на
+# уровне модуля, а не запроса — веса весят 430 МБ и грузятся секунды, так что
+# перезагружать их на каждый старт нельзя. Загрузка ленивая: сервер обязан
+# подниматься и без весов, потому что запись сцен и реконструкция от
+# навигации не зависят.
+_NAV2: dict = {"policy": None, "runner": None, "map_name": None}
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SESSION_MODES = {"idle", "stream", "depth", "yolo", "pipeline"}
 
@@ -196,6 +203,12 @@ def _make_handler(
             if parsed.path == "/api/scene3d/sessions":
                 self._serve_scene_sessions()
                 return
+            if parsed.path == "/api/nav2/status":
+                self._serve_nav2_status()
+                return
+            if parsed.path.startswith("/topomap/"):
+                self._serve_topomap_node(parsed.path)
+                return
             if parsed.path == "/api/scene3d/status":
                 self._serve_scene_status()
                 return
@@ -256,6 +269,15 @@ def _make_handler(
                 return
             if parsed.path == "/api/robot/command":
                 self._handle_robot_command()
+                return
+            if parsed.path == "/api/nav2/build":
+                self._handle_nav2_build()
+                return
+            if parsed.path == "/api/nav2/start":
+                self._handle_nav2_start()
+                return
+            if parsed.path == "/api/nav2/stop":
+                self._handle_nav2_stop()
                 return
             if parsed.path == "/api/scene3d/run":
                 self._handle_scene_run()
@@ -822,6 +844,127 @@ def _make_handler(
             payload = robocar.status()
             payload["available"] = True
             self._send_json(payload)
+
+        # ----------------------------------------------------- топонавигация
+        # Политика загружается ЛЕНИВО и держится в этом словаре: веса весят
+        # 430 МБ и грузятся секунды, а сервер должен подниматься и без них
+        # (панель, запись сцен и реконструкция от навигации не зависят).
+        def _nav2_state(self) -> dict:
+            return _NAV2
+
+        def _serve_topomap_node(self, path: str) -> None:
+            """Кадр узла: /topomap/<карта>/<n>.jpg.
+
+            Имена собираются из URL, поэтому оба сегмента фильтруются по
+            белому списку символов — иначе `..` в пути отдаёт любой файл на
+            диске.
+            """
+            parts = path.strip("/").split("/")
+            if len(parts) != 3 or not parts[2].endswith(".jpg"):
+                self._send_json({"error": "not found"}, status=404)
+                return
+            name = "".join(c for c in parts[1] if c.isalnum() or c in "_-")
+            stem = "".join(c for c in parts[2][:-4] if c.isdigit())
+            root = Path(__file__).resolve().parents[3] / "data/topomaps"
+            node = root / name / f"{stem}.jpg"
+            if not name or not stem or not node.exists():
+                self._send_json({"error": "not found"}, status=404)
+                return
+            data = node.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _serve_nav2_status(self) -> None:
+            from mac_server.nav2 import topomap
+
+            runner = _NAV2.get("runner")
+            maps_dir = Path(__file__).resolve().parents[3] / "data/topomaps"
+            maps = topomap.list_maps(maps_dir) if maps_dir.exists() else []
+            self._send_json({
+                "maps": maps,
+                "loaded_map": _NAV2.get("map_name"),
+                "runner": runner.status() if runner is not None else None,
+            })
+
+        def _handle_nav2_build(self) -> None:
+            from mac_server.nav2 import topomap
+
+            body = self._read_json_body()
+            if body is None:
+                return
+            session = str(body.get("session", ""))
+            root = Path(__file__).resolve().parents[3] / "data"
+            session_dir = root / "scene_sessions" / session
+            if not session or not session_dir.exists():
+                self._send_json({"error": f"нет сессии {session}"}, status=404)
+                return
+            name = str(body.get("name") or session)
+            safe = "".join(c for c in name if c.isalnum() or c in "_-")
+            try:
+                meta = topomap.build_from_session(
+                    session_dir, root / "topomaps" / safe,
+                    stride=int(body.get("stride", topomap.DEFAULT_STRIDE)), name=safe)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"ok": True, **meta})
+
+        def _handle_nav2_start(self) -> None:
+            from mac_server.nav2 import topomap
+            from mac_server.nav2.policy import VintPolicy
+            from mac_server.nav2.runner import Nav2Runner
+
+            if robocar is None:
+                self._send_json({"error": "привод выключен"}, status=409)
+                return
+            body = self._read_json_body()
+            if body is None:
+                return
+            running = _NAV2.get("runner")
+            if running is not None and running.status()["active"]:
+                self._send_json({"error": "уже едет"}, status=409)
+                return
+
+            repo = Path(__file__).resolve().parents[3]
+            name = "".join(c for c in str(body.get("map", "")) if c.isalnum() or c in "_-")
+            map_dir = repo / "data/topomaps" / name
+            if not name or not map_dir.exists():
+                self._send_json({"error": f"нет топокарты {name}"}, status=404)
+                return
+            try:
+                frames, meta = topomap.load(map_dir)
+                if _NAV2.get("policy") is None:
+                    _NAV2["policy"] = VintPolicy(
+                        repo / "models/nav2/vint.pth",
+                        repo / "external/visualnav-transformer/train/config/vint.yaml",
+                        device=str(body.get("device", "mps")))
+            except Exception as exc:  # noqa: BLE001 - показать причину в панели
+                self._send_json({"error": f"политика не загрузилась: {exc}"}, status=500)
+                return
+
+            goal = body.get("goal_node")
+            runner = Nav2Runner(
+                _NAV2["policy"], frames, robocar, frame_hub.get("pi"),
+                speed=int(body.get("speed", 120)),
+                goal_node=int(goal) if goal is not None else None)
+            ok, detail = runner.start()
+            if ok:
+                _NAV2["runner"] = runner
+                _NAV2["map_name"] = meta.get("name", name)
+            self._send_json({"ok": ok, "detail": detail, "nodes": len(frames)},
+                            status=200 if ok else 409)
+
+        def _handle_nav2_stop(self) -> None:
+            runner = _NAV2.get("runner")
+            if runner is None:
+                self._send_json({"ok": True, "detail": "не запущено"})
+                return
+            runner.stop("остановлено с панели")
+            self._send_json({"ok": True, "detail": "остановлено"})
 
         def _handle_robot_drive(self) -> None:
             """Wheel PWMs, or a (throttle, steer, speed) trio to be mixed.
