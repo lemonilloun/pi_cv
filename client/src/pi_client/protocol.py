@@ -260,39 +260,6 @@ def make_imu_cal_state_message(device_id: str, state: dict[str, object]) -> Mess
     )
 
 
-def make_nav_query_message(
-    device_id: str,
-    clip_emb: list[float],
-    depth_center_m: float | None = None,
-    fused: dict[str, object] | None = None,
-    imu: dict[str, object] | None = None,
-) -> Message:
-    """`fused`: the Pi's own EKF state, so the panel can draw the filtered
-    pose next to the raw visual fix. Sent in METRES along the plan frame's
-    axes; the server projects it into display coordinates (it owns the
-    plan_frame). Optional — a vision-only run simply omits it.
-
-    `imu`: raw sensor attitude, deliberately a TOP-LEVEL field rather than
-    part of `fused`. The filter state only exists once the robot has been
-    localized at least once, but the server's localization spin needs the
-    heading precisely when it has NOT been localized yet — nesting the two
-    together produced a deadlock where the spin refused to start for want
-    of a heading that only a successful fix would have delivered.
-    """
-    payload: dict[str, object] = {"clip_emb": clip_emb}
-    if depth_center_m is not None:
-        payload["depth_center_m"] = round(depth_center_m, 2)
-    if fused is not None:
-        payload["fused"] = fused
-    if imu is not None:
-        payload["imu"] = imu
-    return make_message(
-        device_id=device_id,
-        message_type="nav_query",
-        payload=payload,
-    )
-
-
 def make_time_sync_message(device_id: str, t0_pi_ns: int, seq: int = 0) -> Message:
     """Ask the server for its monotonic clock so the two can be joined.
 

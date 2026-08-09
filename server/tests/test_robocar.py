@@ -179,24 +179,21 @@ class CommandAllowlistTests(unittest.TestCase):
 
 
 class SpinTests(unittest.TestCase):
-    """The localization spin stops on MEASURED rotation, not a timer —
-    with no wheel encoders the IMU is the only thing that knows the robot
-    came all the way round."""
+    """An in-place survey spin. Timed, not measured: this chassis has no
+    wheel encoders, and the IMU heading that used to close the loop came
+    from the metric localization stack, which no longer exists."""
 
     def setUp(self):
         self.service = RobocarService()
 
     def test_refuses_without_a_robot(self):
-        self.service.note_heading(0.0)
         ok, detail = self.service.start_spin()
         self.assertFalse(ok)
         self.assertEqual(detail, "no robot connected")
 
-    def test_spins_blind_when_no_imu_heading_is_available(self):
-        """Refusing here deadlocked the feature: the spin exists to GET
-        localized, but the Pi only reported heading once it already was.
-        A survey spin is useful with no IMU at all, and "the button does
-        nothing" is the worst possible failure mode."""
+    def test_spins_on_a_step_count(self):
+        """The button must do something. "The button does nothing" was the
+        worst failure mode of the earlier heading-gated version."""
         class _FakeLink:
             stop = threading.Event()
             addr = ("10.0.0.9", 5000)
@@ -212,22 +209,15 @@ class SpinTests(unittest.TestCase):
         self.service._link = _FakeLink()
         ok, detail = self.service.start_spin()
         self.assertTrue(ok)
-        self.assertIn("blind", detail)
+        self.assertIn("steps", detail)
         self.service.cancel_spin()
         if self.service._spin_thread:
             self.service._spin_thread.join(timeout=3)
-        self.assertEqual(self.service.status()["spin"]["mode"], "blind")
-
-    def test_heading_is_recorded_and_ignores_none(self):
-        self.service.note_heading(12.5)
-        self.assertEqual(self.service.status()["heading_deg"], 12.5)
-        self.service.note_heading(None)
-        self.assertEqual(self.service.status()["heading_deg"], 12.5)
+        self.assertEqual(self.service.status()["spin"]["mode"], "timed")
 
     def test_status_exposes_an_idle_spin(self):
         spin = self.service.status()["spin"]
         self.assertFalse(spin["active"])
-        self.assertEqual(spin["turned_deg"], 0.0)
         self.assertEqual(spin["steps"], 0)
 
     def test_manual_drive_cancels_a_spin(self):

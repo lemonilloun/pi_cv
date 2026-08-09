@@ -19,7 +19,6 @@ from mac_server.handlers import (
     SessionContext,
     handle_message,
     set_action_log,
-    set_robot_service,
 )
 from mac_server.preview import FrameStoreHub, MjpegPreviewServer
 from mac_server.protocol import make_error_response
@@ -74,7 +73,6 @@ class MacServer:
         self.robocar = (
             RobocarService(action_log=self.action_log) if robot_enabled else None
         )
-        set_robot_service(self.robocar)
         set_action_log(self.action_log)
         self.preview_server = (
             MjpegPreviewServer(

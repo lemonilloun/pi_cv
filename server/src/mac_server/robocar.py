@@ -318,11 +318,9 @@ class RobocarService:
         # Same shape the spin loop publishes, so the panel and the API never
         # see a half-populated dict before the first spin has ever run.
         self._spin: dict[str, Any] = {
-            "active": False, "turned_deg": 0.0, "steps": 0,
+            "active": False, "steps": 0,
             "reason": None, "target_deg": SPIN_TARGET_DEG, "mode": None,
         }
-        self._heading_deg: float | None = None
-        self._heading_at = 0.0
         # Camera pan. `None` means "never successfully commanded", which is
         # distinct from "at 0 degrees" — an unknown pan angle must not be
         # reported as a centred one.
@@ -648,32 +646,18 @@ class RobocarService:
 
     # ------------------------------------------------------- localization spin
 
-    def note_heading(self, yaw_deg: float | None) -> None:
-        """Feed the Pi's raw RVC yaw in (from the nav_query handler).
-
-        This is what closes the loop on the spin: with no wheel encoders,
-        the only thing on this robot that knows it has turned all the way
-        round is the IMU. A timed spin would be a guess about wheel slip,
-        battery charge and carpet.
-        """
-        if yaw_deg is None:
-            return
-        with self._lock:
-            self._heading_deg = float(yaw_deg)
-            self._heading_at = time.monotonic()
-
     def start_spin(
         self,
         speed: int = SPIN_SPEED,
         target_deg: float = SPIN_TARGET_DEG,
         timeout_s: float = SPIN_TIMEOUT_S,
     ) -> tuple[bool, str]:
-        """Rotate in place so the place index gets a look at the whole room.
+        """Rotate in place so the camera gets a look at the whole room.
 
-        A single viewpoint often matches nothing — the recorded keyframes
-        were taken facing particular directions, and the robot may have been
-        set down facing a blank wall. One slow revolution guarantees the
-        query sees whatever the index actually contains.
+        Timed, not measured: this chassis has no wheel encoders, and the IMU
+        heading that used to terminate the spin came from the metric
+        localization stack, which is gone. `SPIN_BLIND_STEPS` pulses is what
+        was measured to come out near a revolution on this robot.
         """
         with self._lock:
             if self._link is None or self._link.stop.is_set():
@@ -686,19 +670,17 @@ class RobocarService:
             # ordering bug is fixed, but the principle stands — a survey
             # spin is useful even with no IMU at all, and "the button does
             # nothing" is the worst possible failure mode.
-            blind = self._heading_deg is None
             pan_first = self._pan_supported is not False
             self._spin_cancel.clear()
-            self._spin = {"active": True, "turned_deg": 0.0, "reason": None,
+            self._spin = {"active": True, "reason": None,
                           "target_deg": target_deg, "steps": 0,
-                          "mode": "blind" if blind else "imu"}
+                          "mode": "timed"}
         self._spin_thread = threading.Thread(
-            target=self._survey_loop, args=(speed, target_deg, timeout_s, blind, pan_first),
+            target=self._survey_loop, args=(speed, target_deg, timeout_s, pan_first),
             name="robocar-spin", daemon=True,
         )
         self._spin_thread.start()
-        return True, (f"spinning blind: {SPIN_BLIND_STEPS} steps (no IMU heading — "
-                      f"is pi_navigation running?)" if blind else "spinning")
+        return True, f"spinning: {SPIN_BLIND_STEPS} timed steps"
 
     def cancel_spin(self, reason: str = "cancelled") -> None:
         if self._spin_thread is not None and self._spin_thread.is_alive():
@@ -707,7 +689,7 @@ class RobocarService:
             self._spin_cancel.set()
 
     def _survey_loop(self, speed: int, target_deg: float, timeout_s: float,
-                     blind: bool, pan_first: bool) -> None:
+                     pan_first: bool) -> None:
         """Look around the cheap way first, then rotate only if needed.
 
         Panning the camera costs milliamps; rotating the chassis scrubs both
@@ -727,10 +709,9 @@ class RobocarService:
             with self._lock:
                 self._spin = {**self._spin, "active": False, "reason": "cancelled"}
             return
-        self._spin_loop(speed, target_deg, timeout_s, blind)
+        self._spin_loop(speed, target_deg, timeout_s)
 
-    def _spin_loop(self, speed: int, target_deg: float, timeout_s: float,
-                   blind: bool = False) -> None:
+    def _spin_loop(self, speed: int, target_deg: float, timeout_s: float) -> None:
         # No turn boost here. SPIN_SPEED was MEASURED against this exact
         # scrub — 110 would not rotate the chassis at all and 160 does — so
         # it already contains the compensation TURN_BOOST exists to add.
@@ -738,20 +719,15 @@ class RobocarService:
         # spin was tuned for.
         left, right = mix_drive(0.0, 1.0, speed, turn_boost=0.0)
         deadline = time.monotonic() + timeout_s
-        turned = 0.0
         steps = 0
-        with self._lock:
-            previous = self._heading_deg
         reason = "done"
 
         while not self._spin_cancel.is_set() and not self._stop.is_set():
             if time.monotonic() > deadline:
-                reason = (f"timed out after {timeout_s:.0f}s having turned "
-                          f"{turned:.0f} deg — check that IMU yaw is actually moving")
+                reason = f"timed out after {timeout_s:.0f}s at {steps} steps"
                 break
-            if blind and steps >= SPIN_BLIND_STEPS:
-                reason = (f"blind spin finished after {steps} steps (no IMU heading to "
-                          f"measure against — was pi_navigation running?)")
+            if steps >= SPIN_BLIND_STEPS:
+                reason = f"finished after {steps} steps"
                 break
 
             # Pulse.
@@ -772,28 +748,17 @@ class RobocarService:
             if self._spin_cancel.wait(SPIN_SETTLE_S):
                 break
             with self._lock:
-                current = self._heading_deg
                 self._spin["steps"] = steps
-            if current is not None and previous is not None:
-                # Shortest arc: a single pulse never approaches 180 deg.
-                turned += abs((current - previous + 180.0) % 360.0 - 180.0)
-                with self._lock:
-                    self._spin["turned_deg"] = round(turned, 1)
-            if current is not None:
-                previous = current
-            if not blind and turned >= target_deg:
-                break
 
         if self._spin_cancel.is_set():
             with self._lock:
                 reason = self._spin["reason"] or "cancelled"
         self.drive(0, 0, _internal=True, source="spin")
         with self._lock:
-            self._spin = {"active": False, "turned_deg": round(turned, 1),
-                          "reason": reason, "target_deg": target_deg,
-                          "steps": steps, "mode": "blind" if blind else "imu"}
-        logger.info("RoboCar spin finished: %d steps, turned %.0f deg (%s)",
-                    steps, turned, reason)
+            self._spin = {"active": False, "reason": reason,
+                          "target_deg": target_deg, "steps": steps,
+                          "mode": "timed"}
+        logger.info("RoboCar spin finished: %d steps (%s)", steps, reason)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -815,7 +780,6 @@ class RobocarService:
                 "drive_plan": self.last_plan,
                 "drive_profile_measured": self.drive_profile.measured,
                 "max_pwm": self.max_pwm,
-                "heading_deg": self._heading_deg,
                 "command_port": self.command_port,
                 "discovery_port": self.discovery_port,
                 "errors": list(self._errors),

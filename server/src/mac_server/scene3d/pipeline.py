@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # `describe` sits between objects and graph: it needs finished objects,
 # and the graph benefits from the VLM's corrected names.
-STEP_ORDER = ["reconstruct", "tsdf", "objects", "describe", "graph", "navindex"]
+STEP_ORDER = ["reconstruct", "tsdf", "objects", "describe", "graph"]
 
 
 def _step_functions() -> dict[str, Callable]:
@@ -34,7 +34,6 @@ def _step_functions() -> dict[str, Callable]:
     from mac_server.scene3d.objects_step import run_objects_step
     from mac_server.scene3d.describe_step import run_step as run_describe
     from mac_server.scene3d.graph_step import run_graph_step
-    from mac_server.scene3d.navindex_step import run_navindex_step
 
     return {
         # VGGT (GPU service) by default; scene3d.reconstruction.backend =
@@ -45,7 +44,6 @@ def _step_functions() -> dict[str, Callable]:
         "objects": run_objects_step,
         "describe": run_describe,
         "graph": run_graph_step,
-        "navindex": run_navindex_step,
     }
 
 

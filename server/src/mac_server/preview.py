@@ -199,9 +199,6 @@ def _make_handler(
             if parsed.path == "/api/scene3d/status":
                 self._serve_scene_status()
                 return
-            if parsed.path == "/api/nav/last":
-                self._serve_nav_last()
-                return
             if parsed.path == "/api/vla/episodes":
                 self._serve_vla_episodes()
                 return
@@ -778,14 +775,6 @@ def _make_handler(
                 return
             self._send_json(result)
 
-        def _serve_nav_last(self) -> None:
-            try:
-                from mac_server.scene3d import navindex
-
-                self._send_json({"last": navindex.get_last()})
-            except Exception as exc:
-                self._send_json({"last": None, "error": str(exc)})
-
         def _serve_vla_episodes(self) -> None:
             """Recorded episodes with their quality report.
 
@@ -863,12 +852,11 @@ def _make_handler(
             self._send_json({"ok": True, "left": command.left, "right": command.right})
 
         def _handle_robot_spin(self) -> None:
-            """Start (or cancel) the localization spin.
+            """Start (or cancel) the in-place survey spin.
 
-            Stops on MEASURED rotation, not a timer: with no wheel encoders
-            the IMU is the only thing that knows the robot came all the way
-            round, so pi_navigation has to be running and reporting yaw
-            before this can do anything.
+            Runs a fixed number of pulses. Measuring the rotation would need
+            either wheel encoders (absent) or an IMU heading feed (removed
+            with the metric localization stack).
             """
             if robocar is None:
                 self._send_json({"error": "robot control disabled"}, status=409)

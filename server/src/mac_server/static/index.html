@@ -588,15 +588,8 @@
         <button data-result="mesh">3D mesh</button>
         <button data-result="objects">Objects</button>
       </div>
-      <p class="meta-line" id="navLine"></p>
       <div id="planWrap" style="display:none">
         <img id="scenePlanImg" alt="Floor plan" style="display:block">
-        <div id="navDot" style="position:absolute; display:none; transform:translate(-50%,-50%); color:#ff5533; font-size:20px; text-shadow:0 0 6px #000; pointer-events:none">➤</div>
-        <!-- Fused EKF pose. Drawn UNDER navDot so the raw visual fix stays
-             visible on top: seeing the two diverge is how you tell the
-             filter is doing something. Ellipse is the position std-dev. -->
-        <div id="navFusedEllipse" style="position:absolute; display:none; transform:translate(-50%,-50%); border:1px solid rgba(90,200,255,.55); background:rgba(90,200,255,.13); border-radius:50%; pointer-events:none"></div>
-        <div id="navFusedDot" style="position:absolute; display:none; transform:translate(-50%,-50%); color:#5ac8ff; font-size:18px; text-shadow:0 0 6px #000; pointer-events:none">➤</div>
       </div>
       <div id="meshViewer" style="display:none"></div>
       <div id="sceneObjects" style="display:none">
@@ -631,17 +624,8 @@
         <button id="robotKeysBtn" class="ghost-btn">keyboard: off</button>
       </div>
       <div class="robot-row" style="gap:8px">
-        <button id="robotSpinBtn" class="ghost-btn">Spin to localize (360°)</button>
+        <button id="robotSpinBtn" class="ghost-btn">Spin in place (360°)</button>
       </div>
-      <label class="robot-row">
-        <span>cam→body</span>
-        <select id="robotYawOffset" style="flex:1">
-          <option value="0">0° — camera faces the way it drives</option>
-          <option value="180">180° — camera faces backwards</option>
-          <option value="90">90° — camera faces left</option>
-          <option value="-90">-90° — camera faces right</option>
-        </select>
-      </label>
       <p class="meta-line" id="robotSpin" style="opacity:.8"></p>
       <p class="meta-line" id="robotStatus">robot: —</p>
       <p class="meta-line" id="robotHeading" style="opacity:.8">heading: —</p>
@@ -1709,7 +1693,7 @@ window.addEventListener("resize", drawCharts);
 
 // ------------------------------------------------------------- Scene tab
 
-const SCENE_STEPS = ["depth", "poses", "tsdf", "objects", "graph", "navindex"];
+const SCENE_STEPS = ["reconstruct", "tsdf", "objects", "describe", "graph"];
 const sceneState = { selected: null, sessions: [], pollTimer: null, meshLoadedFor: null };
 
 document.querySelectorAll("#tabs button").forEach((btn) => {
@@ -1718,108 +1702,9 @@ document.querySelectorAll("#tabs button").forEach((btn) => {
     const tab = btn.dataset.tab;
     document.getElementById("tabLive").style.display = tab === "live" ? "" : "none";
     document.getElementById("tabScene").style.display = tab === "scene" ? "grid" : "none";
-    if (tab === "scene") { refreshSceneSessions(); startNavPolling(); }
+    if (tab === "scene") { refreshSceneSessions(); }
   });
 });
-
-// How the camera is bolted to the chassis, in degrees. The heading the
-// markers show comes from the RECORDED KEYFRAME POSES — i.e. where the
-// camera was looking — while "forward" to the operator is where the wheels
-// push. Mount the camera backwards and the arrow sits 180° from the
-// driving direction while the localization itself is perfectly correct.
-// Display-only on purpose: the EKF's theta is camera heading throughout and
-// is self-consistent, so rotating it here would be fixing the wrong thing.
-let robotYawOffset = +(localStorage.getItem("robotYawOffset") || 0);
-
-// Live localization fix from pi_navigation (drawn on the floor plan).
-let navPollTimer = null;
-function startNavPolling() {
-  if (navPollTimer !== null) return;
-  pollNav();
-  navPollTimer = setInterval(pollNav, 2000);
-}
-async function pollNav() {
-  if (document.getElementById("tabScene").style.display === "none") return;
-  const line = document.getElementById("navLine");
-  const dot = document.getElementById("navDot");
-  const fusedDot = document.getElementById("navFusedDot");
-  const fusedEllipse = document.getElementById("navFusedEllipse");
-  const hideAll = () => {
-    dot.style.display = "none";
-    fusedDot.style.display = "none";
-    fusedEllipse.style.display = "none";
-  };
-  try {
-    const res = await fetch("/api/nav/last");
-    const data = await res.json();
-    const last = data.last;
-    if (!last || !last.located) { line.textContent = ""; hideAll(); return; }
-    const best = last.best;
-    const age = Math.max(0, Math.round(Date.now() / 1000 - last.at));
-    if (age > 30) { line.textContent = ""; hideAll(); return; }
-    const room = best.name || best.session_id.replace("session_", "");
-    const spread = best.heading_spread_deg !== undefined ? ` ±${best.heading_spread_deg}°` : "";
-    const heading = best.heading_deg !== undefined ? ` · heading ${best.heading_deg}°${spread}` : "";
-    const depth = last.depth_center_m !== undefined ? ` · ahead ${last.depth_center_m}m` : "";
-    const f = last.fused;
-    let fusedText = "";
-    if (f) {
-      fusedText = ` · fused ±${f.std_m}m`;
-      if (f.heading_std_deg !== undefined) fusedText += ` · hdg ±${f.heading_std_deg}°`;
-      // Yaw-bias spread: the RVC heading filter's convergence indicator.
-      // Small = IMU yaw is tied to this room's frame and carries heading
-      // between visual fixes; large = still learning, trust the fix only.
-      if (f.yaw_bias_std_deg !== undefined) {
-        fusedText += ` · yawbias ${f.yaw_bias_deg}°±${f.yaw_bias_std_deg}°`;
-      }
-      if (f.bias) fusedText += ` · bias ${f.bias[0]},${f.bias[1]}m/s²`;
-      // Raw sensor attitude beside the drive keys: hold A and watch which
-      // way imu yaw moves. That is the axis convention, measured rather
-      // than assumed — the gravity calibration cannot see it.
-      const hd = document.getElementById("robotHeading");
-      if (hd && f.imu_yaw_deg !== undefined) {
-        hd.textContent =
-          `imu yaw ${f.imu_yaw_deg.toFixed(1)}°  pitch ${f.imu_pitch_deg}°  ` +
-          `roll ${f.imu_roll_deg}°  →  map ${f.heading_deg}°` +
-          (f.heading_std_deg !== undefined ? ` ±${f.heading_std_deg}°` : "");
-      }
-    }
-    line.textContent = `📍 ${room} · sim ${best.similarity}${heading}${depth}${fusedText} · ${age}s ago`;
-
-    const onThisPlan = best.session_id === sceneState.selected;
-    if (onThisPlan && best.plan_frac) {
-      dot.style.left = (best.plan_frac[0] * 100) + "%";
-      dot.style.top = (best.plan_frac[1] * 100) + "%";
-      dot.style.transform =
-        `translate(-50%,-50%) rotate(${(best.heading_deg !== undefined ? best.heading_deg : 0) + robotYawOffset}deg)`;
-      dot.style.display = "";
-    } else {
-      dot.style.display = "none";
-    }
-
-    if (onThisPlan && f && f.plan_frac) {
-      fusedDot.style.left = (f.plan_frac[0] * 100) + "%";
-      fusedDot.style.top = (f.plan_frac[1] * 100) + "%";
-      fusedDot.style.transform =
-        `translate(-50%,-50%) rotate(${(f.heading_deg !== undefined ? f.heading_deg : 0) + robotYawOffset}deg)`;
-      fusedDot.style.display = "";
-      if (f.std_frac) {
-        // 2-sigma, and the two axes are sized separately because a
-        // non-square grid stretches metres differently per axis.
-        fusedEllipse.style.left = (f.plan_frac[0] * 100) + "%";
-        fusedEllipse.style.top = (f.plan_frac[1] * 100) + "%";
-        fusedEllipse.style.width = Math.max(0.5, f.std_frac[0] * 2 * 100) + "%";
-        fusedEllipse.style.height = Math.max(0.5, f.std_frac[1] * 2 * 100) + "%";
-        fusedEllipse.style.display = "";
-      } else {
-        fusedEllipse.style.display = "none";
-      }
-    } else {
-      fusedDot.style.display = "none";
-      fusedEllipse.style.display = "none";
-    }
-  } catch (err) { /* transient */ }
-}
 
 async function sceneAction(url, body) {
   document.getElementById("sceneError").textContent = "";
@@ -2309,13 +2194,6 @@ document.getElementById("robotSpinBtn").addEventListener("click", async (e) => {
   if (r && !r.ok) document.getElementById("robotSpin").textContent = "spin: " + r.detail;
 });
 
-const yawOffsetSel = document.getElementById("robotYawOffset");
-yawOffsetSel.value = String(robotYawOffset);
-yawOffsetSel.addEventListener("change", (e) => {
-  robotYawOffset = +e.target.value;
-  localStorage.setItem("robotYawOffset", String(robotYawOffset));
-});
-
 async function pollRobot() {
   const line = document.getElementById("robotStatus");
   try {
@@ -2332,18 +2210,14 @@ async function pollRobot() {
     const spin = s.spin || {};
     const btn = document.getElementById("robotSpinBtn");
     btn.dataset.spinning = spin.active ? "1" : "0";
-    btn.textContent = spin.active ? "Cancel spin" : "Spin to localize (360°)";
+    btn.textContent = spin.active ? "Cancel spin" : "Spin in place (360°)";
     btn.classList.toggle("scan-btn", !!spin.active);
     // "blind" means no IMU heading arrived, so it is a timed spin rather
-    // than a measured 360° — worth saying out loud, since the two look
-    // identical from the outside but only one of them is verified.
+    // Timed, not measured — say so, because a timed spin and a verified
+    // 360° look identical from the outside.
     document.getElementById("robotSpin").textContent = spin.active
-      ? (spin.mode === "blind"
-          ? `spinning blind: step ${spin.steps || 0} (no IMU heading — is pi_navigation running?)`
-          : `spinning: ${spin.turned_deg}° of ${spin.target_deg}° · step ${spin.steps || 0}`)
-      : (spin.reason
-          ? `last spin: ${spin.turned_deg}° in ${spin.steps || 0} steps — ${spin.reason}`
-          : "");
+      ? `spinning: step ${spin.steps || 0}`
+      : (spin.reason ? `last spin: ${spin.steps || 0} steps — ${spin.reason}` : "");
   } catch (e) {
     line.textContent = "robot: panel offline";
   }

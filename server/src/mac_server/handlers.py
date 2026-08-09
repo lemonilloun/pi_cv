@@ -11,7 +11,6 @@ import time
 import zipfile
 from io import BytesIO
 
-from shared.fix_gate import FixGate
 from mac_server.protocol import make_ack_response, make_cv_result_ack_response, make_image_ack_response
 from mac_server.preview import LatestFrameStore
 from mac_server.registry import ClientHandle, ClientRegistry, TelemetryStore
@@ -23,7 +22,6 @@ logger = logging.getLogger(__name__)
 QUIET_MESSAGE_TYPES = {
     "camera_stream_frame",
     "system_telemetry",
-    "nav_query",
     "scene_keyframe",
     "imu_cal_state",  # ~5 Hz while the calibration wizard runs
     "time_sync",      # a 21-message burst at each end of every episode
@@ -90,11 +88,6 @@ def handle_message(
             raise ValueError("storage_dir is required for scene messages")
         return _handle_scene_message(message, binary_payload, storage_dir)
 
-    if message.type == "nav_query":
-        if storage_dir is None:
-            raise ValueError("storage_dir is required for nav queries")
-        return _handle_nav_query(message, storage_dir)
-
     if message.type == "imu_cal_state":
         return _handle_imu_cal_state(message)
 
@@ -144,35 +137,12 @@ def _handle_time_sync(message: Message) -> Message:
     )
 
 
-# The robot link, registered by server.py. nav_query is the only place the
-# server sees the Pi's live heading, and the localization spin needs it to
-# know when a full revolution is done — see robocar.RobocarService.note_heading.
-_robot_service: object | None = None
-
-
-def set_robot_service(service: object | None) -> None:
-    global _robot_service
-    _robot_service = service
-
-
 # The action log, registered by server.py. Armed automatically when the Pi
 # announces an episode, rather than by a separate panel button: the recorder
 # is the authority on when an episode starts, so making the server follow it
 # removes the whole class of "recorded 200 frames, forgot to arm the actions"
 # failures — which the very first smoke episode already hit.
 _action_log: object | None = None
-
-# One gate for the whole process: there is one robot, and its position history
-# is exactly the state the gate needs. Reset when the robot is picked up and
-# put somewhere else (POST /api/nav/reset).
-_fix_gate = FixGate()
-
-
-def reset_fix_gate() -> None:
-    """Forget the position history — for when the robot is physically moved."""
-    global _fix_gate
-    _fix_gate = FixGate()
-
 
 def set_action_log(log: object | None) -> None:
     global _action_log
@@ -182,91 +152,6 @@ def set_action_log(log: object | None) -> None:
 def get_imu_cal_state() -> dict[str, object] | None:
     with _imu_cal_lock:
         return dict(_imu_cal_state) if _imu_cal_state else None
-
-
-def _handle_nav_query(message: Message, storage_dir: Path) -> Message:
-    """Localize the Pi: match its live CLIP embedding against the place
-    indexes of all reconstructed sessions (scene3d/navindex)."""
-    from mac_server.scene3d import navindex
-
-    embedding = message.payload.get("clip_emb")
-    if not isinstance(embedding, list) or len(embedding) < 8:
-        raise ValueError("nav_query needs a clip_emb list")
-    sessions_dir = storage_dir.parent / "scene_sessions"
-    result = navindex.query(sessions_dir, embedding)
-
-    # The index compares one frame against every recorded one and takes the
-    # best, with no memory of the previous fix. Standing in a room and glancing
-    # through a doorway yields a frame that genuinely resembles the middle of
-    # the hall, and the robot teleported there. The gate asks the question the
-    # embedding cannot: could the robot have GOT there since the last fix?
-    if result.get("located"):
-        best = result.get("best") or {}
-        position = best.get("position_m")
-        if isinstance(position, (list, tuple)) and len(position) >= 2:
-            verdict = _fix_gate.accept(
-                str(best.get("session_id")),
-                (float(position[0]), float(position[1])),
-                time.time(),
-                similarity=float(best.get("similarity") or 0.0),
-            )
-            result["gate"] = verdict
-            if not verdict["accepted"]:
-                # Downgraded, not deleted: the panel still shows what was
-                # matched and why it was refused, so a gate that rejects
-                # everything is visible instead of looking like a dead index.
-                result["located"] = False
-                result["reason"] = verdict["reason"]
-                result["rejected_fix"] = best
-
-    depth = message.payload.get("depth_center_m")
-    if depth is not None:
-        result["depth_center_m"] = depth
-
-    # The Pi's own fused EKF state, if it is running one. Converted here
-    # rather than on the Pi because the metres->plan_frac mapping needs the
-    # session's plan_frame, which lives with the index on this side.
-    # Mutating `result` in place is deliberate: navindex.query already
-    # stored this same object as `last_result`, which is what
-    # GET /api/nav/last serves to the panel.
-    fused = message.payload.get("fused")
-    if isinstance(fused, dict) and result.get("located"):
-        position_m = fused.get("position_m")
-        if isinstance(position_m, list) and len(position_m) >= 2:
-            projected = navindex.fused_to_plan(
-                sessions_dir,
-                result["best"]["session_id"],
-                position_m,
-                heading_deg=fused.get("heading_deg"),
-                std_m=fused.get("std_m"),
-            )
-            if projected:
-                projected["filter"] = fused.get("filter")
-                # Pass the filter's own confidence through untouched. For the
-                # RVC heading filter, `yaw_bias_std_deg` falling is the signal
-                # that IMU yaw has been tied to this room's plan frame and can
-                # carry heading between visual fixes; the panel shows it so a
-                # drifting or unconverged filter is visible rather than
-                # silently producing a confident-looking arrow.
-                for key in ("heading_std_deg", "yaw_bias_deg", "yaw_bias_std_deg", "bias",
-                            "imu_yaw_deg", "imu_pitch_deg", "imu_roll_deg"):
-                    if fused.get(key) is not None:
-                        projected[key] = fused[key]
-                result["fused"] = projected
-
-    # Raw attitude, forwarded regardless of whether the fix landed. The
-    # localization spin needs the heading exactly when the robot is NOT
-    # localized yet, so gating this on `located` deadlocked it.
-    imu = message.payload.get("imu")
-    if isinstance(imu, dict):
-        result["imu"] = imu
-        if _robot_service is not None:
-            _robot_service.note_heading(imu.get("yaw_deg"))
-    return Message(
-        device_id="mac_server",
-        type="nav_result",
-        payload=result,
-    )
 
 
 # ------------------------------------------------------------- scene3d

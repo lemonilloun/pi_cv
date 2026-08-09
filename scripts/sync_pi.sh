@@ -45,7 +45,7 @@ if [ ${#DRY[@]} -eq 0 ]; then
   echo "=== проверка импортов на Pi ==="
   ssh "$PI_HOST" "cd $PI_DIR && python3 -c \"
 import sys; sys.path[:0]=['.','client/src','server/src']
-import pi_client.scene_recorder, pi_client.imu_rvc, pi_client.pi_navigation
+import pi_client.scene_recorder, pi_client.imu_rvc
 import json; d=json.load(open('config/seg_classes_indoor.json'))
 assert 'role' in d['classes'][0], 'seg_classes_indoor.json без role!'
 print('Pi готов: импорты ok, классов', len(d['classes']), 'с ролями')

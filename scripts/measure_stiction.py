@@ -10,16 +10,21 @@ property of the motors alone — it moves with battery voltage, floor surface
 and how much the chassis is carrying. Re-run it after changing the battery,
 the payload, or the room.
 
-**How motion is detected.** By IMU yaw, fed to the server through
-`nav_query`, so `pi_navigation` has to be running on the Pi. That measures
-the TURNING threshold directly, which is the one that matters most: turning
-in place scrubs both wheels sideways and needs far more than driving
-straight, and it is the manoeuvre the localization survey repeats. The
-straight threshold is then estimated from it, and flagged as an estimate.
+**BLOCKED — no motion sensor reaches the server any more.** Motion was
+detected from IMU yaw arriving in `nav_query`, and that message went with
+the metric localization stack. The measurement procedure below is kept
+because it is the right procedure, not because it currently runs; it needs
+a heading (or any motion) feed restored first, and `status["heading_deg"]`
+no longer exists, so it refuses immediately rather than reporting a
+threshold it did not measure.
+
+What it measured, and why that is the useful quantity: the TURNING
+threshold. Turning in place scrubs both wheels sideways and needs far more
+than driving straight. The straight threshold was estimated from it and
+flagged as an estimate.
 
     ./scripts/run_server.sh                      # laptop, in another shell
-    ./scripts/run_pi_navigation.sh               # Pi, so heading flows
-    python3 scripts/measure_stiction.py
+    python3 scripts/measure_stiction.py          # refuses: no heading source
 """
 
 from __future__ import annotations
@@ -95,8 +100,9 @@ def main() -> int:
               file=sys.stderr)
         return 2
     if status.get("heading_deg") is None:
-        print("No IMU heading reaching the server. Start ./scripts/run_pi_navigation.sh "
-              "on the Pi; this test detects motion from yaw.", file=sys.stderr)
+        print("No motion feed reaching the server — this script is currently "
+              "BLOCKED (see the module docstring). It detected motion from IMU "
+              "yaw carried by nav_query, which no longer exists.", file=sys.stderr)
         return 2
 
     max_pwm = int(status.get("max_pwm", 150))
