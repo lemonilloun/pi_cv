@@ -83,11 +83,23 @@ const uint16_t PAN_TRAVEL_MS = 450;
 #define PIN_BIN2  D0
 
 // ==================== ДВИЖЕНИЕ ====================
-int      MAX_PWM     = 150;   // сервер поднимает его при каждом коннекте
+int      MAX_PWM     = 220;   // сервер поднимает его при каждом коннекте
                               // (DEFAULT_MAX_PWM); 80 подбирали на голом
                               // шасси, оно едва везёт Pi 5 с камерой
 int      MIN_PWM     = 40;
 uint32_t FAILSAFE_MS = 400;
+// Удар по трению покоя. Момент двигателя постоянного тока пропорционален
+// току, а ток при неподвижном роторе МАКСИМАЛЕН — то есть застрявший мотор
+// берёт самый большой ток и весь его превращает в тепло. Рампа при трогании
+// работает против физики: она ведёт команду через зону, где момента ещё не
+// хватает, тратя на это сотни миллисекунд. Удар решает обратную задачу —
+// проскочить эту зону как можно быстрее, после чего держать можно меньшим.
+// Нужен на трогании и на реверсе: плавный переход через ноль проходит зону
+// застревания дважды.
+const int      KICK_PWM  = 255;
+const uint32_t KICK_MS   = 120;
+uint32_t kickUntil = 0;
+
 const int      RAMP_STEP = 8;
 const uint32_t RAMP_MS   = 15;
 
@@ -227,6 +239,30 @@ void updateRamp() {
   if (millis() - lastRampMs < RAMP_MS) return;
   lastRampMs = millis();
   if (curL == targetL && curR == targetR) return;
+
+  // Пересекает ли какое-нибудь колесо ноль скорости? Тогда бьём.
+  bool crossing = false;
+  for (int i = 0; i < 2; i++) {
+    int cur = i ? curR : curL, tgt = i ? targetR : targetL;
+    if (tgt == 0) continue;
+    if (cur == 0 || ((cur > 0) != (tgt > 0))) crossing = true;
+  }
+  if (crossing && millis() > kickUntil + KICK_MS) {
+    kickUntil = millis() + KICK_MS;
+  }
+  if (millis() < kickUntil) {
+    // Удар СОХРАНЯЕТ соотношение сторон: бить обоими колёсами поровну
+    // значило бы на время удара поехать прямо ровно тогда, когда начинается
+    // поворот.
+    int peak = max(abs(targetL), abs(targetR));
+    if (peak > 0) {
+      curL = (int)((long)targetL * KICK_PWM / peak);
+      curR = (int)((long)targetR * KICK_PWM / peak);
+      applyMotor(true, curL);
+      applyMotor(false, curR);
+      return;
+    }
+  }
 
   int dl = targetL - curL;
   int dr = targetR - curR;

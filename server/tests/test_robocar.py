@@ -39,12 +39,20 @@ class MixDriveTests(unittest.TestCase):
     def test_reverse_is_symmetric(self):
         self.assertEqual(mix_drive(-1.0, 0.0, 160), (-160, -160))
 
-    def test_spin_in_place_counter_rotates(self):
-        # Symmetry is the invariant; the magnitude now carries TURN_BOOST,
-        # because rotating scrubs the tyres sideways and driving does not.
-        left, right = mix_drive(0.0, 1.0, 200)
+    def test_a_true_pivot_counter_rotates(self):
+        # Симметрия — инвариант пивота; величина несёт TURN_BOOST, потому что
+        # вращение скребёт покрышками вбок, а езда нет. Пивот теперь надо
+        # запрашивать явно: обычный поворот стал дугой, иначе на потяжелевшем
+        # шасси он не выполняется вовсе.
+        left, right = mix_drive(0.0, 1.0, 200, turn_assist=0.0)
         self.assertEqual(left, -right)
         self.assertGreater(abs(left), 200)
+
+    def test_a_plain_turn_request_is_an_arc_with_both_wheels_driving(self):
+        left, right = mix_drive(0.0, 1.0, 200)
+        self.assertGreater(left, 0)
+        self.assertGreater(right, 0)
+        self.assertNotEqual(left, right)
 
     def test_a_spin_asks_for_more_effort_than_the_same_speed_straight(self):
         # The measured reason for TURN_BOOST: a request of 110 would not
@@ -83,8 +91,9 @@ class MixDriveTests(unittest.TestCase):
         A and the robot used to turn right. Forward/back hid it, because a
         swapped pair cancels when both wheels get the same sign."""
         self.assertEqual(mix_drive(1.0, 0.0, 100), (100, 100))   # unaffected
-        steer_right = mix_drive(0.0, 1.0, 100)
-        steer_left = mix_drive(0.0, -1.0, 100)
+        # turn_assist=0: проверяется распайка, а не форма дуги.
+        steer_right = mix_drive(0.0, 1.0, 100, turn_assist=0.0)
+        steer_left = mix_drive(0.0, -1.0, 100, turn_assist=0.0)
         # Directions are what this test is about; magnitudes carry TURN_BOOST.
         self.assertLess(steer_right[0], 0)
         self.assertGreater(steer_right[1], 0)
@@ -125,9 +134,11 @@ class ParsePayloadTests(unittest.TestCase):
         body = json.dumps({"throttle": 0.0, "steer": -1.0, "speed": 100}).encode()
         cmd = parse_drive_payload(body)
         self.assertEqual((cmd.throttle, cmd.steer, cmd.speed), (0.0, -1.0, 100))
-        # Mirrored and counter-rotating; the magnitude carries TURN_BOOST.
+        # Оба колеса ведут: поворот с места стал дугой. Обесточенное
+        # колесо редукторного мотора не катится, а тормозит.
         self.assertGreater(cmd.left, 0)
-        self.assertEqual(cmd.left, -cmd.right)
+        self.assertGreater(cmd.right, 0)
+        self.assertNotEqual(cmd.left, cmd.right)
 
     def test_clamps_out_of_range_throttle(self):
         body = json.dumps({"throttle": 5.0, "steer": 0.0, "speed": 100}).encode()
@@ -274,7 +285,7 @@ class SpinSpeedTests(unittest.TestCase):
         # against this exact scrub already — boosting it again would double
         # the compensation and put ~232 on the motors, past what the pulsed
         # spin was tuned for.
-        left, right = mix_drive(0.0, 1.0, SPIN_SPEED, turn_boost=0.0)
+        left, right = mix_drive(0.0, 1.0, SPIN_SPEED, turn_boost=0.0, turn_assist=0.0)
         self.assertEqual(left, -right)
         self.assertEqual(abs(left), SPIN_SPEED)
 

@@ -43,7 +43,9 @@ class SignTest(unittest.TestCase):
         left_turn = mix_drive(*waypoint_to_drive([0.0, 0.05]), 120)
         right_turn = mix_drive(*waypoint_to_drive([0.0, -0.05]), 120)
         self.assertNotEqual(left_turn, right_turn)
-        self.assertEqual(left_turn, tuple(-v for v in right_turn))
+        # Поворот с места — дуга, а не пивот, поэтому пары не противоположны,
+        # но зеркальны: какое колесо было быстрым, таким станет другое.
+        self.assertEqual(left_turn, tuple(reversed(right_turn)))
 
 
 class ProportionalityTest(unittest.TestCase):

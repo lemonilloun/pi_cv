@@ -55,7 +55,13 @@ PWM_LIMIT = 255
 # The sketch boots with MAX_PWM = 80, which was tuned on a bare chassis.
 # Loaded with the Pi 5, the camera and the battery, two small motors need
 # more than that to move at all, so the link raises it on connect.
-DEFAULT_MAX_PWM = 150
+# 220, а не 150. Прошивка отображает запрос как map(|v|, 5..255 ->
+# MIN_PWM..MAX_PWM), поэтому потолок 150 означал, что полный газ доходит до
+# мотора как 59% мощности. Значение подбиралось на ГОЛОМ шасси; сейчас оно
+# везёт Pi 5, камеру, сервопривод и аккумулятор на 2200 мА·ч, и момента не
+# хватает — особенно на поворотах, где колёса скребут вбок. Живёт в ОЗУ
+# платы, поэтому шлётся при каждом подключении, а не однажды.
+DEFAULT_MAX_PWM = 220
 
 # Localization spin: rotate in place so the place-index sees the whole room.
 # Turning in place has to overcome far more friction than driving straight
@@ -167,6 +173,7 @@ def _snap_out_of_deadband(value: int, deadband: int = WHEEL_DEADBAND) -> int:
 
 def mix_drive(throttle: float, steer: float, speed: int,
               turn_boost: float = TURN_BOOST,
+              turn_assist: float = None,
               deadband: int = WHEEL_DEADBAND,
               trim_left: float = WHEEL_TRIM_LEFT,
               trim_right: float = WHEEL_TRIM_RIGHT) -> tuple[int, int]:
@@ -202,6 +209,15 @@ def mix_drive(throttle: float, steer: float, speed: int,
     """
     if throttle == 0.0 and steer == 0.0:
         return 0, 0
+
+    # Дуга вместо пивота. Разворот на месте на потяжелевшем шасси недостижим
+    # при любой доступной скорости: оба колеса скребут вбок, ролик упирается.
+    # Продольная составляющая переводит скольжение в качение. Подробности и
+    # физика — docs/drive_control.md.
+    from shared.drive_control import INNER_WHEEL_RATIO, arc_turn
+
+    assist = INNER_WHEEL_RATIO if turn_assist is None else turn_assist
+    throttle, steer = arc_turn(throttle, steer, assist=assist)
 
     left = throttle + steer
     right = throttle - steer
@@ -749,7 +765,11 @@ class RobocarService:
         # it already contains the compensation TURN_BOOST exists to add.
         # Applying both would put ~232 on the motors, past what the pulsed
         # spin was tuned for.
-        left, right = mix_drive(0.0, 1.0, speed, turn_boost=0.0)
+        # turn_assist=0 — спину нужен ЧЕСТНЫЙ разворот на месте: он снимает
+        # обзор из одной точки, и уехавший по дуге робот снимает не то.
+        # Обычная езда, наоборот, получает дугу, потому что пивот на этом
+        # шасси недостижим.
+        left, right = mix_drive(0.0, 1.0, speed, turn_boost=0.0, turn_assist=0.0)
         deadline = time.monotonic() + timeout_s
         steps = 0
         reason = "done"
