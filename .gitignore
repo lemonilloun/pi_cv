@@ -42,3 +42,4 @@ data/vla_episodes
 models/nav2/
 data/nav2_eval/
 data/topomaps/
+models/nav2/*.onnx
