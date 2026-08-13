@@ -98,7 +98,12 @@ SPIN_BLIND_STEPS = 14      # ~one revolution's worth when nothing measures it
 # it, waits, and detaches — and refuses while the motors are running. That
 # suits the use exactly: park, look around, drive on. The server enforces the
 # same order so a refusal is never a surprise.
-PAN_ANGLES_DEG = (-40.0, 0.0, 40.0)
+# +/-30 is the mechanical limit of the new tripod mount (2026-08-12), and the
+# sketch clamps to the same number. Keeping the two in step matters: a server
+# asking for 40 against a sketch clamping to 30 would report a pan that never
+# happened, and the frames would be labelled with the wrong look direction.
+PAN_ANGLES_DEG = (-30.0, 0.0, 30.0)
+PAN_LIMIT_DEG = 30.0
 PAN_SETTLE_S = 0.9         # servo travel plus a still frame for the camera
 PAN_CENTRE_DEG = 0.0
 
@@ -599,7 +604,10 @@ class RobocarService:
         servo while driving. Refusing here rather than there means the caller
         gets a clear reason instead of a silently ignored command.
         """
-        angle = max(-90.0, min(90.0, float(angle_deg)))
+        # Clamped to the same limit the sketch enforces. Asking for more and
+        # letting the firmware silently trim it would leave the server
+        # believing the camera is somewhere it is not.
+        angle = max(-PAN_LIMIT_DEG, min(PAN_LIMIT_DEG, float(angle_deg)))
         with self._lock:
             link = self._link
             if link is None or link.stop.is_set():

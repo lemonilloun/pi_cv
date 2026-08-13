@@ -20,6 +20,7 @@ for _entry in (str(REPO_ROOT), str(REPO_ROOT / "server/src")):
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
 
+from mac_server import robocar  # noqa: E402
 from mac_server.robocar import (  # noqa: E402
     DEFAULT_MAX_PWM,
     SPIN_SPEED,
@@ -353,16 +354,24 @@ class PanTests(unittest.TestCase):
     def test_sends_the_command_when_parked(self):
         link = self._FakeLink()
         self.service._link = link
-        ok, _ = self.service.set_pan(-40)
+        ok, _ = self.service.set_pan(-30)
         self.assertTrue(ok)
-        self.assertEqual(link.sent, ["PAN -40"])
-        self.assertEqual(self.service.status()["pan_deg"], -40.0)
+        self.assertEqual(link.sent, ["PAN -30"])
+        self.assertEqual(self.service.status()["pan_deg"], -30.0)
 
-    def test_angle_is_clamped(self):
+    def test_angle_is_clamped_to_the_mechanical_limit(self):
+        """Clamped to the same number the sketch clamps to. If the server
+        asked for more, the firmware would trim it silently and the server
+        would believe the camera is somewhere it is not."""
         link = self._FakeLink()
         self.service._link = link
         self.service.set_pan(999)
-        self.assertEqual(link.sent, ["PAN 90"])
+        self.assertEqual(link.sent, [f"PAN {int(robocar.PAN_LIMIT_DEG)}"])
+        self.assertEqual(self.service.status()["pan_deg"], robocar.PAN_LIMIT_DEG)
+
+    def test_the_survey_never_asks_beyond_the_limit(self):
+        for angle in robocar.PAN_ANGLES_DEG:
+            self.assertLessEqual(abs(angle), robocar.PAN_LIMIT_DEG)
 
     def test_unknown_pan_is_never_reported_as_centred(self):
         """`None` means never commanded, which is not the same claim as

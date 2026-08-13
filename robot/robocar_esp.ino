@@ -46,9 +46,17 @@ const char* AP_SSID = "RoboCar-Setup";
 const char* AP_PASS = "robocar123";      // минимум 8 символов
 
 // ==================== ПИНЫ ====================
-// --- Camera pan servo (added 2026-08-03) -----------------------------------
-// D4 / GPIO2 is the spare pin on this board. It is also the onboard LED, so
-// the LED flickers while the servo is being driven; harmless.
+// --- Camera pan servo (D4 2026-08-03, moved to D8 2026-08-12) --------------
+// D8 / GPIO15.
+//
+// **GPIO15 MUST BE LOW AT BOOT.** It is a strapping pin: the ESP8266 samples
+// it at reset to choose the boot mode, and a HIGH there means "boot from SD
+// card", i.e. the board does not start at all. A servo signal wire is exactly
+// the kind of thing that can hold it up — many servos and servo breakouts
+// have a pull-up on the signal line. If the board stops booting after this
+// change, that is the cause and not a bad flash: fit a 10k resistor from D8
+// to GND. `setup()` drives the pin LOW as early as it can, but that is only
+// AFTER boot and cannot help with the strapping itself.
 //
 // IMPORTANT, and the reason the servo is attached and detached rather than
 // held: on the ESP8266 the Servo library and analogWrite() both use timer1,
@@ -57,7 +65,12 @@ const char* AP_PASS = "robocar123";      // минимум 8 символов
 // moves the servo, waits for it to arrive, and detaches again. That matches
 // how the robot is actually used — park, look around, drive on.
 #include <Servo.h>
-#define PIN_SERVO D4
+#define PIN_SERVO D8
+// Travel limit either side of centre. The tripod mount fouls beyond this, so
+// the clamp is mechanical protection, not a preference — the server asks for
+// at most PAN_ANGLES_DEG but a hand-typed PAN command must not be able to
+// drive the horn into the bracket.
+#define PAN_LIMIT_DEG 30
 Servo panServo;
 int  panAngle = 90;          // servo degrees; 90 = straight ahead
 const uint16_t PAN_TRAVEL_MS = 450;
@@ -500,7 +513,7 @@ void handleCommand(char* c) {
     if (curL != 0 || curR != 0 || targetL != 0 || targetR != 0) {
       send("ERR PAN while driving"); return;
     }
-    int deg = constrain(atoi(c + 4), -80, 80);
+    int deg = constrain(atoi(c + 4), -PAN_LIMIT_DEG, PAN_LIMIT_DEG);
     panAngle = 90 + deg;
     panServo.attach(PIN_SERVO);
     panServo.write(panAngle);
@@ -563,6 +576,12 @@ void pollSerial() {
 
 // ================= SETUP =================
 void setup() {
+  // First thing, before anything else can float it: GPIO15 is a strapping pin
+  // and must not sit HIGH. This does not fix the boot itself (that is decided
+  // before any code runs) but it keeps the line defined afterwards.
+  pinMode(PIN_SERVO, OUTPUT);
+  digitalWrite(PIN_SERVO, LOW);
+
   motorsInit();
   pinMode(LED_BUILTIN, OUTPUT);
   setLed(false);
