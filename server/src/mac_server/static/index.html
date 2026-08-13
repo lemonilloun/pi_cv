@@ -1721,7 +1721,7 @@ window.addEventListener("resize", drawCharts);
 
 // ------------------------------------------------------------- Scene tab
 
-const SCENE_STEPS = ["reconstruct", "tsdf", "objects", "describe", "graph"];
+const SCENE_STEPS = ["reconstruct", "tsdf", "objects", "describe", "graph", "navcheck"];
 const sceneState = { selected: null, sessions: [], pollTimer: null, meshLoadedFor: null };
 
 document.querySelectorAll("#tabs button").forEach((btn) => {
