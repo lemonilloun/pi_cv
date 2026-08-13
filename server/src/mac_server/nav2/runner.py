@@ -59,7 +59,7 @@ class Nav2Runner:
         self._lock = threading.Lock()
         self._state: dict[str, Any] = {
             "active": False, "node": 0, "nodes": len(topomap),
-            "distance": None, "reason": None, "frames": 0,
+            "distance": None, "reason": None, "frames": 0, "pan_note": None,
         }
 
     # ------------------------------------------------------------ запуск
@@ -70,9 +70,25 @@ class Nav2Runner:
         if self.robocar is None:
             return False, "привод выключен"
         self._stop.clear()
+
+        # Камера ОБЯЗАНА смотреть вперёд. Политика сравнивает текущий кадр с
+        # записанными и молча считает направление взгляда тем же самым;
+        # серво, оставшийся повёрнутым после обзора, даёт заезд с косой
+        # камерой, где всё выглядит работающим и всё неверно. Отказ
+        # центрироваться не останавливает старт — на прошивке без PAN
+        # серво просто нет, — но в статус это попадает.
+        pan_note = None
+        try:
+            ok, detail = self.robocar.set_pan(0.0)
+            if not ok:
+                pan_note = f"камера не отцентрована: {detail}"
+        except AttributeError:
+            pan_note = None
+
         self.robocar.add_takeover_hook(self._on_takeover)
         with self._lock:
-            self._state.update({"active": True, "reason": None, "frames": 0})
+            self._state.update({"active": True, "reason": None, "frames": 0,
+                                "pan_note": pan_note})
         self._thread = threading.Thread(target=self._loop, name="nav2", daemon=True)
         self._thread.start()
         return True, "поехали"

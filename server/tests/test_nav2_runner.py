@@ -53,6 +53,10 @@ class _Robocar:
     def add_takeover_hook(self, hook):
         self.hooks.append(hook)
 
+    def set_pan(self, angle):
+        self.panned = angle
+        return True, f"pan {angle}"
+
     def drive(self, left, right, **kwargs):
         with self.lock:
             self.commands.append((left, right))
@@ -138,6 +142,28 @@ class SafetyTest(unittest.TestCase):
         runner = _runner()
         self.assertTrue(runner.start()[0])
         self.assertFalse(runner.start()[0])
+        runner.stop()
+
+    def test_it_centres_the_camera_before_driving(self):
+        """Серво, оставшийся повёрнутым после обзора, даёт заезд с косой
+        камерой: политика считает направление взгляда тем же, что в записи,
+        и ошибается молча."""
+        robocar = _Robocar()
+        runner = _runner(robocar=robocar)
+        runner.start()
+        runner.stop()
+        self.assertEqual(robocar.panned, 0.0)
+
+    def test_firmware_without_pan_does_not_block_the_start(self):
+        class _NoPan(_Robocar):
+            def set_pan(self, angle):
+                return False, "this firmware has no PAN command"
+
+        robocar = _NoPan()
+        runner = _runner(robocar=robocar)
+        ok, _ = runner.start()
+        self.assertTrue(ok)
+        self.assertIn("не отцентрована", runner.status()["pan_note"])
         runner.stop()
 
     def test_it_refuses_without_a_robot(self):

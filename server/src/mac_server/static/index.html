@@ -1771,6 +1771,7 @@ async function pollNav2() {
   // Положение — это НОМЕР УЗЛА и его кадр. Координат в этой схеме нет.
   line.textContent = r.active
     ? `едет · узел ${r.node} из ${r.nodes} · дистанция ${r.distance ?? "—"} · кадров ${r.frames}`
+      + (r.pan_note ? " · " + r.pan_note : "")
     : `стоит · узел ${r.node} из ${r.nodes}${r.reason ? " · " + r.reason : ""}`;
   const map = data.loaded_map;
   if (map) { img.src = `/topomap/${map}/${r.node}.jpg?t=${r.frames}`; img.style.display = "block"; }
