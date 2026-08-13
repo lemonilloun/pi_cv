@@ -158,6 +158,9 @@ def _make_handler(
             if parsed.path in {"/", "/index.html"}:
                 self._serve_index()
                 return
+            if parsed.path in {"/drive", "/drive.html"}:
+                self._serve_static_page("drive.html")
+                return
             if parsed.path == "/stream.mjpg":
                 self._serve_stream(parsed.query)
                 return
@@ -1190,6 +1193,19 @@ def _make_handler(
                 self._send_json({"error": str(exc)}, status=409)
                 return
             self._send_json({"ok": True, "command": result})
+
+        def _serve_static_page(self, name: str) -> None:
+            try:
+                content = (STATIC_DIR / name).read_bytes()
+            except OSError:
+                self._send_json({"error": f"{name} not found"}, status=404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
 
         def _serve_index(self) -> None:
             index_path = STATIC_DIR / "index.html"

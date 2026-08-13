@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!-- Отдельная страница под телефон, а не адаптация панели. Панель — приборная
+     доска: таблицы, графики, вкладки. Здесь нужно одно — вести робота, идя
+     рядом с ним, одной рукой и не глядя. Разные задачи, разные страницы. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#111318">
+<title>RoboCar</title>
+<style>
+  :root { --bg:#111318; --card:#1b1e26; --line:#2c3040; --text:#e7e9ee;
+          --muted:#98a0b3; --accent:#3987e5; --stop:#c0392b; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+               font:15px/1.4 -apple-system, system-ui, sans-serif;
+               overscroll-behavior:none; touch-action:manipulation; }
+  body { display:flex; flex-direction:column; gap:8px; padding:8px;
+         padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
+  #view { width:100%; aspect-ratio:16/9; object-fit:cover; background:#000;
+          border-radius:10px; border:1px solid var(--line); }
+  .row { display:flex; gap:8px; align-items:center; }
+  .muted { color:var(--muted); font-size:13px; }
+
+  /* Крестовина. Кнопки крупные намеренно: попадать надо не глядя, на ходу. */
+  #pad { display:grid; grid-template-columns:repeat(3, 1fr);
+         grid-template-rows:repeat(3, 1fr); gap:8px; flex:1; min-height:210px; }
+  .key { border:1px solid var(--line); background:var(--card); color:var(--text);
+         border-radius:12px; font-size:26px; display:flex; align-items:center;
+         justify-content:center; user-select:none; }
+  .key:active, .key.on { background:var(--accent); border-color:var(--accent); }
+  #stop { grid-column:2; grid-row:2; background:var(--stop);
+          border-color:var(--stop); font-size:17px; font-weight:600; }
+  #fwd { grid-column:2; grid-row:1; } #back { grid-column:2; grid-row:3; }
+  #left { grid-column:1; grid-row:2; } #right { grid-column:3; grid-row:2; }
+
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:12px; padding:10px; }
+  input[type=range] { width:100%; }
+  .chip { flex:1; padding:10px 6px; border-radius:10px; border:1px solid var(--line);
+          background:var(--card); color:var(--text); font-size:14px; }
+  .chip:active { background:var(--accent); }
+  #navBtn { background:var(--accent); border-color:var(--accent); font-weight:600; }
+  #link { color:var(--muted); font-size:12px; text-align:center; }
+</style>
+</head>
+<body>
+
+<img id="view" alt="камера">
+
+<div id="pad">
+  <button class="key" id="fwd">▲</button>
+  <button class="key" id="left">◀</button>
+  <button class="key" id="stop">СТОП</button>
+  <button class="key" id="right">▶</button>
+  <button class="key" id="back">▼</button>
+</div>
+
+<div class="card">
+  <div class="row"><span class="muted">скорость</span><b id="speedVal">120</b></div>
+  <input type="range" id="speed" min="70" max="200" value="120">
+</div>
+
+<div class="card">
+  <div class="row" style="margin-bottom:8px">
+    <button class="chip" data-pan="-30">◀ камера 30°</button>
+    <button class="chip" data-pan="0">центр</button>
+    <button class="chip" data-pan="30">камера 30° ▶</button>
+  </div>
+  <div class="row">
+    <button class="chip" id="navBtn">Автономно</button>
+    <button class="chip" id="navStop">Стоп авто</button>
+  </div>
+  <p class="muted" id="status" style="margin:8px 0 0">—</p>
+</div>
+
+<div id="link"></div>
+
+<script>
+"use strict";
+
+// Прошивка глушит моторы через 400 мс тишины, а сервер прекращает повтор
+// команды через 0.6 с. Значит удержание кнопки должно ПЕРЕПОСЫЛАТЬСЯ, иначе
+// робот дёргается и встаёт. Интервал взят заметно меньше обоих порогов.
+const REPEAT_MS = 250;
+
+let throttle = 0, steer = 0, timer = null;
+const speedEl = document.getElementById("speed");
+const statusEl = document.getElementById("status");
+
+function send() {
+  fetch("/api/robot/drive", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ throttle, steer, speed: +speedEl.value }),
+  }).catch(() => {});
+}
+
+function apply(t, s) {
+  throttle = t; steer = s;
+  send();
+  if (timer === null && (t !== 0 || s !== 0)) timer = setInterval(send, REPEAT_MS);
+  if (t === 0 && s === 0 && timer !== null) { clearInterval(timer); timer = null; }
+}
+
+function hold(id, t, s) {
+  const el = document.getElementById(id);
+  const down = (e) => { e.preventDefault(); el.classList.add("on"); apply(t, s); };
+  const up = (e) => { e.preventDefault(); el.classList.remove("on"); apply(0, 0); };
+  el.addEventListener("pointerdown", down);
+  // pointercancel и pointerleave тоже отпускают: палец, соскользнувший с
+  // кнопки, не должен оставить робота едущим.
+  ["pointerup", "pointercancel", "pointerleave"].forEach((ev) =>
+    el.addEventListener(ev, up));
+}
+
+hold("fwd", 1, 0);
+hold("back", -1, 0);
+hold("left", 0, -1);
+hold("right", 0, 1);
+
+document.getElementById("stop").addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  apply(0, 0);
+  fetch("/api/robot/command", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: "STOP" }),
+  }).catch(() => {});
+});
+
+// Экран не должен гаснуть посреди заезда. Поддерживается не везде — молча
+// пропускаем, это удобство, а не функция.
+if ("wakeLock" in navigator) {
+  const grab = () => navigator.wakeLock.request("screen").catch(() => {});
+  grab();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") grab();
+  });
+}
+
+speedEl.addEventListener("input", () => {
+  document.getElementById("speedVal").textContent = speedEl.value;
+});
+
+document.querySelectorAll("[data-pan]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    // Отказ приходит полем `ok` в теле при коде 200, а не HTTP-статусом —
+    // проверять только res.ok значит молча проглотить «робота нет».
+    const res = await fetch("/api/robot/pan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ angle_deg: +btn.dataset.pan }),
+    }).catch(() => null);
+    if (!res) { statusEl.textContent = "камера: сервер не ответил"; return; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      statusEl.textContent = "камера: " + (data.error || data.detail || res.status);
+    }
+  });
+});
+
+document.getElementById("navBtn").addEventListener("click", async () => {
+  const maps = await (await fetch("/api/nav2/status")).json().catch(() => ({}));
+  const first = (maps.maps || [])[0];
+  if (!first) { statusEl.textContent = "нет топокарт — соберите на панели"; return; }
+  const out = await (await fetch("/api/nav2/start", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ map: first.name, speed: +speedEl.value }),
+  })).json().catch(() => ({}));
+  statusEl.textContent = out.error || `автономно по «${first.name}»`;
+});
+
+document.getElementById("navStop").addEventListener("click", async () => {
+  await fetch("/api/nav2/stop", { method: "POST" }).catch(() => {});
+  statusEl.textContent = "автономность выключена";
+});
+
+async function poll() {
+  try {
+    const robot = await (await fetch("/api/robot/status")).json();
+    const nav = await (await fetch("/api/nav2/status")).json();
+    const r = nav.runner;
+    const parts = [robot.connected ? "робот на связи" : "робота нет"];
+    if (robot.pan_deg !== null && robot.pan_deg !== undefined) parts.push(`камера ${robot.pan_deg}°`);
+    if (r && r.active) parts.push(`авто: узел ${r.node}/${r.nodes}`);
+    else if (r && r.reason) parts.push(`авто стоит: ${r.reason}`);
+    statusEl.textContent = parts.join(" · ");
+  } catch (err) { statusEl.textContent = "сервер не отвечает"; }
+}
+setInterval(poll, 1500);
+poll();
+
+document.getElementById("view").src = "/stream.mjpg?view=pi";
+document.getElementById("link").textContent = location.host + " · панель: /";
+</script>
+</body>
+</html>
