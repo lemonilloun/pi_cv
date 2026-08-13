@@ -74,13 +74,19 @@ class OnnxVintPolicy:
     def _prepare(self, image) -> np.ndarray:
         """PIL или BGR-массив -> (3, H, W) float32, нормализованный."""
         width, height = self.config.image_size
-        if hasattr(image, "resize"):                     # PIL
-            array = np.asarray(image.resize((width, height)), dtype=np.float32)
-        else:                                            # numpy BGR из камеры
+        # Проверка на ndarray идёт ПЕРВОЙ и по типу, а не по наличию метода.
+        # У numpy-массива тоже есть `.resize` — только он меняет буфер на
+        # месте и на чужой памяти бросает «cannot resize an array that
+        # references...». Утиная проверка `hasattr(image, "resize")` уводила
+        # кадр с камеры в ветку для PIL, и падало это не на синтетике, а
+        # везде.
+        if isinstance(image, np.ndarray):                # BGR с камеры
             import cv2
 
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             array = cv2.resize(rgb, (width, height)).astype(np.float32)
+        else:                                            # PIL
+            array = np.asarray(image.resize((width, height)), dtype=np.float32)
         chw = array.transpose(2, 0, 1) / 255.0
         return (chw - _MEAN) / _STD
 

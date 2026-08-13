@@ -19,10 +19,12 @@ from mac_server.handlers import (
     SessionContext,
     handle_message,
     set_action_log,
+    set_nav2_relay,
 )
 from mac_server.preview import FrameStoreHub, MjpegPreviewServer
 from mac_server.protocol import make_error_response
 from mac_server.registry import ClientRegistry, TelemetryStore
+from mac_server.nav2.relay import Nav2Relay
 from mac_server.robocar import RobocarService
 from mac_server.vla.action_log import ActionLog
 from shared.config import load_config
@@ -74,6 +76,11 @@ class MacServer:
             RobocarService(action_log=self.action_log) if robot_enabled else None
         )
         set_action_log(self.action_log)
+        # Приёмник путевых точек с робота. Модели здесь нет: считает Pi,
+        # ноутбук превращает точку в ШИМ колёс — там же, где знание о
+        # распайке моторов и порогах страгивания этого шасси.
+        self.nav2_relay = Nav2Relay(self.robocar) if self.robocar is not None else None
+        set_nav2_relay(self.nav2_relay)
         self.preview_server = (
             MjpegPreviewServer(
                 preview_host,

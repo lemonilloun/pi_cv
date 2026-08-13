@@ -26,6 +26,7 @@ QUIET_MESSAGE_TYPES = {
     "imu_cal_state",  # ~5 Hz while the calibration wizard runs
     "time_sync",      # a 21-message burst at each end of every episode
     "vla_frame",      # 10 Hz for the whole of a recording episode
+    "nav2_waypoint",  # 4 Hz for the whole of an autonomous run
 }
 
 
@@ -88,6 +89,9 @@ def handle_message(
             raise ValueError("storage_dir is required for scene messages")
         return _handle_scene_message(message, binary_payload, storage_dir)
 
+    if message.type == "nav2_waypoint":
+        return _handle_nav2_waypoint(message)
+
     if message.type == "imu_cal_state":
         return _handle_imu_cal_state(message)
 
@@ -143,6 +147,33 @@ def _handle_time_sync(message: Message) -> Message:
 # removes the whole class of "recorded 200 frames, forgot to arm the actions"
 # failures — which the very first smoke episode already hit.
 _action_log: object | None = None
+
+# Приёмник путевых точек с робота. Ставится server.py вместе с приводом;
+# без привода автономность невозможна, поэтому None — нормальное состояние.
+_nav2_relay: object | None = None
+
+
+def set_nav2_relay(relay: object | None) -> None:
+    global _nav2_relay
+    _nav2_relay = relay
+
+
+def get_nav2_relay() -> object | None:
+    return _nav2_relay
+
+
+def _handle_nav2_waypoint(message: Message) -> Message:
+    """Точку считает робот; здесь она только превращается в колёса."""
+    if _nav2_relay is None:
+        return Message(device_id="mac_server", type="nav2_ack",
+                       payload={"ok": False, "reason": "привод выключен"})
+    try:
+        result = _nav2_relay.handle(message.payload)
+    except ValueError as exc:
+        return Message(device_id="mac_server", type="nav2_ack",
+                       payload={"ok": False, "reason": str(exc)})
+    return Message(device_id="mac_server", type="nav2_ack", payload=result)
+
 
 def set_action_log(log: object | None) -> None:
     global _action_log

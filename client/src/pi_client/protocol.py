@@ -260,6 +260,18 @@ def make_imu_cal_state_message(device_id: str, state: dict[str, object]) -> Mess
     )
 
 
+def make_nav2_waypoint_message(device_id: str, payload: dict) -> Message:
+    """Готовая путевая точка с робота на ноутбук.
+
+    Точка, а не колёса: превращение намерения в ШИМ зависит от распайки
+    моторов и порогов страгивания этого шасси, и это знание живёт на стороне
+    привода в одном экземпляре. Робот сообщает, КУДА ехать; как крутить
+    колёса — не его дело.
+    """
+    return make_message(device_id=device_id, message_type="nav2_waypoint",
+                        payload=payload)
+
+
 def make_time_sync_message(device_id: str, t0_pi_ns: int, seq: int = 0) -> Message:
     """Ask the server for its monotonic clock so the two can be joined.
 
