@@ -1780,10 +1780,33 @@ async function pollNav2() {
 }
 
 document.getElementById("nav2BuildBtn").addEventListener("click", async () => {
-  const session = sceneState.selected;
-  if (!session) { document.getElementById("nav2Error").textContent = "выберите сессию в таблице выше"; return; }
-  const out = await nav2Post("/api/nav2/build", { session });
-  if (out.ok) { document.getElementById("nav2Map").dataset.names = ""; pollNav2(); }
+  const btn = document.getElementById("nav2BuildBtn");
+  const status = document.getElementById("nav2Status");
+  // Не выбрано — берём свежайшую (список приходит новыми сверху). Требовать
+  // клика по строке значит требовать помнить, какая из записей нужна.
+  const session = sceneState.selected || (sceneState.sessions[0] || {}).session_id;
+  if (!session) { document.getElementById("nav2Error").textContent = "нет записанных сессий"; return; }
+
+  // Успех обязан быть виден. Пересборка уже существующей карты не меняет ни
+  // список, ни одну надпись на экране — и работающая кнопка выглядит ровно
+  // как мёртвая. Отсюда и надпись на время работы, и результат после.
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "собираю…";
+  status.textContent = `собираю топокарту из «${session}»…`;
+  try {
+    const out = await nav2Post("/api/nav2/build", { session });
+    if (out.ok) {
+      const sel = document.getElementById("nav2Map");
+      sel.dataset.names = "";          // заставить список перечитаться
+      await pollNav2();
+      sel.value = out.name;            // и сразу выбрать только что собранную
+      status.textContent = `карта «${out.name}»: ${out.nodes} узлов из ${out.source_frames} кадров`;
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 });
 document.getElementById("nav2StartBtn").addEventListener("click", async () => {
   const goal = document.getElementById("nav2Goal").value;
