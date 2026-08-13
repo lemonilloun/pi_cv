@@ -21,6 +21,24 @@ from pathlib import Path
 DEFAULT_STRIDE = 3
 
 
+def session_display_name(session_dir: Path) -> str:
+    """Имя, под которым сессия видна на панели.
+
+    Оно, а не машинный идентификатор, — то, как пользователь называет
+    запись. Карта с именем `session_20260813_161329` в списке не
+    опознаётся, даже если собрана правильно.
+    """
+    meta = session_dir / "session_meta.json"
+    if meta.exists():
+        try:
+            name = json.loads(meta.read_text()).get("name")
+        except (ValueError, OSError):
+            name = None
+        if name:
+            return str(name)
+    return session_dir.name
+
+
 def build_from_session(session_dir: Path, out_dir: Path,
                        stride: int = DEFAULT_STRIDE,
                        name: str | None = None) -> dict:

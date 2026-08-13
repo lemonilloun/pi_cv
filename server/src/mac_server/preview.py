@@ -901,11 +901,20 @@ def _make_handler(
                 return
             session = str(body.get("session", ""))
             root = Path(__file__).resolve().parents[3] / "data"
-            session_dir = root / "scene_sessions" / session
+            sessions_dir = root / "scene_sessions"
+            session_dir = sessions_dir / session
+            if session and not session_dir.exists():
+                # Принимаем и отображаемое имя: пользователь называет запись
+                # «bedroom2», а не session_20260813_161329, и требовать от
+                # него идентификатор — значит требовать знать внутренности.
+                session_dir = next(
+                    (d for d in sorted(sessions_dir.glob("session_*"))
+                     if d.is_dir() and topomap.session_display_name(d) == session),
+                    session_dir)
             if not session or not session_dir.exists():
                 self._send_json({"error": f"нет сессии {session}"}, status=404)
                 return
-            name = str(body.get("name") or session)
+            name = str(body.get("name") or topomap.session_display_name(session_dir))
             safe = "".join(c for c in name if c.isalnum() or c in "_-")
             try:
                 meta = topomap.build_from_session(
@@ -1216,6 +1225,10 @@ def _make_handler(
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
+            # Без этого браузер держит панель в кэше и новые кнопки просто не
+            # появляются на экране — выглядит как «функция не работает», а на
+            # самом деле пользователь смотрит прошлую версию страницы.
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(content)
 

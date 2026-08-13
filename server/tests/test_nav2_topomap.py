@@ -56,6 +56,21 @@ class TopomapTest(unittest.TestCase):
             self.assertEqual(len(frames), 3)
             self.assertEqual(meta["nodes"], 3)
 
+    def test_the_map_takes_the_session_display_name(self):
+        """Пользователь называет запись «bedroom2», а не
+        session_20260813_161329. Карта с машинным именем не опознаётся в
+        списке, даже если собрана правильно."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = _session(root, 9)
+            (session / "session_meta.json").write_text('{"name": "bedroom2"}')
+            self.assertEqual(topomap.session_display_name(session), "bedroom2")
+
+    def test_a_session_without_a_name_falls_back_to_its_id(self):
+        with TemporaryDirectory() as tmp:
+            session = _session(Path(tmp), 9)
+            self.assertEqual(topomap.session_display_name(session), session.name)
+
     def test_a_session_without_frames_is_refused(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

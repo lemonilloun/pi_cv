@@ -56,6 +56,15 @@ class DrivePageTest(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read() or b"{}")
 
+    def test_the_panel_is_never_cached(self):
+        """Панель без Cache-Control застревает в браузере, и добавленные
+        кнопки просто не появляются: выглядит как «функция не работает»,
+        а на деле пользователь смотрит прошлую версию страницы."""
+        import urllib.request
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=3) as r:
+            self.assertEqual(r.headers.get("Cache-Control"), "no-store")
+
     def test_the_page_is_served(self):
         status, body = self._get("/drive")
         self.assertEqual(status, 200)
